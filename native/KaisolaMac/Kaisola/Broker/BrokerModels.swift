@@ -319,29 +319,6 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.agentActivity = agentActivity
     }
 
-    func routed(to generation: BrokerGenerationRecord) -> BrokerTerminalRecord {
-        var record = BrokerTerminalRecord(
-            id: id,
-            projectID: projectID,
-            pid: pid,
-            exited: exited,
-            streamEpoch: streamEpoch,
-            endOffset: endOffset,
-            diskBytes: diskBytes,
-            columns: columns,
-            rows: rows,
-            currentOwnerID: currentOwnerID,
-            lastOwnerID: lastOwnerID,
-            currentOwnerInstanceID: currentOwnerInstanceID,
-            lastOwnerInstanceID: lastOwnerInstanceID,
-            brokerGenerationID: generation.id,
-            brokerPersistenceIdentity: generation.info.persistenceIdentity,
-            agentActivity: agentActivity
-        )
-        record.cwd = cwd
-        return record
-    }
-
     func wasOwned(by stableOwnerID: String) -> Bool {
         currentOwnerID == stableOwnerID || lastOwnerID == stableOwnerID
     }

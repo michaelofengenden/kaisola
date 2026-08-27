@@ -32,33 +32,6 @@ enum OnboardingReadiness {
         )
     }
 
-    static func terminalService(
-        connectionState: AppModel.ConnectionState,
-        controlAvailable: Bool
-    ) -> OnboardingReadinessStatus {
-        switch connectionState {
-        case .looking, .connecting:
-            return .init(kind: .checking, detail: "Connecting to saved terminal sessions…")
-        case let .reconnecting(attempt):
-            return .init(
-                kind: .checking,
-                detail: "Reconnect attempt \(attempt). Running terminals continue safely."
-            )
-        case .connected where controlAvailable:
-            return .init(
-                kind: .ready,
-                detail: "New terminals are enabled and running terminals can reconnect after Kaisola closes."
-            )
-        case .connected:
-            return .init(
-                kind: .needsAction,
-                detail: "Saved terminals are visible, but new terminal control is temporarily unavailable."
-            )
-        case let .unavailable(message):
-            return .init(kind: .needsAction, detail: message)
-        }
-    }
-
     static func agentAccount(
         agentID: String,
         readings: [UsageCenter.ProviderPlanUsage],
@@ -171,13 +144,6 @@ struct OnboardingView: View {
         OnboardingReadiness.project(directory: model.currentProjectDirectory)
     }
 
-    private var terminalStatus: OnboardingReadinessStatus {
-        OnboardingReadiness.terminalService(
-            connectionState: model.connectionState,
-            controlAvailable: model.controlAvailable
-        )
-    }
-
     private var accountStatus: OnboardingReadinessStatus {
         OnboardingReadiness.agentAccount(
             agentID: selectedAgentID,
@@ -212,13 +178,6 @@ struct OnboardingView: View {
                             actionTitle: model.currentProjectDirectory == nil ? "Choose Project…" : nil,
                             action: { runCommand(.openProject) }
                         )
-                        readinessRow(
-                            title: "Terminal Continuity",
-                            symbol: "terminal.fill",
-                            status: terminalStatus,
-                            actionTitle: terminalStatus.kind == .needsAction ? "Try Again" : nil,
-                            action: { Task { await model.reload() } }
-                        )
                         agentRow
                         readinessRow(
                             title: "Updates",
@@ -231,7 +190,7 @@ struct OnboardingView: View {
 
                     if !canStart {
                         Label(
-                            "Choose a project and restore terminal control before starting the first session.",
+                            "Choose a project to start the first session.",
                             systemImage: "info.circle"
                         )
                         .font(.caption)

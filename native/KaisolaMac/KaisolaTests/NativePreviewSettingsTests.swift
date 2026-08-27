@@ -560,7 +560,6 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(settings.restoreCLIDrafts)
         XCTAssertFalse(settings.semanticShellIntegration)
         XCTAssertEqual(settings.terminalLineSpacing, NativePreviewSettings.terminalLineSpacingDefault)
-        XCTAssertEqual(settings.terminalHistoryWarningMiB, NativePreviewSettings.terminalHistoryWarningDefaultMiB)
         XCTAssertTrue(settings.workspaceRailVisible)
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
@@ -582,7 +581,6 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
         settings.terminalLineSpacing = 1.18
-        settings.terminalHistoryWarningMiB = 2_048
         settings.workspaceRailWidth = 300
         settings.filePreviewWidth = 640
         settings.toolCallDensity = .detailed
@@ -598,7 +596,6 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(reloaded.restoreCLIDrafts)
         XCTAssertTrue(reloaded.semanticShellIntegration)
         XCTAssertEqual(reloaded.terminalLineSpacing, 1.18, accuracy: 0.001)
-        XCTAssertEqual(reloaded.terminalHistoryWarningMiB, 2_048)
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)

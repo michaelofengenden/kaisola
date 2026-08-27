@@ -9,13 +9,9 @@ const repoRoot = path.resolve(__dirname, '..')
 
 const NATIVE_CONTRACT_TESTS = Object.freeze([
   'AppModelProjectContextTests',
-  'BrokerControlClientTests',
   'BrokerHelperPackageTests',
-  'BrokerLaunchConfigurationTests',
   'BrokerModelsTests',
-  'BrokerStartupCoordinatorTests',
   'NativeUpdateConfigurationTests',
-  'ObserveOnlyBrokerClientTests',
   'SwiftSessionBrokerDarwinPTYTests',
   'SwiftSessionBrokerFreshStoreTests',
   'SwiftSessionBrokerOutputTests',
@@ -33,9 +29,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'NativePreviewSettingsTests', 'NotificationBridgeTests',
   ]],
   ['native/KaisolaMac/Kaisola/Broker/', [
-    'BrokerControlClientTests', 'BrokerDiscoveryTests', 'BrokerModelsTests',
-    'BrokerReconnectBackoffTests', 'BrokerStartupCoordinatorTests',
-    'ObserveOnlyBrokerClientTests', 'ObserveOnlyBrokerHistoryPagingTests',
+    'BrokerModelsTests', 'BrokerReconnectBackoffTests',
     'TerminalCursorStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/Companion/', [

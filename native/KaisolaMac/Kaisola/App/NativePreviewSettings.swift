@@ -983,29 +983,6 @@ final class NativePreviewSettings: ObservableObject {
         min(max(lines, terminalScrollbackRange.lowerBound), terminalScrollbackRange.upperBound)
     }
 
-    /// A soft per-terminal disk threshold. Interactive history remains
-    /// append-only until the terminal is explicitly closed; crossing this
-    /// value surfaces a warning instead of silently deleting the first byte.
-    @Published var terminalHistoryWarningMiB: Int {
-        didSet {
-            let clamped = Self.clampedTerminalHistoryWarning(terminalHistoryWarningMiB)
-            if clamped != terminalHistoryWarningMiB {
-                terminalHistoryWarningMiB = clamped
-                return
-            }
-            persist(clamped, forKey: Keys.terminalHistoryWarningMiB)
-        }
-    }
-
-    nonisolated static let terminalHistoryWarningChoicesMiB = [256, 512, 1_024, 2_048, 4_096]
-    nonisolated static let terminalHistoryWarningDefaultMiB = 1_024
-
-    nonisolated static func clampedTerminalHistoryWarning(_ value: Int) -> Int {
-        terminalHistoryWarningChoicesMiB.min {
-            abs($0 - value) < abs($1 - value)
-        } ?? terminalHistoryWarningDefaultMiB
-    }
-
     /// The selected terminal theme's id — a `TerminalThemeRegistry` id, which
     /// may name a custom theme. An id whose theme has since been removed or
     /// invalidated resolves to the shipped default at install time rather
@@ -1301,7 +1278,6 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalLineSpacing = "terminalLineSpacing"
         static let terminalScrollbackLines = "terminalScrollbackLines"
         static let terminalScrollbackPolicyVersion = "terminalScrollbackPolicyVersion"
-        static let terminalHistoryWarningMiB = "terminalHistoryWarningMiB"
         static let terminalPalette = "terminalPalette"
         static let restoreCLIDrafts = "restoreCLIDrafts"
         static let summonHotkeyEnabled = "summonHotkeyEnabled"
@@ -1402,10 +1378,6 @@ final class NativePreviewSettings: ObservableObject {
                 forKey: Keys.terminalScrollbackPolicyVersion
             )
         }
-        let storedHistoryWarning = defaults.integer(forKey: Keys.terminalHistoryWarningMiB)
-        terminalHistoryWarningMiB = storedHistoryWarning > 0
-            ? Self.clampedTerminalHistoryWarning(storedHistoryWarning)
-            : Self.terminalHistoryWarningDefaultMiB
         terminalThemeID = defaults.string(forKey: Keys.terminalPalette) ?? "native"
         restoreCLIDrafts = defaults.object(forKey: Keys.restoreCLIDrafts) as? Bool ?? true
         summonHotkeyEnabled = defaults.object(forKey: Keys.summonHotkeyEnabled) as? Bool ?? false

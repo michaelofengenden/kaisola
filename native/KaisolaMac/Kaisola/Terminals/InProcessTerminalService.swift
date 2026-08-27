@@ -596,9 +596,6 @@ extension InProcessTerminalService: BrokerControlServing {
         core.setControlLease(terminalID: terminalID, active: active)
     }
 
-    func detachGenerations(_ generationIDs: Set<String>) async {
-        // No generations exist in-process.
-    }
 }
 
 // MARK: - CompanionTerminalBrokerServing

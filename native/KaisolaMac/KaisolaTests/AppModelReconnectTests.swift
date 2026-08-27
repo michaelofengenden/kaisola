@@ -1514,7 +1514,7 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
-    func testAcknowledgedAgentTurnOpensLocalActivityAndLeavesUpdatesFlowing() async throws {
+    func testAcknowledgedAgentTurnOpensLocalActivity() async throws {
         let fixture = try AgentTurnGateFixture(agentTurnAccepted: true)
         defer { fixture.cleanUp() }
         await fixture.model.reload()
@@ -1523,45 +1523,24 @@ final class AppModelReconnectTests: XCTestCase {
         await waitUntil { await fixture.control.agentTurnCalls() == [true] }
 
         XCTAssertEqual(fixture.model.openAgentTurnTerminalIDs, [fixture.terminalID])
-        XCTAssertTrue(fixture.model.agentTurnSignalFailureTerminalIDs.isEmpty)
-        XCTAssertTrue(fixture.model.unprotectedAgentTurnTerminalIDs.isEmpty)
-        XCTAssertNil(fixture.model.brokerUpdateGateBlockedDetail)
-
-        let before = await fixture.upgradeAttempts.count()
-        await fixture.model.refreshInventory()
-        let after = await fixture.upgradeAttempts.count()
-        XCTAssertEqual(after, before + 1, "An acknowledged turn leaves the update gate open.")
         await fixture.model.disconnect()
     }
 
-    func testRefusedAgentTurnLeavesNoLocalTurnAndShutsTheUpdateGate() async throws {
+    func testRefusedAgentTurnLeavesNoLocalTurnAndKeepsKeystrokes() async throws {
         let fixture = try AgentTurnGateFixture(agentTurnAccepted: false)
         defer { fixture.cleanUp() }
         await fixture.model.reload()
-        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
 
-        // The broker refuses the turn, so it still counts this terminal idle
-        // and would accept a rolling cutover underneath the running agent.
+        // The engine refuses the turn (it no longer holds the record), so
+        // local activity must not claim a turn nothing recorded.
         fixture.model.sendInput("go\r", to: fixture.terminalID)
         await waitUntil { await fixture.control.agentTurnCalls() == [true] }
 
         XCTAssertTrue(fixture.model.openAgentTurnTerminalIDs.isEmpty)
-        XCTAssertEqual(fixture.model.agentTurnSignalFailureTerminalIDs, [fixture.terminalID])
-        XCTAssertEqual(fixture.model.unprotectedAgentTurnTerminalIDs, [fixture.terminalID])
-        XCTAssertNotNil(fixture.model.brokerUpdateGateBlockedDetail)
-        XCTAssertEqual(
-            ToastCenter.shared.toasts.last?.message,
-            "Agent activity could not be reported; terminal-continuity updates are paused"
-        )
 
         // A refused signal must not cost the keystrokes themselves.
         let writes = await fixture.control.writes()
         XCTAssertEqual(writes, ["go\r"])
-
-        let before = await fixture.upgradeAttempts.count()
-        await fixture.model.refreshInventory()
-        let after = await fixture.upgradeAttempts.count()
-        XCTAssertEqual(after, before, "An unprotected turn must hold the update gate shut.")
         await fixture.model.disconnect()
     }
 
@@ -1590,134 +1569,6 @@ final class AppModelReconnectTests: XCTestCase {
 
         await waitUntil { await fixture.client.connectionAttempts() >= 2 }
         XCTAssertFalse(fixture.model.connectionState.isConnected)
-        await fixture.model.disconnect()
-    }
-
-    func testInitialTopologyProviderNilFailsClosedBeforeClientConnect() async throws {
-        let authority = topologyAuthorityFixture()
-        let preparer = MutableTopologyBrokerPreparer(
-            info: authority.info,
-            topology: nil
-        )
-        let fixture = try Fixture(
-            failingConnectAttempts: [],
-            brokerPreparer: preparer
-        )
-        defer { fixture.cleanUp() }
-
-        await fixture.model.reload()
-
-        let topologyRequests = await preparer.topologyRequests()
-        let connectionAttempts = await fixture.client.connectionAttempts()
-        XCTAssertGreaterThanOrEqual(topologyRequests, 1)
-        XCTAssertEqual(connectionAttempts, 0)
-        XCTAssertFalse(fixture.model.connectionState.isConnected)
-        await fixture.model.disconnect()
-    }
-
-    func testEstablishedTopologyProviderNilDisconnectsAndReconnectsAfterAuthorityReturns() async throws {
-        let authority = topologyAuthorityFixture()
-        let preparer = MutableTopologyBrokerPreparer(
-            info: authority.info,
-            topology: authority.topology
-        )
-        let control = RecordingBrokerControlClient()
-        let fixture = try Fixture(
-            failingConnectAttempts: [],
-            brokerPreparer: preparer,
-            controlClient: control
-        )
-        defer { fixture.cleanUp() }
-        await fixture.model.reload()
-        XCTAssertTrue(fixture.model.connectionState.isConnected)
-        let initialConnectionAttempts = await fixture.client.connectionAttempts()
-        XCTAssertEqual(initialConnectionAttempts, 1)
-        let disconnectsBeforeAuthorityLoss = await fixture.client.disconnectAttempts()
-
-        await preparer.setTopology(nil)
-        await fixture.model.refreshInventory()
-        await waitUntil {
-            await fixture.client.disconnectAttempts() > disconnectsBeforeAuthorityLoss
-                && !fixture.model.connectionState.isConnected
-        }
-        let connectionAttemptsWhileAuthorityMissing = await fixture.client.connectionAttempts()
-        XCTAssertEqual(
-            connectionAttemptsWhileAuthorityMissing,
-            1,
-            "A missing authoritative topology must never redial the retained route."
-        )
-        let createsBeforeAuthorityLoss = await control.createAttempts()
-        let createdWithoutAuthority = await fixture.model.createTerminal(inDirectory: fixture.root)
-        let createsAfterAuthorityLoss = await control.createAttempts()
-        XCTAssertNil(createdWithoutAuthority)
-        XCTAssertEqual(
-            createsAfterAuthorityLoss,
-            createsBeforeAuthorityLoss,
-            "A still-open controller lane must not create on a route whose topology authority was revoked."
-        )
-
-        await preparer.setTopology(authority.topology)
-        await waitUntil {
-            await fixture.client.connectionAttempts() >= 2
-                && fixture.model.connectionState.isConnected
-        }
-        let finalDisconnectAttempts = await fixture.client.disconnectAttempts()
-        XCTAssertGreaterThanOrEqual(finalDisconnectAttempts, 2)
-        await fixture.model.disconnect()
-    }
-
-    func testTopologyAuthorityIsRecheckedAfterObserverDialBeforeConnectionPublishes() async throws {
-        let authority = topologyAuthorityFixture()
-        let preparer = MutableTopologyBrokerPreparer(
-            info: authority.info,
-            topology: authority.topology,
-            nilAfterTopologyRequestCount: 1
-        )
-        let control = RecordingBrokerControlClient()
-        let fixture = try Fixture(
-            failingConnectAttempts: [],
-            brokerPreparer: preparer,
-            controlClient: control
-        )
-        defer { fixture.cleanUp() }
-
-        await fixture.model.reload()
-
-        let observerConnections = await fixture.client.connectionAttempts()
-        let controlConnections = await control.connectionCount()
-        let topologyRequests = await preparer.topologyRequests()
-        XCTAssertGreaterThanOrEqual(observerConnections, 1)
-        XCTAssertEqual(controlConnections, 0)
-        XCTAssertFalse(fixture.model.connectionState.isConnected)
-        XCTAssertGreaterThanOrEqual(topologyRequests, 2)
-        await fixture.model.disconnect()
-    }
-
-    func testTopologyAuthorityRevokedDuringControlConnectNeverEnablesCreate() async throws {
-        let authority = topologyAuthorityFixture()
-        let preparer = MutableTopologyBrokerPreparer(
-            info: authority.info,
-            topology: authority.topology
-        )
-        let control = RecordingBrokerControlClient(onConnect: {
-            await preparer.setTopology(nil)
-        })
-        let fixture = try Fixture(
-            failingConnectAttempts: [],
-            brokerPreparer: preparer,
-            controlClient: control
-        )
-        defer { fixture.cleanUp() }
-
-        await fixture.model.reload()
-
-        let controlConnections = await control.connectionCount()
-        let created = await fixture.model.createTerminal(inDirectory: fixture.root)
-        let createAttempts = await control.createAttempts()
-        XCTAssertGreaterThanOrEqual(controlConnections, 1)
-        XCTAssertFalse(fixture.model.connectionState.isConnected)
-        XCTAssertNil(created)
-        XCTAssertEqual(createAttempts, 0)
         await fixture.model.disconnect()
     }
 
@@ -1769,52 +1620,6 @@ final class AppModelReconnectTests: XCTestCase {
             streamEpoch: "epoch",
             endOffset: 0,
             agentActivity: activity
-        )
-    }
-
-    private func topologyAuthorityFixture() -> (
-        info: BrokerInfo,
-        topology: BrokerGenerationTopology
-    ) {
-        let currentInfo = BrokerInfo(
-            protocolVersion: BrokerWire.protocolVersion,
-            securityEpoch: BrokerWire.securityEpoch,
-            pid: 54_321,
-            socketPath: "/tmp/kaisola-topology-current.sock",
-            token: String(repeating: "d", count: 64),
-            startedAt: 1_784_250_003_000,
-            version: "current"
-        )
-        let drainingInfo = BrokerInfo(
-            protocolVersion: BrokerWire.protocolVersion,
-            securityEpoch: BrokerWire.securityEpoch,
-            pid: 54_320,
-            socketPath: "/tmp/kaisola-topology-draining.sock",
-            token: String(repeating: "e", count: 64),
-            startedAt: 1_784_250_002_000,
-            version: "draining"
-        )
-        return (
-            currentInfo,
-            BrokerGenerationTopology(
-                current: BrokerGenerationRecord(
-                    id: String(repeating: "d", count: 64),
-                    role: .current,
-                    info: currentInfo,
-                    packageRoot: "/tmp/kaisola-topology-current",
-                    registeredAt: currentInfo.startedAt
-                ),
-                draining: [
-                    BrokerGenerationRecord(
-                        id: String(repeating: "e", count: 64),
-                        role: .draining,
-                        info: drainingInfo,
-                        packageRoot: "/tmp/kaisola-topology-draining",
-                        registeredAt: drainingInfo.startedAt
-                    ),
-                ],
-                registryTopologyVersion: 7
-            )
         )
     }
 
@@ -2177,90 +1982,13 @@ private final class ControllerReconnectFixture {
     }
 }
 
-private actor UpgradeAttemptRecorder {
-    private var attempts = 0
-
-    func record() { attempts += 1 }
-    func count() -> Int { attempts }
-}
-
-/// A preparer that is also the upgrade monitor, so a test can see whether the
-/// app asked for a terminal-continuity update on an inventory tick.
-private struct MonitoredBrokerPreparer: BrokerInfoPreparing, BrokerUpgradeMonitoring {
-    let info: BrokerInfo
-    let attempts: UpgradeAttemptRecorder
-
-    func prepare() async throws -> BrokerInfo { info }
-
-    func upgradeState() async -> BrokerUpgradeState { .unknown }
-
-    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
-        await attempts.record()
-        return .unknown
-    }
-
-    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
-}
-
-private actor MutableTopologyBrokerPreparer:
-    BrokerGenerationTopologyProviding,
-    BrokerUpgradeMonitoring
-{
-    private let info: BrokerInfo
-    private var topology: BrokerGenerationTopology?
-    private var topologyRequestCount = 0
-    private let nilAfterTopologyRequestCount: Int?
-
-    init(
-        info: BrokerInfo,
-        topology: BrokerGenerationTopology?,
-        nilAfterTopologyRequestCount: Int? = nil
-    ) {
-        self.info = info
-        self.topology = topology
-        self.nilAfterTopologyRequestCount = nilAfterTopologyRequestCount
-    }
-
-    func prepare() async throws -> BrokerInfo { info }
-
-    func generationTopology() async -> BrokerGenerationTopology? {
-        topologyRequestCount += 1
-        if let nilAfterTopologyRequestCount,
-           topologyRequestCount > nilAfterTopologyRequestCount {
-            return nil
-        }
-        return topology
-    }
-
-    func setTopology(_ topology: BrokerGenerationTopology?) {
-        self.topology = topology
-    }
-
-    func topologyRequests() -> Int { topologyRequestCount }
-
-    func upgradeState() async -> BrokerUpgradeState {
-        .pending(
-            fromContentDigest: String(repeating: "e", count: 64),
-            targetContentDigest: String(repeating: "d", count: 64),
-            reason: .requestUnavailable
-        )
-    }
-
-    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
-        await upgradeState()
-    }
-
-    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
-}
-
-/// An owned agent terminal on a broker whose upgrade monitor is observable,
-/// so the agent-turn signal and the update gate can be exercised together.
+/// An owned agent terminal whose controller can accept or refuse the
+/// agent-turn signal, so local activity acknowledgement can be exercised.
 @MainActor
 private final class AgentTurnGateFixture {
     let root: URL
     let client = ReconnectBrokerClient(failingConnectAttempts: [])
     let control: RecordingBrokerControlClient
-    let upgradeAttempts = UpgradeAttemptRecorder()
     let model: AppModel
 
     var terminalID: String { ReconnectBrokerClient.firstTerminalID }
@@ -2281,7 +2009,7 @@ private final class AgentTurnGateFixture {
         ))
         let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
         model = AppModel(
-            brokerPreparer: MonitoredBrokerPreparer(info: Self.brokerInfo, attempts: upgradeAttempts),
+            brokerPreparer: LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
             client: client,
             controlClient: control,
             sessionStore: sessionStore,

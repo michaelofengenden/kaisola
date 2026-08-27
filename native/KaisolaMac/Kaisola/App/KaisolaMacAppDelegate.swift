@@ -761,6 +761,7 @@ enum KaisolaMacMain {
             exit(NativeVisualLayoutCommand.run(invocation))
         }
         KaisolaProductMigration.run()
+        BrokerTeardownMigration.run()
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
         application.delegate = appDelegate

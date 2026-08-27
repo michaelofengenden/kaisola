@@ -278,13 +278,12 @@ struct SettingsView: View {
         }
     }
 
-    /// Names exactly what a relaunch costs. Terminals are called out as safe
-    /// because they genuinely are — they live in the detached broker and resume
-    /// from their byte cursor — and saying so is what makes the prompt
-    /// answerable rather than alarming.
+    /// Names exactly what a relaunch costs. Terminal processes are the app's
+    /// own children now, so a restart ends them; saying so is what makes the
+    /// prompt answerable rather than alarming.
     private var restartWarning: String {
         let running = interruptibleTurnCount?() ?? 0
-        let terminals = "Terminal sessions keep running in the background."
+        let terminals = "Open terminal sessions will close. Chats reconnect automatically."
         guard running > 0 else { return terminals }
         let subject = running == 1 ? "1 chat or Mesh column is" : "\(running) chats or Mesh columns are"
         return "\(subject) mid-turn and will be interrupted. \(terminals)"
@@ -1087,34 +1086,6 @@ struct SettingsView: View {
                 }
 
                 TerminalColorCard(settings: settings)
-
-                SettingsCard(title: "History Storage", symbol: "externaldrive") {
-                    SettingsRow(
-                        title: "Disk warning",
-                        detail: "Per terminal · never deletes output automatically",
-                        symbol: "externaldrive.badge.exclamationmark"
-                    ) {
-                        Menu {
-                            ForEach(NativePreviewSettings.terminalHistoryWarningChoicesMiB, id: \.self) { mib in
-                                Button(TerminalHistoryStoragePolicy.budgetLabel(mib)) {
-                                    settings.terminalHistoryWarningMiB = mib
-                                }
-                            }
-                        } label: {
-                            SettingsChoiceLabel(TerminalHistoryStoragePolicy.budgetLabel(settings.terminalHistoryWarningMiB))
-                        }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Terminal history disk warning")
-                        .accessibilityValue(TerminalHistoryStoragePolicy.budgetLabel(settings.terminalHistoryWarningMiB))
-                    }
-                    Text("Full terminal output stays append-only until you close that terminal. This threshold warns; changing it never removes history.")
-                        .font(.caption)
-                        .foregroundStyle(.kaisolaSecondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 14)
-                }
-                .id("terminal-history")
 
                     SettingsCard(title: "Interaction", symbol: "keyboard") {
                         SettingsRow(

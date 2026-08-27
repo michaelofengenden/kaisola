@@ -100,31 +100,6 @@ final class OnboardingStateTests: XCTestCase {
         ]))
     }
 
-    func testTerminalReadinessRequiresWriteControlNotOnlyObservation() {
-        XCTAssertEqual(
-            OnboardingReadiness.terminalService(
-                connectionState: .connected(
-                    version: "fixture",
-                    pid: 42,
-                    serverEnforcedObserver: true
-                ),
-                controlAvailable: false
-            ).kind,
-            .needsAction
-        )
-        XCTAssertEqual(
-            OnboardingReadiness.terminalService(
-                connectionState: .connected(
-                    version: "fixture",
-                    pid: 42,
-                    serverEnforcedObserver: true
-                ),
-                controlAvailable: true
-            ).kind,
-            .ready
-        )
-    }
-
     func testAgentReadinessSeparatesCheckingSignedInAndUnverifiedStates() {
         XCTAssertEqual(
             OnboardingReadiness.agentAccount(

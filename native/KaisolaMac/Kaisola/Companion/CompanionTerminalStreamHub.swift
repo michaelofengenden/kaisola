@@ -15,8 +15,6 @@ protocol CompanionTerminalBrokerServing: Sendable {
     func disconnect() async
 }
 
-extension ObserveOnlyBrokerClient: CompanionTerminalBrokerServing {}
-extension BrokerGenerationObserverRouter: CompanionTerminalBrokerServing {}
 
 struct CompanionTerminalStreamDelivery: Sendable {
     let connectionIDs: Set<String>
@@ -30,9 +28,9 @@ struct CompanionTerminalSubscriptionResponse: Sendable {
     let initialSnapshot: CompanionBody?
 }
 
-/// One typed observer connection multiplexed across paired phones. Terminal
-/// bytes stay in the detached broker; this actor retains only a 256 KiB tail
-/// per actively viewed terminal and fans validated deltas to interested peers.
+/// One typed observer view multiplexed across paired phones. Terminal bytes
+/// stay in the in-process engine; this actor retains only a 256 KiB tail per
+/// actively viewed terminal and fans validated deltas to interested peers.
 actor CompanionTerminalStreamHub {
     static let maximumSnapshotBytes = 256 * 1_024
     static let maximumActiveStreams = 8
@@ -150,7 +148,7 @@ actor CompanionTerminalStreamHub {
             return response(
                 command,
                 status: .unavailable,
-                message: "The detached terminal service is temporarily unavailable."
+                message: "The terminal engine is temporarily unavailable."
             )
         }
     }
@@ -216,14 +214,7 @@ actor CompanionTerminalStreamHub {
             }
         }
         guard !connected else { return }
-        if let topologyLocator = locator as? any BrokerTopologyLocating,
-           let routedBroker = broker as? any ObserveOnlyBrokerServing {
-            _ = try await routedBroker.connect(
-                to: topologyLocator.locateTopology(validateSockets: true)
-            )
-        } else {
-            _ = try await broker.connect(to: locator.locate())
-        }
+        _ = try await broker.connect(to: locator.locate())
         connected = true
     }
 

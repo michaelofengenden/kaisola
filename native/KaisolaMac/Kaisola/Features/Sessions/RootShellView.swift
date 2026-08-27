@@ -1549,8 +1549,9 @@ struct RootShellView: View {
     }
 
     /// Closing a project hides its tab but does NOT stop its work (§4d): the
-    /// user confirms when live sessions would keep running out of sight.
-    /// Attention events still surface; ⌘⇧T reopens with everything intact.
+    /// user confirms when live sessions would keep running out of sight
+    /// (in-process, so only until the app quits). Attention events still
+    /// surface; ⌘⇧T reopens with everything intact.
     private func requestCloseProject(_ project: AppModel.ProjectGroup) {
         let running = model.runningWorkCount(inProject: project.id)
         guard running > 0 else {
@@ -1560,8 +1561,8 @@ struct RootShellView: View {
         let alert = NSAlert()
         alert.messageText = "Close \(project.name)?"
         alert.informativeText = running == 1
-            ? "1 session keeps running in the background. Reopen the project with ⌘⇧T to get back to it."
-            : "\(running) sessions keep running in the background. Reopen the project with ⌘⇧T to get back to them."
+            ? "1 session stays available until Kaisola quits. Reopen the project with ⌘⇧T to get back to it."
+            : "\(running) sessions stay available until Kaisola quits. Reopen the project with ⌘⇧T to get back to them."
         alert.addButton(withTitle: "Close Project")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
@@ -1857,13 +1858,6 @@ struct RootShellView: View {
     private var footer: some View {
         ConnectionFooter(
             state: model.connectionState,
-            brokerUpgradeState: model.brokerUpgradeState,
-            brokerGenerationDetail: model.brokerGenerationDetail,
-            brokerUpdateGateBlockedDetail: model.brokerUpdateGateBlockedDetail,
-            brokerRollbackCandidates: model.brokerRollbackCandidates,
-            rollbackBrokerGeneration: { generationID in
-                Task { await model.rollbackBrokerGeneration(generationID) }
-            },
             reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             attentionContext: { model.attentionContext(for: $0) },
@@ -6015,15 +6009,6 @@ struct RunOnPickerSelection: Equatable, Sendable {
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
     let state: AppModel.ConnectionState
-    let brokerUpgradeState: BrokerUpgradeState
-    let brokerGenerationDetail: String
-    /// Non-nil while the app is holding terminal-continuity updates back
-    /// because a live terminal's agent activity never reached the broker. The
-    /// toast that announced it is long gone by the time anyone wonders why
-    /// updates stopped, so the reason lives here too.
-    var brokerUpdateGateBlockedDetail: String?
-    let brokerRollbackCandidates: [BrokerRollbackCandidate]
-    let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
     var jumpToAttention: ((String) -> Void)?
     /// Resolves an inbox target to its project and liveness at render time —
@@ -6234,26 +6219,17 @@ private struct ConnectionFooter: View {
     /// Sections fix that at the root: a section header is typographically a
     /// caption rather than a dead command, so the version becomes a heading for
     /// the status beneath it and the account name a heading for the identity
-    /// actions. The lines that say nothing are also no longer said — a
-    /// placeholder like "Broker generations have not been inspected yet." is
-    /// noise in a menu opened to find out what is wrong.
+    /// actions. Lines that say nothing are no longer said.
     /// Everything the menu used to print, on the clipboard instead.
     ///
-    /// The digests, pids and package versions are genuinely useful — they are
-    /// the first thing anyone asks for when terminals misbehave — they were
-    /// just useful in the wrong place. One item collects them in a form that
-    /// can be pasted into an issue, which the menu rows never could.
+    /// The version and connection detail are genuinely useful — they are the
+    /// first thing anyone asks for when terminals misbehave — they were just
+    /// useful in the wrong place. One item collects them in a form that can
+    /// be pasted into an issue, which the menu rows never could.
     private func copyDiagnostics() {
         var lines = ["Kaisola \(Self.appVersion)", "Connection: \(state.title)"]
         if let detail = state.detail, !detail.isEmpty {
             lines.append("  \(detail)")
-        }
-        if brokerGenerationDetail != AppModel.brokerGenerationsUninspected {
-            lines.append("Generations: \(brokerGenerationDetail)")
-        }
-        lines.append("Terminal continuity: \(brokerUpgradeState.detail)")
-        if let brokerUpdateGateBlockedDetail {
-            lines.append("Update gate: \(brokerUpdateGateBlockedDetail)")
         }
         if usage.totalPeakTokens > 0 {
             lines.append(
@@ -6296,36 +6272,15 @@ private struct ConnectionFooter: View {
                 Button(action: reload) {
                     Label("Reconnect", systemImage: "arrow.clockwise")
                 }
-                if !brokerRollbackCandidates.isEmpty {
-                    Menu("Use Retained Terminal Version") {
-                        ForEach(brokerRollbackCandidates) { candidate in
-                            Button {
-                                rollbackBrokerGeneration(candidate.id)
-                            } label: {
-                                Text(
-                                    "\(candidate.brokerVersion) · package \(candidate.packageVersion) · PID \(candidate.pid)"
-                                )
-                            }
-                        }
-                    }
-                }
             }
-            // Status, in at most two short sentences, and a way to get the rest.
+            // Status, in at most one short sentence, and a way to get the rest.
             //
-            // This section used to print the connection detail, the generation
-            // inventory, the upgrade detail, the update-gate reason and a usage
-            // tally — four or five lines, several of them carrying 64-character
-            // content digests and process ids. Two hashes are enough to stretch
-            // a menu across the entire window, and the clause that actually
-            // meant something was the last few words of the longest line. None
-            // of it is lost: `copyDiagnostics` puts every one of those strings
-            // on the clipboard, in full, which is the form anyone reporting a
-            // bug wanted anyway.
+            // This section used to print the connection detail and a usage
+            // tally in bare rows that read as disabled commands. None of it is
+            // lost: `copyDiagnostics` puts every string on the clipboard, in
+            // full, which is the form anyone reporting a bug wanted anyway.
             Section("Kaisola v\(Self.appVersion)") {
                 Text(state.title)
-                if let summary = brokerUpgradeState.summary {
-                    Text(summary)
-                }
                 Button(action: copyDiagnostics) {
                     Label("Copy Diagnostics", systemImage: "doc.on.doc")
                 }

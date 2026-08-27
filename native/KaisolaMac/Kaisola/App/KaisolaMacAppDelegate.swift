@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Darwin
 import KaisolaCore
+import KaisolaSessionBrokerCore
 import QuartzCore
 import ScreenCaptureKit
 import Security
@@ -711,6 +712,12 @@ enum KaisolaMacMain {
     private static let appDelegate = KaisolaMacAppDelegate()
 
     static func main() {
+        // The in-process terminal engine re-enters this executable to perform
+        // the async-signal-sensitive PTY child setup (login_tty, chdir, exec)
+        // in a fresh process. This must run before AppKit or user state.
+        if ProcessInfo.processInfo.arguments.dropFirst().first == "--pty-child" {
+            DarwinPTYChild.run()
+        }
         let environment = ProcessInfo.processInfo.environment
         if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
             || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil
@@ -1032,6 +1039,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         NativeTerminalHistoryFrameCadence.environmentKey
     ] == "1"
     private var resourceFrameCadenceProbe: NativeFrameCadenceProbe?
+    private var resourceStreamHeadsTimer: Timer?
     private var visualStreamingFixtureTask: Task<Void, Never>?
     private var visualContinuousScrollReceipt: VisualTerminalContinuousScrollReceipt?
     private var visualOwnershipFlapTask: Task<Void, Never>?
@@ -1788,18 +1796,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let transcriptStore = AcpTranscriptStore(
             fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
         )
-        let brokerPreparer: any BrokerInfoPreparing
-        if let resourceWorkload {
-            brokerPreparer = BrokerStartupCoordinator.resourceFixture(
-                userDataRoot: resourceWorkload.brokerUserDataRoot
-            )
-        } else if visualFixture {
-            brokerPreparer = BrokerFreeFixturePreparer()
-        } else {
-            brokerPreparer = BrokerStartupCoordinator.live()
-        }
+        // Terminals are in-process children now, so fixture isolation is
+        // inherent: every PTY dies with the fixture app and no detached
+        // profile state can leak into (or out of) the production root.
         return AppModel(
-            brokerPreparer: brokerPreparer,
             sessionStore: NativeSessionStore(
                 fileURL: root.appendingPathComponent("native-sessions.json")
             ),
@@ -1955,14 +1955,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                   rows.allSatisfy({ $0.windowWidth == 1_280 && $0.windowHeight == 800 }) else {
                 throw CocoaError(.fileReadCorruptFile)
             }
-            let broker = try BrokerInfoLocator(
-                userDataCandidates: [configuration.brokerUserDataRoot]
-            ).locate()
+            // Terminals run in-process: the terminal engine's identity IS the
+            // app's. The receipt keeps both fields so the Node gate's shape
+            // stays stable across the broker removal.
             var receipt: [String: Any] = [
                 "workload": configuration.workloadID,
                 "appPid": ProcessInfo.processInfo.processIdentifier,
-                "brokerPid": broker.pid,
-                "brokerStartedAt": broker.startedAt,
+                "brokerPid": ProcessInfo.processInfo.processIdentifier,
+                "brokerStartedAt": InProcessTerminalCore.shared.startedAt,
                 "terminalIds": rows.map(\.terminalID),
                 "rendererScrollbackLines": settings.terminalScrollbackLines,
                 "windowCount": rows.count,
@@ -1976,19 +1976,60 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             }
             let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
             resourceReceiptEmitted = true
-            FileHandle.standardOutput.write(Data("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=".utf8))
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data("\n".utf8))
-            try? FileHandle.standardOutput.synchronize()
-            if resourceFrameCadenceRequested {
-                startResourceFrameCadenceProbe(
-                    configuration: configuration,
-                    window: window
-                )
+            let cadenceRequested = resourceFrameCadenceRequested
+            // The Node gate reads terminal stream heads from a file now that
+            // there is no broker to query: the first dump must exist before
+            // readiness is announced, and a refresh cadence keeps the
+            // after-capture read current.
+            Task { @MainActor [weak self] in
+                await Self.writeResourceStreamHeads(configuration: configuration)
+                FileHandle.standardOutput.write(Data("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=".utf8))
+                FileHandle.standardOutput.write(data)
+                FileHandle.standardOutput.write(Data("\n".utf8))
+                try? FileHandle.standardOutput.synchronize()
+                self?.startResourceStreamHeadsRefresh(configuration: configuration)
+                if cadenceRequested {
+                    self?.startResourceFrameCadenceProbe(
+                        configuration: configuration,
+                        window: window
+                    )
+                }
             }
         } catch {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL \(error.localizedDescription)")
             NSApp.terminate(nil)
+        }
+    }
+
+    /// `<fixture root>/stream-heads.json`: `{terminalID: {streamEpoch,
+    /// endOffset}}` from the in-process engine, replacing the `broker.status`
+    /// stream-head probe the frame gates used against the detached broker.
+    private static func writeResourceStreamHeads(
+        configuration: NativeResourceWorkloadConfiguration
+    ) async {
+        let snapshot = await InProcessTerminalCore.shared.store.atomicInventorySnapshot()
+        let heads = Dictionary(uniqueKeysWithValues: snapshot.records.map { record in
+            (record.id, ["streamEpoch": record.streamEpoch, "endOffset": record.endOffset] as [String: Any])
+        })
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: heads,
+            options: [.sortedKeys]
+        ) else { return }
+        let destination = configuration.root.appendingPathComponent("stream-heads.json")
+        try? data.write(to: destination, options: [.atomic])
+    }
+
+    private func startResourceStreamHeadsRefresh(
+        configuration: NativeResourceWorkloadConfiguration
+    ) {
+        resourceStreamHeadsTimer?.invalidate()
+        resourceStreamHeadsTimer = Timer.scheduledTimer(
+            withTimeInterval: 1,
+            repeats: true
+        ) { _ in
+            Task.detached(priority: .utility) {
+                await Self.writeResourceStreamHeads(configuration: configuration)
+            }
         }
     }
 
@@ -2042,13 +2083,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 try? FileHandle.standardOutput.synchronize()
                 return
             }
-            let locator = BrokerInfoLocator.preview()
-            guard let broker = try? locator.locate(), broker.isProcessAlive,
-                  broker.pid > 1 else {
-                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL broker-identity-unavailable")
-                try? FileHandle.standardOutput.synchronize()
-                return
-            }
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.calendar = Calendar(identifier: .gregorian)
@@ -2057,7 +2091,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             guard let payload = try? NativeTerminalHistoryFrameCadence.encodeReceipt(
                 report: report,
                 appPID: ProcessInfo.processInfo.processIdentifier,
-                brokerPID: broker.pid,
+                brokerPID: ProcessInfo.processInfo.processIdentifier,
                 capturedAt: formatter.string(from: Date())
             ) else {
                 print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL receipt-encoding")

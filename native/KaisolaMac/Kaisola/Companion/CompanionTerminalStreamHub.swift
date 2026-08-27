@@ -58,15 +58,16 @@ actor CompanionTerminalStreamHub {
     private var streams: [Key: Stream] = [:]
 
     init(
-        broker: any CompanionTerminalBrokerServing = BrokerGenerationObserverRouter(
-            routes: BrokerGenerationRouteTable()
-        ),
-        locator: any BrokerInfoLocating = BrokerInfoLocator.preview(),
+        broker: (any CompanionTerminalBrokerServing)? = nil,
+        locator: (any BrokerInfoLocating)? = nil,
         ownerID: String = NativeSessionStore().ownerID(),
         eventSink: @escaping @Sendable (CompanionTerminalStreamDelivery) -> Void
     ) {
-        self.broker = broker
-        self.locator = locator
+        // Default to one in-process facade for both seams: the terminal
+        // engine lives in this process, so there is nothing to locate.
+        let inProcess = InProcessTerminalService()
+        self.broker = broker ?? inProcess
+        self.locator = locator ?? inProcess
         self.ownerID = ownerID
         self.eventSink = eventSink
     }

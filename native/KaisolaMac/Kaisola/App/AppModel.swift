@@ -467,7 +467,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessionAdoptions: [String: String] = [:]
 
     init(
-        brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
+        brokerPreparer: (any BrokerInfoPreparing)? = nil,
         fallbackPreparer: (any BrokerInfoPreparing)? = nil,
         client: (any ObserveOnlyBrokerServing)? = nil,
         controlClient: (any BrokerControlServing)? = nil,
@@ -497,11 +497,14 @@ final class AppModel: ObservableObject {
         beforeRestoredChatMaterialization: (@Sendable (String) async -> Void)? = nil,
         beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)? = nil
     ) {
-        self.brokerPreparer = brokerPreparer
+        // One in-process facade backs every seam a test double did not
+        // replace, so a default window's preparer, observer, and controller
+        // share a single connection-equivalent identity.
+        let inProcess = InProcessTerminalService()
+        self.brokerPreparer = brokerPreparer ?? inProcess
         self.fallbackPreparer = fallbackPreparer
-        let generationRoutes = BrokerGenerationRouteTable()
-        self.client = client ?? BrokerGenerationObserverRouter(routes: generationRoutes)
-        self.controlClient = controlClient ?? BrokerGenerationControlRouter(routes: generationRoutes)
+        self.client = client ?? inProcess
+        self.controlClient = controlClient ?? inProcess
         self.sessionStore = sessionStore
         self.cursorStore = cursorStore
         self.workspaceStateStore = workspaceStateStore

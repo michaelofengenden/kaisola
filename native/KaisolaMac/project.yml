@@ -65,6 +65,7 @@ targets:
       - path: ../../assets/kaisola-icon.icns
         buildPhase: resources
     dependencies:
+      - target: KaisolaSessionBrokerCore
       - package: KaisolaCore
         product: KaisolaCore
       - package: KaisolaCore

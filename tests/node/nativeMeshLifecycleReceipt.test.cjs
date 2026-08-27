@@ -8,6 +8,11 @@ const test = require('node:test')
 const repoRoot = path.resolve(__dirname, '../..')
 const validator = path.join(repoRoot, 'scripts/native-mesh-lifecycle-receipt.cjs')
 const workflow = path.join(repoRoot, '.github/workflows/native-mesh-lifecycle.yml')
+const packagePolicy = require(path.join(
+  repoRoot,
+  'native/KaisolaMac/BrokerHelper/package-policy.json'
+))
+const pinnedNodeVersion = packagePolicy.node.version
 const swiftTest = path.join(
   repoRoot,
   'native/KaisolaMac/KaisolaTests/MeshSessionTests.swift'
@@ -16,7 +21,7 @@ const swiftTest = path.join(
 function validReceipt(overrides = {}) {
   return {
     schemaVersion: 1,
-    nodeVersion: '22.23.1',
+    nodeVersion: pinnedNodeVersion,
     columns: 3,
     adapterProcessesAtStart: 3,
     minimumAdapterFileDescriptorsAtStart: 4,
@@ -91,6 +96,12 @@ test('required Mesh test fails closed and records bounded lifecycle evidence', (
   assert.match(source, /KAISOLA_EXPECTED_NODE_VERSION/)
   assert.match(source, /KAISOLA_MESH_LIFECYCLE_RECEIPT/)
   assert.match(source, /required-mesh-lifecycle\.json/)
+  assert.match(source, /BrokerHelper\/package-policy\.json/)
+  assert.doesNotMatch(
+    source,
+    /configuration\.nodeVersion\s*==\s*["']\d+\.\d+\.\d+/,
+    'the Swift gate must read the package policy instead of restating the runtime version'
+  )
   assert.match(source, /missingRequiredNode/)
   assert.match(source, /adapterProcessesAtStart/)
   assert.match(source, /minimumAdapterFileDescriptorsAtStart/)
@@ -100,6 +111,13 @@ test('required Mesh test fails closed and records bounded lifecycle evidence', (
 })
 
 test('receipt validator accepts one complete redacted lifecycle proof', () => {
+  const source = fs.readFileSync(validator, 'utf8')
+  assert.match(source, /package-policy\.json/)
+  assert.doesNotMatch(
+    source,
+    /expectedNodeVersion\s*=\s*["']\d+\.\d+\.\d+/,
+    'the receipt validator must read the package policy instead of restating the runtime version'
+  )
   const { root, receiptPath } = fixture()
   try {
     const result = runValidator(receiptPath)
@@ -107,7 +125,7 @@ test('receipt validator accepts one complete redacted lifecycle proof', () => {
     assert.deepEqual(JSON.parse(result.stdout), {
       ok: true,
       schemaVersion: 1,
-      nodeVersion: '22.23.1',
+      nodeVersion: pinnedNodeVersion,
       columns: 3,
       recoverableColumnCount: 1,
     })
@@ -118,6 +136,7 @@ test('receipt validator accepts one complete redacted lifecycle proof', () => {
 
 test('receipt validator rejects missing evidence, count drift, and unknown fields', () => {
   for (const receipt of [
+    validReceipt({ nodeVersion: '0.0.0' }),
     validReceipt({ adaptersStoppedAfterSuspend: false }),
     validReceipt({ adapterProcessesAtStart: 2 }),
     validReceipt({ minimumAdapterFileDescriptorsAtStart: 0 }),

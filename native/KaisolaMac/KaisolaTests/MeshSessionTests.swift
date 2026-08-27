@@ -39,6 +39,11 @@ final class MeshSessionTests: XCTestCase {
         }
     }
 
+    private struct RuntimePolicy: Decodable {
+        struct Node: Decodable { let version: String }
+        let node: Node
+    }
+
     private struct ChildProcessRecord: Equatable {
         let pid: Int32
         let parentPID: Int32
@@ -90,9 +95,10 @@ final class MeshSessionTests: XCTestCase {
     }
 
     func testRequiredMeshRuntimeFailsInsteadOfSkippingMissingOrMismatchedNode() throws {
+        let expectedVersion = "9.8.7"
         let requiredEnvironment = [
             "KAISOLA_REQUIRE_MESH_INTEGRATION": "1",
-            "KAISOLA_EXPECTED_NODE_VERSION": "22.23.1",
+            "KAISOLA_EXPECTED_NODE_VERSION": expectedVersion,
             "KAISOLA_NODE": "/private/tmp/required-node",
         ]
 
@@ -107,45 +113,62 @@ final class MeshSessionTests: XCTestCase {
         XCTAssertThrowsError(try Self.resolveNode(
             environment: requiredEnvironment,
             isExecutable: { _ in true },
-            versionReader: { _ in "22.22.0" }
+            versionReader: { _ in "9.8.6" }
         )) { error in
             XCTAssertEqual(
                 error as? RequiredIntegrationError,
-                .nodeVersionMismatch(expected: "22.23.1", actual: "22.22.0")
+                .nodeVersionMismatch(expected: expectedVersion, actual: "9.8.6")
             )
         }
     }
 
     func testRequiredMeshConfigurationRejectsUnknownFieldsAndUnpinnedRuntime() throws {
+        let expectedVersion = "9.8.7"
         let valid = Data(
             """
-            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"22.23.1",\
+            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"9.8.7",\
             "receiptPath":"/private/tmp/receipt.json"}
             """.utf8
         )
         XCTAssertEqual(
-            try Self.decodeRequiredConfiguration(valid),
+            try Self.decodeRequiredConfiguration(valid, expectedNodeVersion: expectedVersion),
             RequiredIntegrationConfiguration(
                 schemaVersion: 1,
                 nodePath: "/private/tmp/node",
-                nodeVersion: "22.23.1",
+                nodeVersion: expectedVersion,
                 receiptPath: "/private/tmp/receipt.json"
             )
         )
 
         for source in [
             """
-            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"22.23.1",\
+            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"9.8.7",\
             "receiptPath":"/private/tmp/receipt.json","unexpected":true}
             """,
             """
-            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"22.22.0",\
+            {"schemaVersion":1,"nodePath":"/private/tmp/node","nodeVersion":"9.8.6",\
             "receiptPath":"/private/tmp/receipt.json"}
             """,
         ] {
             let invalid = Data(source.utf8)
-            XCTAssertThrowsError(try Self.decodeRequiredConfiguration(invalid))
+            XCTAssertThrowsError(try Self.decodeRequiredConfiguration(
+                invalid,
+                expectedNodeVersion: expectedVersion
+            ))
         }
+    }
+
+    func testRequiredMeshPinnedNodeVersionMatchesPackagePolicy() throws {
+        let policyURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("BrokerHelper/package-policy.json", isDirectory: false)
+        let policy = try JSONDecoder().decode(
+            RuntimePolicy.self,
+            from: Data(contentsOf: policyURL)
+        )
+
+        XCTAssertEqual(try Self.pinnedNodeVersion(), policy.node.version)
     }
 
     override func tearDownWithError() throws {
@@ -686,10 +709,16 @@ final class MeshSessionTests: XCTestCase {
               (1 ... 16 * 1_024).contains(Int(metadata.st_size)) else {
             throw RequiredIntegrationError.invalidRequiredConfiguration("unsafe configuration file")
         }
-        return try decodeRequiredConfiguration(Data(contentsOf: url))
+        return try decodeRequiredConfiguration(
+            Data(contentsOf: url),
+            expectedNodeVersion: pinnedNodeVersion()
+        )
     }
 
-    private static func decodeRequiredConfiguration(_ data: Data) throws -> RequiredIntegrationConfiguration {
+    private static func decodeRequiredConfiguration(
+        _ data: Data,
+        expectedNodeVersion: String
+    ) throws -> RequiredIntegrationConfiguration {
         let object = try JSONSerialization.jsonObject(with: data)
         guard let dictionary = object as? [String: Any],
               Set(dictionary.keys) == Set(["schemaVersion", "nodePath", "nodeVersion", "receiptPath"]) else {
@@ -697,12 +726,27 @@ final class MeshSessionTests: XCTestCase {
         }
         let configuration = try JSONDecoder().decode(RequiredIntegrationConfiguration.self, from: data)
         guard configuration.schemaVersion == 1,
-              configuration.nodeVersion == "22.23.1",
+              configuration.nodeVersion == expectedNodeVersion,
               configuration.nodePath.hasPrefix("/"),
               configuration.receiptPath.hasPrefix("/") else {
             throw RequiredIntegrationError.invalidRequiredConfiguration("invalid configuration values")
         }
         return configuration
+    }
+
+    private static func pinnedNodeVersion() throws -> String {
+        let policyURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // KaisolaTests
+            .deletingLastPathComponent()   // KaisolaMac
+            .appendingPathComponent("BrokerHelper/package-policy.json", isDirectory: false)
+        let policy = try JSONDecoder().decode(
+            RuntimePolicy.self,
+            from: Data(contentsOf: policyURL)
+        )
+        guard !policy.node.version.isEmpty else {
+            throw RequiredIntegrationError.invalidRequiredConfiguration("empty runtime policy version")
+        }
+        return policy.node.version
     }
 
     private static func resolveNode(

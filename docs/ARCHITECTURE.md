@@ -11,11 +11,15 @@ Kaisola uses a native shell with explicit process and trust boundaries.
 3. **Shared packages** — `KaisolaCore` and `KaisolaBrokerProtocol` own portable
    wire models, framing, cryptography, and compatibility constants shared with
    the iPhone app.
-4. **Runtime boundary** — the detached Node broker owns durable PTYs. It is a
-   deliberately small compatibility island, launched and verified by a signed
-   Swift bootstrap. Replacing it requires wire compatibility and live session
-   drainage; UI work does not expand it.
-5. **External adapters** — ACP and MCP processes remain isolated stdio/network
+4. **Terminal engine** — PTYs are direct in-process children owned by one
+   process-wide store (`InProcessTerminalCore`). Every window talks to it
+   through a facade that preserves per-window controller identity. Terminals
+   live and die with the app; on relaunch, remembered sessions reopen as fresh
+   shells in their recorded working directories.
+5. **Sealed Node helper** — a digest-sealed, pinned Node runtime ships only for
+   the usage service and custom ACP adapters. It owns no terminals and no UI
+   state.
+6. **External adapters** — ACP and MCP processes remain isolated stdio/network
    peers with capability negotiation and bounded inputs.
 
 ## UI policy
@@ -38,9 +42,10 @@ Kaisola uses a native shell with explicit process and trust boundaries.
 - Feature models expose narrow observable state; the root application model is
   a coordinator, not a second database.
 - Durable writes are atomic, permission-restricted where sensitive, and scoped
-  by account, workspace, broker identity, or session as appropriate.
-- Terminal and agent processes survive GUI replacement. Updating the app must
-  not restart the broker merely to refresh the interface.
+  by account, workspace, or session as appropriate.
+- Agent chats reconnect across app restarts through provider session resume.
+  Terminal PTYs end with the app; their sessions are remembered and reopened
+  in place on the next launch.
 
 ## Dependency direction
 

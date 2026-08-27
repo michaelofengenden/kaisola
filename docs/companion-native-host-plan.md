@@ -1,5 +1,7 @@
 # Native Companion host — restoration plan
 
+> **Superseded (2026-08-27):** terminals now run in-process (`InProcessTerminalService`); the detached broker, its bootstrap, and the continuity/rolling-update machinery described below were removed. Kept for historical context.
+
 Supersedes `superpowers/plans/2026-07-17-mobile-companion.md`, which is written
 against the archived Electron shell and should be treated as history. The
 [design spec](superpowers/specs/2026-07-17-mobile-companion-design.md) remains

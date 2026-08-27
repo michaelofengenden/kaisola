@@ -30,7 +30,7 @@ The locked Hono version is newer than the common 4.12.34 fix for:
 | `hono/proxy` | Present inside the transitive Hono package | Not copied | None |
 | `hono/language` | Present inside the transitive Hono package | Not copied | None |
 
-`scripts/native-broker-package.cjs` copies an explicit allowlist: the broker
+`scripts/native-broker-package.cjs` copies an explicit allowlist: the usage
 sources, `node-pty`, and the Claude Agent SDK package. It does not copy Hono,
 the MCP SDK peer tree, or `@hono/node-server`. A source scan of first-party
 `runtime/` and `scripts/` JavaScript also finds no Hono import. Kaisola

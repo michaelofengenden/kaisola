@@ -23,6 +23,36 @@ enum RootShellLocalCommand: Equatable, Sendable {
     }
 }
 
+/// A Sparkle action requested from workspace Settings cannot run while that
+/// SwiftUI sheet is still attached. AppKit rejects the termination request
+/// before it reaches Kaisola's delegate, so remember the user's action and run
+/// it from the sheet's actual dismissal callback instead of guessing at the
+/// animation's duration.
+@MainActor
+final class SettingsSheetUpdateCoordinator: ObservableObject {
+    enum Action: Equatable {
+        case check
+        case install
+    }
+
+    private(set) var pendingAction: Action?
+
+    func request(_ action: Action, dismiss: () -> Void) {
+        guard pendingAction == nil else { return }
+        pendingAction = action
+        dismiss()
+    }
+
+    func performAfterDismissal(check: () -> Void, install: () -> Void) {
+        guard let action = pendingAction else { return }
+        pendingAction = nil
+        switch action {
+        case .check: check()
+        case .install: install()
+        }
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -74,6 +104,7 @@ struct RootShellView: View {
     @State private var showOmniBar = false
     @State private var showOnboarding = false
     @State private var showSettings = false
+    @StateObject private var settingsUpdateCoordinator = SettingsSheetUpdateCoordinator()
     @State private var settingsSectionID: String?
     /// One unfinished chooser tab per project, owned by this window only. It
     /// never enters AppModel or any durable session and process state.
@@ -442,12 +473,27 @@ struct RootShellView: View {
                     .frame(width: 520, height: 460)
             }
         }
-        .sheet(isPresented: $showSettings) {
+        .sheet(isPresented: $showSettings, onDismiss: {
+            settingsUpdateCoordinator.performAfterDismissal(
+                check: {
+                    NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
+                },
+                install: {
+                    UpdateCenter.shared.installAndRelaunch()
+                }
+            )
+        }) {
             InAppSettingsSheet(
                 settings: settings,
                 workspace: model.currentProjectDirectory,
                 initialSectionID: settingsSectionID,
                 dismiss: { showSettings = false },
+                requestCheckForUpdates: {
+                    settingsUpdateCoordinator.request(.check) { showSettings = false }
+                },
+                requestInstallPendingUpdate: {
+                    settingsUpdateCoordinator.request(.install) { showSettings = false }
+                },
                 updateDetail: KaisolaMacAppDelegate.sharedUpdateAvailabilityDetail(),
                 interruptibleTurnCount: { model.interruptibleTurnCount },
                 canCheckForUpdates: KaisolaMacAppDelegate.sharedCanCheckForUpdates()
@@ -4703,6 +4749,8 @@ private struct InAppSettingsSheet: View {
     let workspace: URL?
     let initialSectionID: String?
     let dismiss: () -> Void
+    let requestCheckForUpdates: () -> Void
+    let requestInstallPendingUpdate: () -> Void
     /// Full capability parity with the ⌘, window (2026-08-06 spec §3c): the
     /// sheet used to silently drop the updater's unavailability reason and
     /// the restart warning's turn count.
@@ -4713,9 +4761,8 @@ private struct InAppSettingsSheet: View {
     var body: some View {
         SettingsView(
             settings: settings,
-            checkForUpdates: canCheckForUpdates ? {
-                NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
-            } : nil,
+            checkForUpdates: canCheckForUpdates ? requestCheckForUpdates : nil,
+            installPendingUpdate: requestInstallPendingUpdate,
             updateDetail: updateDetail,
             interruptibleTurnCount: interruptibleTurnCount,
             workspace: workspace,

@@ -139,6 +139,10 @@ struct SettingsView: View {
     @FocusState private var settingsSearchFocused: Bool
     /// Update affordance from the app delegate (Sparkle).
     var checkForUpdates: (() -> Void)?
+    /// Standalone Settings requests installation through the app-global modal
+    /// gate. The workspace sheet injects an additional dismissal-aware action
+    /// so its own sheet begins closing before that request reaches the gate.
+    var installPendingUpdate: (() -> Void)?
     var updateDetail: String?
     /// Turns a relaunch would abort, so the restart prompt can say so.
     var interruptibleTurnCount: (() -> Int)?
@@ -441,7 +445,11 @@ struct SettingsView: View {
                 message: Text(restartWarning),
                 primaryButton: .default(Text("Restart and Update")) {
                     restartRequest = nil
-                    UpdateCenter.shared.installAndRelaunch()
+                    if let installPendingUpdate {
+                        installPendingUpdate()
+                    } else {
+                        UpdateCenter.shared.installAndRelaunch()
+                    }
                 },
                 secondaryButton: .cancel(Text("Later"))
             )

@@ -289,19 +289,20 @@ final class SwiftSessionBrokerDarwinPTYTests: XCTestCase {
     }
 
     private func brokerExecutablePath() throws -> String {
-        var candidate = Bundle(for: Self.self).bundleURL
-        for _ in 0..<8 {
-            let executable = candidate.appendingPathComponent("KaisolaSessionBroker")
-            if FileManager.default.isExecutableFile(atPath: executable.path) {
-                return executable.path
-            }
-            candidate.deleteLastPathComponent()
+        // The pty child re-enters the app binary with `--pty-child`, handled
+        // first in `KaisolaMacMain.main()`. These tests run hosted inside
+        // Kaisola.app, so the host executable IS the production child — the
+        // standalone broker binary this helper used to hunt no longer exists.
+        guard let path = Bundle.main.executablePath,
+              FileManager.default.isExecutableFile(atPath: path)
+        else {
+            throw NSError(
+                domain: "SwiftSessionBrokerDarwinPTYTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "could not locate the pty child host executable"]
+            )
         }
-        throw NSError(
-            domain: "SwiftSessionBrokerDarwinPTYTests",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "could not locate KaisolaSessionBroker"]
-        )
+        return path
     }
 
     private func isAlive(_ pid: pid_t) -> Bool {

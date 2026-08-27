@@ -308,4 +308,60 @@ final class SessionPaneLayoutTests: XCTestCase {
         )
     }
 
+    func testTerminalHeaderResolverUsesOnlyEachTerminalsLifecycleAndInputAuthority() {
+        struct Case {
+            let name: String
+            let exited: Bool
+            let authority: TerminalSurfaceAuthority
+            let symbol: String
+            let label: String
+            let tone: TerminalHeaderPresentation.Tone
+        }
+
+        let cases = [
+            Case(
+                name: "ended",
+                exited: true,
+                authority: .localController(active: true),
+                symbol: "stop.circle.fill",
+                label: "Session ended",
+                tone: .inactive
+            ),
+            Case(
+                name: "interactive owner",
+                exited: false,
+                authority: .localController(active: true),
+                symbol: "checkmark.circle.fill",
+                label: "Terminal ready",
+                tone: .ready
+            ),
+            Case(
+                name: "temporarily inactive owner",
+                exited: false,
+                authority: .localController(active: false),
+                symbol: "clock.arrow.circlepath",
+                label: "Terminal input retrying automatically",
+                tone: .inactive
+            ),
+            Case(
+                name: "observer only",
+                exited: false,
+                authority: .observerOnly,
+                symbol: "eye",
+                label: "Terminal controlled by another window or Companion",
+                tone: .inactive
+            ),
+        ]
+
+        for testCase in cases {
+            let presentation = TerminalHeaderPresentation.resolve(
+                exited: testCase.exited,
+                authority: testCase.authority
+            )
+            XCTAssertEqual(presentation.systemImage, testCase.symbol, testCase.name)
+            XCTAssertEqual(presentation.accessibilityLabel, testCase.label, testCase.name)
+            XCTAssertEqual(presentation.tone, testCase.tone, testCase.name)
+        }
+    }
+
 }

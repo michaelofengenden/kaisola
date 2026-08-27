@@ -53,6 +53,53 @@ final class SettingsSheetUpdateCoordinator: ObservableObject {
     }
 }
 
+/// The terminal header is resolved from the terminal's own lifecycle and input
+/// authority so its icon and VoiceOver label always describe the same state.
+struct TerminalHeaderPresentation: Equatable {
+    enum Tone: Equatable {
+        case ready
+        case inactive
+    }
+
+    let systemImage: String
+    let accessibilityLabel: String
+    let tone: Tone
+
+    static func resolve(
+        exited: Bool,
+        authority: TerminalSurfaceAuthority
+    ) -> Self {
+        if exited {
+            return Self(
+                systemImage: "stop.circle.fill",
+                accessibilityLabel: "Session ended",
+                tone: .inactive
+            )
+        }
+
+        switch authority {
+        case .localController(active: true):
+            return Self(
+                systemImage: "checkmark.circle.fill",
+                accessibilityLabel: "Terminal ready",
+                tone: .ready
+            )
+        case .localController(active: false):
+            return Self(
+                systemImage: "clock.arrow.circlepath",
+                accessibilityLabel: "Terminal input retrying automatically",
+                tone: .inactive
+            )
+        case .observerOnly:
+            return Self(
+                systemImage: "eye",
+                accessibilityLabel: "Terminal controlled by another window or Companion",
+                tone: .inactive
+            )
+        }
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -2784,15 +2831,23 @@ struct RootShellView: View {
                                 .accessibilityLabel(surfaceStatusLabel(id))
                         }
                     } else {
-                        Image(systemName: surfaceLive(id) ? "checkmark.circle.fill" : "circle.slash")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(
-                                surfaceLive(id)
-                                    ? KaisolaStatusTone.done.foregroundColor
-                                    : Color.kaisolaSecondary
-                            )
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel(surfaceStatusLabel(id))
+                        if let terminal = terminalHeaderPresentation(id) {
+                            Image(systemName: terminal.systemImage)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(terminalHeaderStatusColor(terminal))
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(terminal.accessibilityLabel)
+                        } else {
+                            Image(systemName: surfaceLive(id) ? "checkmark.circle.fill" : "circle.slash")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(
+                                    surfaceLive(id)
+                                        ? KaisolaStatusTone.done.foregroundColor
+                                        : Color.kaisolaSecondary
+                                )
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(surfaceStatusLabel(id))
+                        }
                     }
                     Spacer(minLength: 4)
                 }
@@ -3298,19 +3353,6 @@ struct RootShellView: View {
                 .accessibilityLabel("Pasting into \(surfaceTitle(id))")
                 .accessibilityValue("\(progress.sentBytes) of \(progress.totalBytes) bytes sent")
                 .accessibilityHint("Cancel stops chunks that have not started sending")
-            } else if case let .reconnecting(attempt) = model.connectionState {
-                Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.kaisolaSecondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.regularMaterial, in: Capsule())
-                    .overlay {
-                        Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
-                    }
-                    .padding(10)
-                    .accessibilityLabel("Reconnecting to \(surfaceTitle(id))")
-                    .accessibilityValue("Attempt \(attempt). Running terminals keep going in the background.")
             }
         }
     }
@@ -3369,23 +3411,32 @@ struct RootShellView: View {
         return false
     }
 
-    private func surfaceLive(_ id: String) -> Bool {
-        if let terminal = model.sessions.first(where: { $0.id == id }) {
-            return !terminal.exited && model.connectionState.isConnected
+    private func terminalHeaderPresentation(_ id: String) -> TerminalHeaderPresentation? {
+        guard let terminal = model.sessions.first(where: { $0.id == id }) else { return nil }
+        return TerminalHeaderPresentation.resolve(
+            exited: terminal.exited,
+            authority: TerminalSurfaceAuthority(
+                isOwned: model.isOwned(id),
+                hasDurableOwnership: model.canClose(id)
+            )
+        )
+    }
+
+    private func terminalHeaderStatusColor(_ presentation: TerminalHeaderPresentation) -> Color {
+        switch presentation.tone {
+        case .ready: KaisolaStatusTone.done.foregroundColor
+        case .inactive: .kaisolaSecondary
         }
+    }
+
+    private func surfaceLive(_ id: String) -> Bool {
         if let chat = model.chats.first(where: { $0.id == id }) { return chat.conversation.isConnected }
         return model.meshes.contains(where: { $0.id == id })
     }
 
     private func surfaceStatusLabel(_ id: String) -> String {
-        if let terminal = model.sessions.first(where: { $0.id == id }) {
-            if terminal.exited { return "Session ended" }
-            switch model.connectionState {
-            case .reconnecting: return "Terminal reconnecting"
-            case .connected: return "Terminal live"
-            case .looking, .connecting: return "Terminal connecting"
-            case .unavailable: return "Terminal offline"
-            }
+        if let terminal = terminalHeaderPresentation(id) {
+            return terminal.accessibilityLabel
         }
         if let chat = model.chats.first(where: { $0.id == id }) {
             return chat.conversation.isConnected ? "Chat connected" : "Chat disconnected"

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.141 — 2026-08-27
+
+- White backgrounds finally read white. The light glass used to normalize every desktop down to a fixed pale grey before frosting, which kept text legible on dim wallpapers but turned a white background into a grey pane. That target is now a floor instead of a destination: dim desktops still get lifted so ink never lands on a dark surface, and anything brighter shines through at its own lightness — white like Messages, tinted by your wallpaper like Finder. Dark mode is unchanged.
+- Files lead the message. A prompt sent with images or files now shows them as small chips at the top of the bubble, an icon and a name each, with your text underneath — instead of a trailing paperclip line under the prompt. Restored and resumed threads pick up the same treatment.
+- The agent stack updates itself. The Claude Agent SDK and the sealed Node runtime moved to their newest releases, and a weekly refresh now keeps them there: bumps land through ordinary pull requests so every release gate still applies, and a CI check opens an issue if the pins ever fall behind. The chat adapters for Claude Code and Codex were never pinned — each new chat already launches the newest published adapter.
+
 ## 0.1.140 — 2026-08-27
 
 - The terminal broker is gone. Terminals now run inside the app itself: one in-process PTY engine replaces the detached Node process, its dormant Swift twin, the bootstrap LaunchAgent, and the client, generation, and upgrade apparatus that existed to manage them (about 47,000 lines, net). The trade is deliberate: shells close with the app and reopen at their recorded folder on relaunch, and in exchange there is no second process to spawn, dial, authenticate, crash, or leak. First launch after this update quietly cleans up whatever an older install left behind: the LaunchAgent, cached broker state, and any orphaned broker process still running.

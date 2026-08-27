@@ -15,8 +15,6 @@ protocol CompanionTerminalBrokerServing: Sendable {
     func disconnect() async
 }
 
-extension ObserveOnlyBrokerClient: CompanionTerminalBrokerServing {}
-extension BrokerGenerationObserverRouter: CompanionTerminalBrokerServing {}
 
 struct CompanionTerminalStreamDelivery: Sendable {
     let connectionIDs: Set<String>
@@ -30,9 +28,9 @@ struct CompanionTerminalSubscriptionResponse: Sendable {
     let initialSnapshot: CompanionBody?
 }
 
-/// One typed observer connection multiplexed across paired phones. Terminal
-/// bytes stay in the detached broker; this actor retains only a 256 KiB tail
-/// per actively viewed terminal and fans validated deltas to interested peers.
+/// One typed observer view multiplexed across paired phones. Terminal bytes
+/// stay in the in-process engine; this actor retains only a 256 KiB tail per
+/// actively viewed terminal and fans validated deltas to interested peers.
 actor CompanionTerminalStreamHub {
     static let maximumSnapshotBytes = 256 * 1_024
     static let maximumActiveStreams = 8
@@ -58,15 +56,16 @@ actor CompanionTerminalStreamHub {
     private var streams: [Key: Stream] = [:]
 
     init(
-        broker: any CompanionTerminalBrokerServing = BrokerGenerationObserverRouter(
-            routes: BrokerGenerationRouteTable()
-        ),
-        locator: any BrokerInfoLocating = BrokerInfoLocator.preview(),
+        broker: (any CompanionTerminalBrokerServing)? = nil,
+        locator: (any BrokerInfoLocating)? = nil,
         ownerID: String = NativeSessionStore().ownerID(),
         eventSink: @escaping @Sendable (CompanionTerminalStreamDelivery) -> Void
     ) {
-        self.broker = broker
-        self.locator = locator
+        // Default to one in-process facade for both seams: the terminal
+        // engine lives in this process, so there is nothing to locate.
+        let inProcess = InProcessTerminalService()
+        self.broker = broker ?? inProcess
+        self.locator = locator ?? inProcess
         self.ownerID = ownerID
         self.eventSink = eventSink
     }
@@ -149,7 +148,7 @@ actor CompanionTerminalStreamHub {
             return response(
                 command,
                 status: .unavailable,
-                message: "The detached terminal service is temporarily unavailable."
+                message: "The terminal engine is temporarily unavailable."
             )
         }
     }
@@ -215,14 +214,7 @@ actor CompanionTerminalStreamHub {
             }
         }
         guard !connected else { return }
-        if let topologyLocator = locator as? any BrokerTopologyLocating,
-           let routedBroker = broker as? any ObserveOnlyBrokerServing {
-            _ = try await routedBroker.connect(
-                to: topologyLocator.locateTopology(validateSockets: true)
-            )
-        } else {
-            _ = try await broker.connect(to: locator.locate())
-        }
+        _ = try await broker.connect(to: locator.locate())
         connected = true
     }
 

@@ -419,30 +419,6 @@ final class TerminalTranscriptTests: XCTestCase {
         }
     }
 
-    func testHistoryStorageWarningIsSoftAndUsesExactBrokerBytes() {
-        XCTAssertEqual(TerminalHistoryStoragePolicy.warningBytes(1_024), 1_073_741_824)
-        XCTAssertFalse(TerminalHistoryStoragePolicy.isExceeded(
-            diskBytes: 1_073_741_823,
-            warningMiB: 1_024
-        ))
-        XCTAssertTrue(TerminalHistoryStoragePolicy.isExceeded(
-            diskBytes: 1_073_741_824,
-            warningMiB: 1_024
-        ))
-        XCTAssertEqual(TerminalHistoryStoragePolicy.budgetLabel(2_048), "2 GB")
-        // The warning still deletes nothing. It now names the broker's disk
-        // quota as the one thing that does, instead of promising history is
-        // never trimmed at all.
-        XCTAssertTrue(TerminalHistoryStoragePolicy.help(
-            diskBytes: 1_073_741_824,
-            warningMiB: 1_024
-        ).contains("crossing this warning deletes nothing"))
-        XCTAssertTrue(TerminalHistoryStoragePolicy.help(
-            diskBytes: 1_073_741_824,
-            warningMiB: 1_024
-        ).contains("disk quota"))
-    }
-
     func testExportFileNameIsPortableAndNeverEmpty() {
         XCTAssertEqual(
             TerminalTranscriptExport.suggestedFileName(for: "Codex · Kaisola / main"),

@@ -9,21 +9,12 @@ const repoRoot = path.resolve(__dirname, '..')
 
 const NATIVE_CONTRACT_TESTS = Object.freeze([
   'AppModelProjectContextTests',
-  'BrokerControlClientTests',
   'BrokerHelperPackageTests',
-  'BrokerLaunchConfigurationTests',
   'BrokerModelsTests',
-  'BrokerStartupCoordinatorTests',
   'NativeUpdateConfigurationTests',
-  'ObserveOnlyBrokerClientTests',
-  'SwiftSessionBrokerConfigurationTests',
-  'SwiftSessionBrokerCoreTests',
   'SwiftSessionBrokerDarwinPTYTests',
-  'SwiftSessionBrokerFreshEndToEndTests',
   'SwiftSessionBrokerFreshStoreTests',
-  'SwiftSessionBrokerFreshWireTests',
   'SwiftSessionBrokerOutputTests',
-  'SwiftSessionBrokerShadowIntegrationTests',
   'TerminalLinkRoutingTests',
   'WorkspaceFilesTests',
 ])
@@ -38,9 +29,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'NativePreviewSettingsTests', 'NotificationBridgeTests',
   ]],
   ['native/KaisolaMac/Kaisola/Broker/', [
-    'BrokerControlClientTests', 'BrokerDiscoveryTests', 'BrokerModelsTests',
-    'BrokerReconnectBackoffTests', 'BrokerStartupCoordinatorTests',
-    'ObserveOnlyBrokerClientTests', 'ObserveOnlyBrokerHistoryPagingTests',
+    'BrokerModelsTests', 'BrokerReconnectBackoffTests',
     'TerminalCursorStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/Companion/', [
@@ -292,9 +281,7 @@ function isBrokerOrSharedProtocolFile(file) {
   return file.startsWith('runtime/node-broker/')
     || file.startsWith('protocol/broker/')
     || file.startsWith('native/KaisolaCore/Sources/KaisolaBrokerProtocol/')
-    || file.startsWith('native/KaisolaMac/BrokerBootstrap/')
     || file.startsWith('native/KaisolaMac/BrokerHelper/')
-    || file.startsWith('native/KaisolaMac/KaisolaSessionBroker/')
     || file.startsWith('native/KaisolaMac/KaisolaSessionBrokerCore/')
     || file.startsWith('native/KaisolaMac/Shared/Broker')
     || file === 'scripts/native-broker-package.cjs'

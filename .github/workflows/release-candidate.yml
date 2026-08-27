@@ -180,21 +180,10 @@ jobs:
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app"
-          node scripts/native-broker-package.cjs \
-            --verify "$app/Contents/Resources/BrokerSessionHelper" \
-            --policy native/KaisolaMac/BrokerHelper/native-package-policy.json \
-            --app-release-version "$NATIVE_MARKETING_VERSION" \
-            --app-release-build "$NATIVE_BUILD_VERSION" \
-            --require-signatures
           npm run native:preflight -- \
             --app "$app" \
             --require-updates --require-developer-id \
             --source-commit "$GITHUB_SHA"
-      - name: Prove packaged broker and PTY continuity
-        run: >-
-          npm run native:helper:probe --
-          "$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app/Contents/Resources/BrokerHelper"
-          --require-signed-host
       - name: Notarize, staple, package, and receipt immutable candidate
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}

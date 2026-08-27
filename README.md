@@ -18,8 +18,8 @@ What that means in practice:
   told before you start a session on a spent account.
 - **An IDE around the agents.** File tree, editable Markdown and file
   previews, syntax highlighting, Git panels, project-scoped MCP
-  configuration, command palette, multi-window and split layouts, terminals
-  that survive relaunches through a detached broker.
+  configuration, command palette, multi-window and split layouts, and
+  terminals that reopen in place after a relaunch.
 - **Native all the way down.** SwiftUI/AppKit, a measured glass aesthetic
   over your desktop wallpaper, Sparkle updates — no Electron, no web-view
   shell.
@@ -32,8 +32,8 @@ This repository intentionally contains only the shipping native product:
 - `native/KaisolaMac` — the macOS application;
 - `mobile/KaisolaCompanion` — the iPhone Companion;
 - `native/KaisolaCore` — shared protocols, security, and domain models;
-- `runtime/node-broker` — the small transitional terminal broker packaged by
-  the macOS app until its Swift replacement passes continuity gates;
+- `runtime/node-broker` — the usage/environment modules sealed into the
+  app's pinned Node helper (terminals themselves are native, in-process);
 - `scripts` and `tests` — native packaging, release, and contract tooling.
 
 There is no Electron renderer or React application in this repository.
@@ -46,9 +46,9 @@ npm run native:fast
 ```
 
 The fast lane performs an active-architecture incremental Debug build using a
-persistent DerivedData cache, reuses the detached broker, and launches the build
-product directly. It skips application installation, universal packaging,
-notarization, and release checks.
+persistent DerivedData cache and launches the build product directly. It skips
+application installation, universal packaging, notarization, and release
+checks.
 
 Run a focused test while iterating:
 
@@ -77,8 +77,8 @@ npm run native:canary
 npm run native:canary:archive
 ```
 
-See [the macOS development guide](native/KaisolaMac/README.md) for release and
-broker-continuity details.
+See [the macOS development guide](native/KaisolaMac/README.md) for release
+details.
 
 ## Projects
 

@@ -196,9 +196,10 @@ final class UpdateCenter: ObservableObject {
         pendingUpdate = nil
     }
 
-    /// Install and relaunch now. Terminal sessions survive this — they live in
-    /// the detached broker — but in-process ACP chats and Mesh columns do not,
-    /// so callers should warn when `AppModel.interruptibleTurnCount` is nonzero.
+    /// Install and relaunch now. Terminal PTYs end with the app; the Sparkle
+    /// relaunch reopens them at their recorded cwd via dormant-terminal
+    /// resurrection. ACP chats and Mesh columns are interrupted mid-turn, so
+    /// callers should warn when `AppModel.interruptibleTurnCount` is nonzero.
     func installAndRelaunch() {
         guard let pendingUpdate,
               pendingUpdate.phase == .ready,

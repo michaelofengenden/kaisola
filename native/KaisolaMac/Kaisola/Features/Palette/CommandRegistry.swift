@@ -472,7 +472,7 @@ enum AppCommandRegistry {
         if id == .newTerminal || id.agentID != nil {
             return model.controlAvailable
                 ? .available
-                : .unavailable("Reconnect terminal continuity before starting a terminal session.")
+                : .unavailable("Connecting the terminal engine. Try again in a moment.")
         }
         if id.chatAgentID != nil || id == .openProject || id == .toggleFiles
             || id == .commandPalette || id == .messageCurrentAgent {

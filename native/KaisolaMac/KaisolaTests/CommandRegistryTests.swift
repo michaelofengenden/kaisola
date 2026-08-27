@@ -105,10 +105,8 @@ final class CommandRegistryTests: XCTestCase {
         let projectStatusBefore = OnboardingReadiness.project(
             directory: model.currentProjectDirectory
         )
-        let terminalStatusBefore = OnboardingReadiness.terminalService(
-            connectionState: model.connectionState,
-            controlAvailable: model.controlAvailable
-        )
+        let connectionStateBefore = model.connectionState
+        let controlAvailableBefore = model.controlAvailable
         let routed = expectation(
             forNotification: .kaisolaLocalCommand,
             object: model
@@ -134,13 +132,11 @@ final class CommandRegistryTests: XCTestCase {
             projectStatusBefore
         )
         XCTAssertEqual(
-            OnboardingReadiness.terminalService(
-                connectionState: model.connectionState,
-                controlAvailable: model.controlAvailable
-            ),
-            terminalStatusBefore,
+            model.connectionState,
+            connectionStateBefore,
             "presenting the checklist must not mutate the live readiness inputs"
         )
+        XCTAssertEqual(model.controlAvailable, controlAvailableBefore)
     }
 
     func testPaletteSelectionIdentityFollowsFilteredItemInsteadOfReusedIndex() {

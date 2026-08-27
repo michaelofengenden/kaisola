@@ -7,10 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		00015B79C2EB96D8300D854C /* InProcessTerminalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A0984F414A3C07722FA764 /* InProcessTerminalService.swift */; };
 		00079CC9E9DD3C149455EFB1 /* index.html in Resources */ = {isa = PBXBuildFile; fileRef = 7B38F18265244392487F7BED /* index.html */; };
-		00D9F73664C48755B2B541E7 /* ObserveOnlyBrokerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */; };
 		011C47B6BED06DC38AD99782 /* GitCleanTreeLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0352B0431749EA554BF06BF /* GitCleanTreeLayoutTests.swift */; };
-		027E1397790B571CBCCA2004 /* BrokerControlClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD40F6DB5889F51004BEF1C9 /* BrokerControlClientTests.swift */; };
 		048E24B33924C66C0A0F484F /* RootShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBB83EF128840150F6F7103D /* RootShellView.swift */; };
 		04F51C3955F0C4BD44AE3B81 /* AcpTerminalHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */; };
 		064587EDDCB61E12B2C9EFBA /* NativeTerminalInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */; };
@@ -39,9 +38,7 @@
 		12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */; };
 		1359E8BDC50E6B9CABE820AC /* DarwinPTYProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 715C7A32E47628665B42A2F0 /* DarwinPTYProcess.swift */; };
 		137B0B37E2B58DE72AC839A2 /* QuietIdentityMarkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */; };
-		13A6A60D6220A630B9631F07 /* ShadowBrokerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02170F9FF53891101DA8198E /* ShadowBrokerService.swift */; };
 		1402D69DCC56FF170B7E18A4 /* QuietStatusClockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */; };
-		165500F38547B802787EB395 /* ShadowBrokerConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = F55D6B3D9C8F9291C4F594FE /* ShadowBrokerConfiguration.swift */; };
 		16EE3B2F8BBC6BC4AFBAC503 /* DetailShowDoors.swift in Sources */ = {isa = PBXBuildFile; fileRef = 055F15AB1B998161AD252189 /* DetailShowDoors.swift */; };
 		1763DAFD85AE9A3BC6ED6D8B /* WorkspaceRestorationNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02A10A6A4198BF7AD4807A20 /* WorkspaceRestorationNotice.swift */; };
 		1780D63195E079FEFBD762C0 /* LocalhostDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBC39D51D190999C81FEFA9D /* LocalhostDetectorTests.swift */; };
@@ -52,29 +49,25 @@
 		1BDB84F1784E42B3CBE221C8 /* MeshDiffSheetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4605B4AACB146A75E39F597 /* MeshDiffSheetTests.swift */; };
 		1C675F4AF5327A3E83E5D7F8 /* CompanionCommandRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */; };
 		1E20031443D573B27CA5E095 /* CustomAgentStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13EBC07FC170BBA533902C87 /* CustomAgentStoreTests.swift */; };
-		1F5D94ECB9133B884B3DD0BC /* BrokerLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50FBA8BAA80816C3072B1FC3 /* BrokerLog.swift */; };
+		200D815E3963C481971281B1 /* BrokerTeardownMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5C548B5809463E7B20AFB69 /* BrokerTeardownMigration.swift */; };
 		209D362D9279CD14816E2F5E /* ToastOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5F1498DA27E5128953C0E0E /* ToastOverlayView.swift */; };
 		20C8CC811E88C38BEBF9C371 /* AcpTranscriptStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A4673AB95018489B81132A /* AcpTranscriptStoreTests.swift */; };
 		20F63B2966AEF56EC965FC9D /* AccountHeadroomTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1186936559305BAEF5106851 /* AccountHeadroomTests.swift */; };
 		2259110A01D9CAE6B9DACDFE /* kaisola-icon.icns in Resources */ = {isa = PBXBuildFile; fileRef = 90A94C83E7A4D1EB77644187 /* kaisola-icon.icns */; };
 		2269345E0332FD5546F7659A /* CompanionListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30302FC993E589B6B0D08005 /* CompanionListener.swift */; };
-		229B44FDFC7BDDD805F2DDEE /* SwiftSessionBrokerConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 745B1EA1A58041D7D42DE58D /* SwiftSessionBrokerConfigurationTests.swift */; };
 		231DEC0938A5D1EE5222341B /* CompanionTerminalStreamHubTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02B0ACCF7CCDBD5F320201EC /* CompanionTerminalStreamHubTests.swift */; };
 		238020DBF76BFC455A16486B /* McpConfigStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B645C36AE63ACE3FAEDDCE0C /* McpConfigStoreTests.swift */; };
 		23A111A6EC49759BCB9C3D55 /* BrokerModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D98396E44670C6412BE1415 /* BrokerModels.swift */; };
 		250A8DA2481E3C90D8F6D652 /* MarkdownListIndent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B05AE61B5ED532BD4FEF019 /* MarkdownListIndent.swift */; };
 		25499203FCB994206D99C34D /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = 70A119130CC9C8CB74AEBA5F /* SwiftTerm */; };
 		25BFFB0D3C7D7C7D9800919D /* KaisolaCore in Frameworks */ = {isa = PBXBuildFile; productRef = AD6C0B5E5BAC7C78414F4162 /* KaisolaCore */; };
-		26DA6B9F10D3882138885E95 /* SwiftSessionBrokerShadowIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C7441963D21C24B5C40A843 /* SwiftSessionBrokerShadowIntegrationTests.swift */; };
 		27677409CAA8A4C646F990C9 /* SessionPinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2C127B15864D9B20EE61750 /* SessionPinStore.swift */; };
-		2A036B8D354950B0C99C64C9 /* ObserveOnlyBrokerHistoryPagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E1D8BD37B438582BF78F52C /* ObserveOnlyBrokerHistoryPagingTests.swift */; };
 		2B0106FB232612C7046A680A /* CodeEditorViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7E991B45873080FAD43C47 /* CodeEditorViewTests.swift */; };
 		2BF9CEBCA7CFB95452D31EFD /* CompanionIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AF176037F884FCA78D3646F /* CompanionIdentityStore.swift */; };
 		2D4F3E75A2BD0372C6732DC0 /* NativeTerminalSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */; };
 		2D548448B8258638948FF620 /* AcpTranscriptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0BA874BD9613768958ED354 /* AcpTranscriptStore.swift */; };
 		2D87B2E1CE804065E07728CC /* RememberedSessionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8A8DBF7E5E633D17ADDE128 /* RememberedSessionCatalog.swift */; };
 		2DDDCA865F413721721D800C /* ApiKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */; };
-		2EEAAAC8E8944A0A47F12576 /* BrokerGenerationRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D917DA578BC63AF251ADA075 /* BrokerGenerationRoutingTests.swift */; };
 		2EEF618C0672590D5F84E02E /* InstructionFileStaleness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B86A2CF95725BC0B94C0DF1 /* InstructionFileStaleness.swift */; };
 		2F5FE737F53A209D9EF0884A /* AcpTerminalHostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */; };
 		2FB7A43822C41E01166489DE /* MarkdownTaskToggleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43DE8262D5D789B8D0AF17B1 /* MarkdownTaskToggleTests.swift */; };
@@ -89,10 +82,10 @@
 		3769FF88F6731888F7913E56 /* ProjectTint.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */; };
 		380F8D745A8FFB7E44651A98 /* ClosedLifecycleStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */; };
 		38943553D49563BB8063182C /* AppModelBookkeeping.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */; };
-		395CF5D2389A3A14D23A5888 /* BrokerDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */; };
 		3A3057A403EEDE75E24FCFE6 /* NativeUpdateConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 269A1E4D253C170CBDB084CA /* NativeUpdateConfiguration.swift */; };
 		3AE49E8F43BBA4A83E3DAEEF /* TerminalLinkRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CAA069E2630D2CF6971FFE2 /* TerminalLinkRoutingTests.swift */; };
 		3B6F860742DA560F55B27009 /* BrokerProtocolTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 911A85E1C6FBFB0A08B51446 /* BrokerProtocolTypes.swift */; };
+		3BCCE3075B460AD12D09F50D /* libKaisolaSessionBrokerCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 73B1D9B33957C20761D198F9 /* libKaisolaSessionBrokerCore.a */; };
 		3C0717751127B8CD4BE8359F /* AcpProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FAD1CF1DFF4378CF3677E4A /* AcpProcessIntegrationTests.swift */; };
 		3D355C6C5B793869FC49D708 /* AcpComposerModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67FEB4FC59825677F0542D06 /* AcpComposerModelTests.swift */; };
 		3D5D2BB9AF69D483F5E7B602 /* CompanionHostFoundationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54C430C9213147C88D3B98F9 /* CompanionHostFoundationTests.swift */; };
@@ -100,16 +93,15 @@
 		3DF59BE4339CBB2D9339AB60 /* AuthModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95607C26D9D00EAA7955A72D /* AuthModel.swift */; };
 		3DF637B8B4F213C7FACFBF9E /* CompanionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40508869DD92A10AE3EF0352 /* CompanionHost.swift */; };
 		405642754B45AED95E4283BA /* CommandRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = F415566C0592DEBE80C0A642 /* CommandRegistry.swift */; };
+		409175ECDFD0BF3EA674B47D /* InProcessTerminalServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */; };
 		41C16D5DE1E0A270FBCB9BBE /* SessionPinStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B2E1FD28106BD28EB2758AE /* SessionPinStoreTests.swift */; };
 		41FC00FDC2261CDFEE5EA5D3 /* CompanionPairingCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C12BBC20CE649CC674E0BF6 /* CompanionPairingCoordinator.swift */; };
 		4335877BBB53DF40796FDB4D /* MarkdownReadingTypeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A87FB43ED1B4D822CDFD726 /* MarkdownReadingTypeTests.swift */; };
 		438E0552CA9EAAAB09ED0C1B /* ProjectTabStripView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BBE0412CE376DD5EA36FC81 /* ProjectTabStripView.swift */; };
-		43D055006D996EBBAAA8EB67 /* BrokerGenerationRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = D076BF05CC777C8363D4066D /* BrokerGenerationRegistry.swift */; };
 		445679CA685A335A1E58CC6E /* NativeVisualLayoutAudit.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF04D4E52D6D1F5FAE4E6FA2 /* NativeVisualLayoutAudit.swift */; };
 		445F0B98BA9637A2980CFB1A /* FirebaseAuthBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD76B9C89A35C06E7942F6D6 /* FirebaseAuthBackend.swift */; };
 		4552F75BAE695B4A4E2327A3 /* AcpProcessTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */; };
 		45BDB67E55C8E0C6B1F2FF3E /* AcpComposerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */; };
-		461796BC63E29B3BAD8CAB8D /* BrokerBootstrapMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */; };
 		46BA25D027D7A256C24EB26B /* AccountRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5BAFFCCA8277AEFF3F83AF7 /* AccountRouter.swift */; };
 		46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */; };
 		479DE2FE9457787C45E9E44D /* AccountRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07BD11CA9BE6F5EEFA96519F /* AccountRouterTests.swift */; };
@@ -124,24 +116,20 @@
 		4E6A3E96C33819EB4C16738C /* FilePreviewRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E5069F25B113346A58119D3 /* FilePreviewRecovery.swift */; };
 		4F2D5C5B7F7CFDEC0554F3A7 /* AppModel+QuickActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */; };
 		4F54CE61D748E5469408987F /* UsageCenterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E321EB733F62BC0E2D6CF1AF /* UsageCenterTests.swift */; };
-		50279221F9A37C996D021083 /* BrokerConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E41619A5DB920EB695D01FD /* BrokerConnection.swift */; };
 		50D43293D5D16358308D0E77 /* PreviewMappingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1630C2BF94B82E3E1CE1529D /* PreviewMappingTests.swift */; };
 		50E4AD9DC49C82B758116FCF /* TerminalTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9BB2E9EA7403C1040B07AB9 /* TerminalTheme.swift */; };
 		50EF121B774D27CEBAE34AF7 /* MarkdownRevealStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CE3E6CD9D6D19BBB6E3FDCA /* MarkdownRevealStateTests.swift */; };
 		51DE82B8956A88B420079EDE /* AttentionInboxModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC5460B6E0069C69E57550C /* AttentionInboxModelTests.swift */; };
-		51E20BB18D6A545E5DBCBD0A /* AppModelBrokerFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */; };
 		52AE6E4E8BA301B6D72A0A5E /* QuietProjectRail.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1963B69A68F8B8B3326F9E /* QuietProjectRail.swift */; };
 		56020A049B6645F55D0B9AD0 /* ProjectAccountStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B629B0BA3C5297E755F46087 /* ProjectAccountStoreTests.swift */; };
 		564D45F6C7CAD6E523055578 /* GitRefreshPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49280DD117D97BF6CBB23B5 /* GitRefreshPolicy.swift */; };
 		5664AAD1A82D16414660D3E2 /* ProjectAccountSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E29DC702C486362350335C94 /* ProjectAccountSelectionTests.swift */; };
-		5729303DDAE35AC5A424D440 /* BrokerGenerationRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58E98EB49F192C275F6621D9 /* BrokerGenerationRouting.swift */; };
 		5760827CF9F4168466291A60 /* CustomAgentsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = F962ED6ABB7DF6857352C351 /* CustomAgentsSection.swift */; };
 		595E74C762DF125BE0076FEF /* NativeUpdateConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */; };
 		5B9D83461433539D662A2E0E /* MarkdownIncrementalStyleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C7A4F2FAC61FD9BED492FAD /* MarkdownIncrementalStyleTests.swift */; };
 		5BF12B4AEA260B658F89B865 /* PreviewPreparationBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F31D5C02E5186D5E22284E23 /* PreviewPreparationBudgetTests.swift */; };
 		5C7D76CFED4EEF89851A4184 /* MarkdownRevealState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D5896A204E6F9F7450DBABF /* MarkdownRevealState.swift */; };
 		5E7F7A75F43B6ED23B0A0C71 /* MarkdownAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2D6020A7FBF1683EB7484D0 /* MarkdownAssets.swift */; };
-		5EA24E714C9FF79494C0DDFA /* BrokerStartupCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */; };
 		60AA9AEBE492C9A60C2E6D65 /* TerminalInputPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8706659D242DB21B7FFB17CB /* TerminalInputPolicy.swift */; };
 		61101714425568F6003C559A /* AttentionCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD79D4F2FC6603ED61013FA9 /* AttentionCenter.swift */; };
 		619C44E67FF8ED816D7B7E4A /* MarkdownListIndentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F32E2D8B5187D1E4FC770A6 /* MarkdownListIndentTests.swift */; };
@@ -159,9 +147,6 @@
 		6A17D13258D14DC0222A37FA /* FilePreviewContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2245F534D44AA15E71263FA8 /* FilePreviewContent.swift */; };
 		6B55D776CEFB9CF47F289629 /* DarwinPTYChild.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8871E43479CC256C0EE6B01D /* DarwinPTYChild.swift */; };
 		6D39F55B8ABC3C6DA2B46827 /* QuickActionsBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 995477C896372B075A7640B8 /* QuickActionsBar.swift */; };
-		6E8756D55ADB435BF33E5D5E /* KaisolaBrokerProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = BE5CAEF422CD9708D0FE4084 /* KaisolaBrokerProtocol */; };
-		6EAC794B55DA08FD078D9BAA /* BrokerBootstrapXPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CF54122B716B55D67623C3F /* BrokerBootstrapXPC.swift */; };
-		6FC06029C8643A919750FD77 /* BrokerBootstrapService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD5419F311EE385C8A43CD8 /* BrokerBootstrapService.swift */; };
 		6FF083B2FF23AA15D7648E9F /* QuietSessionStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = E871B07C959F4B3AA9233CFE /* QuietSessionStatus.swift */; };
 		7220383F52A27FECE4EA9D08 /* CompanionConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = C77EC0A7729995A36851FD19 /* CompanionConnection.swift */; };
 		722940467ACF9EDDCCFEF652 /* AcpComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 446E609412A194ED4620DCDF /* AcpComposerView.swift */; };
@@ -175,9 +160,7 @@
 		768806706220AA2FBF980582 /* TranscriptSearchBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */; };
 		77A3BE106C196A76FF285F1F /* AgentFileFollow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 856354DE0BB8187DD641F300 /* AgentFileFollow.swift */; };
 		786500F83F08DE46B17C8103 /* TerminalOutputBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DDB27378A66D4739F467B46 /* TerminalOutputBuffer.swift */; };
-		798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		7A0EA1291D2559FF2EED0F00 /* NewSessionChooserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 578ABCFAF2467405A0B82B92 /* NewSessionChooserTests.swift */; };
-		7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */; };
 		7BC7DA25DFE3CD7C27BF3EBD /* ExtensionsSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09871A17CA3466F16953DC55 /* ExtensionsSettingsModel.swift */; };
 		7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */; };
 		7DAB0AD69D2C07C5526C14B9 /* ProjectAccountsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */; };
@@ -201,12 +184,9 @@
 		89543933B6E63A62D1EA271E /* QuickActionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 172BD0290C1A7F15B30D881B /* QuickActionStoreTests.swift */; };
 		897B77B765BE67C87E3258C5 /* SidebarScrollPinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED0277730A353A218BAC1101 /* SidebarScrollPinTests.swift */; };
 		89C7CC13ADA6A74DA94F405B /* MeshSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA63C78CB95AECCF06926DB8 /* MeshSession.swift */; };
-		8B8F9D7E715AC5693879B9FC /* BrokerStartupCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */; };
-		8BB60C4F46574BE004C9D594 /* SwiftSessionBrokerFreshEndToEndTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8BBD75931C41A31E12A79B /* SwiftSessionBrokerFreshEndToEndTests.swift */; };
 		8BDA99F9EAB9C98190CA3E86 /* FuzzyMatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */; };
 		8C6E07F0D42D5F9F9BEF3EFF /* AppModelReconnectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */; };
 		8FED7792428E2FE62331CB0A /* CustomGrammarRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BC1C07309495EC7EC2B4AD2 /* CustomGrammarRegistryTests.swift */; };
-		903E732834F463F07A9BAF02 /* ObserveOnlyBrokerPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */; };
 		90445DE80EF3DDAF57B4D896 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = CDA6393EA6C175126B5799D6 /* Sparkle */; };
 		907211E885D959CE7539719F /* AcpClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B1563BF7D126A8B5C295EA7 /* AcpClient.swift */; };
 		9092652655231F8741CB4840 /* ApiKeysSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B1A175C81DA229AA3A9DFE1 /* ApiKeysSettingsTab.swift */; };
@@ -222,7 +202,6 @@
 		95094E0BFA321F0CDBB34A25 /* AuthModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */; };
 		951FE358054F4005AD3EB755 /* MeshDiffSheetState.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92F33A6CD9755CAF9D868B0 /* MeshDiffSheetState.swift */; };
 		962C060B2EF48F35A66AAEDD /* AppModel+Pinning.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */; };
-		9871B1188DC281FDBF7088AD /* BrokerControlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */; };
 		98882138088B682565342107 /* AcpPermissionRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */; };
 		999ED8CCA027C3B3C2691A18 /* TerminalOptionClickTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C39FF0D2776D41DC0294227 /* TerminalOptionClickTests.swift */; };
 		99E6D86EF216D99AA0A13755 /* CompanionTerminalControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E438E95AD251C6069A846859 /* CompanionTerminalControlTests.swift */; };
@@ -232,12 +211,10 @@
 		9B22C7B2D49CF22D2374964D /* DesktopChromaMeasureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD91E3C10425B025BF5441 /* DesktopChromaMeasureTests.swift */; };
 		9C0F1C05560CAA34F45C43B8 /* CompanionEventLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E90B4D2D24769D0CEB3DD2B /* CompanionEventLogTests.swift */; };
 		9C3E6C7EFE9AB39FC8360B0D /* NativeVisualLayoutAuditTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5076882199B6B8FFA0A323A /* NativeVisualLayoutAuditTests.swift */; };
-		9C3EB0769AFF798B9B98FBE1 /* BrokerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4AF4AEE4E9155639C2E812D /* BrokerServer.swift */; };
 		9C6DEADB2F56662E21B02311 /* DesktopWallpaperResolution.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC22ACE9C4D6019F734568D5 /* DesktopWallpaperResolution.swift */; };
 		9CF1B17121C7EA3A74101CD7 /* TerminalThemeRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B1E8D66FD540F29E239E3E /* TerminalThemeRegistryTests.swift */; };
 		9D8B0AB207CB7097EB17FD0B /* UsageSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB03F186495669D5F881F00E /* UsageSettingsTab.swift */; };
 		9D9F0944BD72F9C09E3A2B09 /* NativePreviewPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */; };
-		9DB217E145925411CB5A2A84 /* BrokerRequestGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9608644964317043ED13E235 /* BrokerRequestGate.swift */; };
 		9DFA6E1632DEEDAA96201159 /* BrowserCardAccessibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FE676EDAF6FA950986AB45F /* BrowserCardAccessibilityTests.swift */; };
 		9E7E972525952B3086B87964 /* FreshTerminalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 025695839B8931044DAD2F2C /* FreshTerminalStore.swift */; };
 		A03F00327572BDE3A12D2187 /* SessionAdoptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35BDE208E1EC7A98B2ECAA87 /* SessionAdoptionStore.swift */; };
@@ -270,10 +247,7 @@
 		B31E292AEB6FAAB870582010 /* AccountSignInController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4847C0EA490C12B1F64A4B5C /* AccountSignInController.swift */; };
 		B417F4F52D40B81736E1F7CC /* SavedWindowsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */; };
 		B566395F4947361F71EF2293 /* TerminalScrollbackDepthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3B5EDEC3440E3166941306C /* TerminalScrollbackDepthTests.swift */; };
-		B571635820C717C9ADE49531 /* KaisolaBrokerProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = A6EC4526BD528A7E1586CBCD /* KaisolaBrokerProtocol */; };
-		B5C0E8FF89A7B0B01445686A /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		B64B3788574C41B5D0BC8A4A /* SessionOrderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27165DF5641D8A7739273769 /* SessionOrderStore.swift */; };
-		B68BE361569352A22826DEC3 /* BrokerAuthentication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C46CF60802D04C20404D2DF /* BrokerAuthentication.swift */; };
 		B690C4F444061ABE357D8C02 /* MarkdownInlineFormattingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BC8C1434D04E2FD29D366DE /* MarkdownInlineFormattingTests.swift */; };
 		B9E42D4C5DC974E0AAFA2D99 /* ToastCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81A1444F9C5905630D1DC018 /* ToastCenter.swift */; };
 		BA06D02D0D784812DFE9BD1C /* NotificationBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37780782E5170FFD4996C1D8 /* NotificationBridgeTests.swift */; };
@@ -297,8 +271,6 @@
 		C109697A36B8E2CDC10ED68C /* GitService+PR.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC761EFF29AA2C76D917C3DA /* GitService+PR.swift */; };
 		C19C7088849EC2E91A9EB2B2 /* FileTreeModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEA4E3B7B25D187C019B2CC9 /* FileTreeModel.swift */; };
 		C3C6A0FA37B46A4E2561429A /* AcpChatHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */; };
-		C48769F696CFCF2B9A0FA5F3 /* KaisolaSessionBrokerMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2C2D3E0FFD2D59255FD53EC /* KaisolaSessionBrokerMain.swift */; };
-		C54F3D4D964B74CE046A5040 /* SwiftSessionBrokerFreshWireTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6868A3535831325A32CAC18A /* SwiftSessionBrokerFreshWireTests.swift */; };
 		C65CB916FA1AB7DB4A99769F /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45799AC8A5D80828BB3EB235 /* AppModel.swift */; };
 		C6B77BD965183EA73469C7A1 /* GitPanelModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 007B60933A677DAD3CB98F9D /* GitPanelModelTests.swift */; };
 		C8A9DC583907630A05DC6A71 /* MarkdownTaskToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 329E359F992EAA9A5B6CE522 /* MarkdownTaskToggle.swift */; };
@@ -308,7 +280,6 @@
 		CD43D40E248EEF8E5B5D41E0 /* AcpComposerMenuView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE80FA0295453D77144074F1 /* AcpComposerMenuView.swift */; };
 		CDC7BC20F1CECF9BB283CA58 /* BrokerHelperPackageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */; };
 		CE2036C2C15219A63B1E36B2 /* CompanionProjectionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 142C8737C1900DE903FF5E87 /* CompanionProjectionBuilder.swift */; };
-		CEFF0B4FF8E2FB74846A125F /* libKaisolaSessionBrokerCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 73B1D9B33957C20761D198F9 /* libKaisolaSessionBrokerCore.a */; };
 		CF3950FAA193A0B68E569A8C /* DataPreviewsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0AA3187DEE4894928C6341 /* DataPreviewsTests.swift */; };
 		CF3A73BF1400EC4646AE71EF /* GlobalHotkeyCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */; };
 		D03D33CB4441F782774F21CD /* QuietIdentityMark.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAE3A01EB2EEB4DDB4267B50 /* QuietIdentityMark.swift */; };
@@ -336,11 +307,9 @@
 		DD85F3B3C80646A550454B5B /* NativeUpdateCheckRaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF12007D0734A61652801B2B /* NativeUpdateCheckRaceTests.swift */; };
 		DD88322BBB0BD5470118188E /* OmniBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83D17767E2F2F48BE60D3518 /* OmniBarView.swift */; };
 		DD89F25377A4D52E5ED66886 /* PlanUsageSnapshotStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22F183A542A74098D9877FD8 /* PlanUsageSnapshotStoreTests.swift */; };
-		DDB3209BE08014BA8D392778 /* SwiftSessionBrokerCoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3F91F45B36C1BE91239FA12 /* SwiftSessionBrokerCoreTests.swift */; };
 		DDE8DE7312A55EEAC190CF53 /* FilePreviewEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5CC774EC646C7FF89176197 /* FilePreviewEditors.swift */; };
 		DE3AC5C4180DE02722CB1470 /* CompanionEventLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DFAD4E1DBEFB8075FE1DE21 /* CompanionEventLog.swift */; };
 		E10CE269EF3E4658005F823A /* MarkdownInlineFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED9671A8C3521DD5DBBDC145 /* MarkdownInlineFormatting.swift */; };
-		E1DAD231CBE5620F9B604C58 /* BrokerGenerationRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5531DF3E35ADBE7EBBA1054E /* BrokerGenerationRegistryTests.swift */; };
 		E2484D69B0F74307AC81294B /* PreviewMappingStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD11C0718AB79EB611A1B01B /* PreviewMappingStore.swift */; };
 		E255262499CA22D8FB25AD64 /* CompanionTerminalControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D10523E5E2321CBD2C8C1C2 /* CompanionTerminalControl.swift */; };
 		E2DC7F36968EA13B0E6FB431 /* AccountSignInSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E2B204EE7B57EDF7B64A59 /* AccountSignInSheet.swift */; };
@@ -348,17 +317,15 @@
 		E413575336FF1CA3C15A0339 /* TerminalCursorStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */; };
 		E47FD4F392895FEC52E1D3A1 /* TerminalFontOptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00599FEEB522F6C880664E5E /* TerminalFontOptions.swift */; };
 		E5AF1D08B4924F79ECC5CCF0 /* SessionPaneLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D546C26BAA99A03D0E76CA7 /* SessionPaneLayout.swift */; };
-		E6781527DAD43EDB96DBD461 /* BrokerHelperPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */; };
+		E73B3D87FCE1A558D5083FE9 /* TerminalServing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56037517DA6DBC5B24A76CF0 /* TerminalServing.swift */; };
 		E7EC945D70A1071B42558C89 /* CompanionDeviceRosterStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 481C565423F2C82B8F330468 /* CompanionDeviceRosterStore.swift */; };
 		E8ECC0EF46B7927129A02CDB /* NativeVisualLayoutProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99BEB5C842957215BC0F09A1 /* NativeVisualLayoutProbe.swift */; };
 		EA0D0D3DAFF6CDF0B33FC8AA /* SessionAdoptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD95A9C0C35F965BA5D79A1 /* SessionAdoptionTests.swift */; };
 		EA33B02175AA9D20E233B9CB /* AcpTranscriptDisplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74AAAAE49A6503341D8C4367 /* AcpTranscriptDisplayTests.swift */; };
-		EB35F29036B0051D6ED3BCBD /* BrokerLaunchConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9EDBEF947F0725DF51BDA4 /* BrokerLaunchConfigurationTests.swift */; };
 		EB574B84578D2F2C9608D94E /* CompanionProjectionBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53F710A393B9F0B30F9D2F91 /* CompanionProjectionBuilderTests.swift */; };
 		EBD24B42377F41E7D46E8E94 /* AppModelTerminalRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */; };
 		EC2DA4A5EEE7309740A3F8FF /* CompanionCommandRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A6971FB4400D5FB64CC8D8C /* CompanionCommandRouter.swift */; };
 		EE3A241AFCCC6C58D0648592 /* TerminalDocumentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */; };
-		EF4D751CD470308338C7C585 /* BrokerBootstrapClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */; };
 		EF5C4926C6A1A69767C3ECB2 /* BrowserCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D651B2D78C5F94B243E1DC2 /* BrowserCardView.swift */; };
 		F17344ADF8D1552B4E8CA59B /* TerminalAccessibilityAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1F794A610279AFCEC8CB0B0 /* TerminalAccessibilityAdapter.swift */; };
 		F20A050AB66C47DB5951E23F /* SwiftSessionBrokerDarwinPTYTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 503BC75494F340E8E97BA347 /* SwiftSessionBrokerDarwinPTYTests.swift */; };
@@ -369,17 +336,12 @@
 		F4248E5440AD98344F6FAF7F /* QuietStatusDerivation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */; };
 		F4C6C5462997C4F025270D7D /* CustomAgentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */; };
 		F512DF3A0328EE87D174211C /* TerminalSemantics.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6886FE576953B0452EE0392 /* TerminalSemantics.swift */; };
-		F5139A7FD8A6FD7EEFABB6AB /* BrokerBootstrapXPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CF54122B716B55D67623C3F /* BrokerBootstrapXPC.swift */; };
-		F54657F1A6F671121F2FB2B3 /* ObserveOnlyBrokerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */; };
 		F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */; };
 		F70671167EAC7B9AB373F0DF /* PermissionRuleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */; };
 		F8C6FB0C2C3588D89201E634 /* SourceOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F83577979FF0B2A400B8F40 /* SourceOutline.swift */; };
-		F958069AD757FAAC93656C6C /* UnixBrokerTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */; };
 		F9F0465E4528725BBF84B7B3 /* NativeSessionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 977E366BEE44EBE7CFFBB95C /* NativeSessionStoreTests.swift */; };
-		FA8353B1B2AB10089716A151 /* ObserveOnlyBrokerPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */; };
 		FB7229562C7FBCA9222943F5 /* MemoryEfficiencyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CDC4E10ECDC8ECE407EBA0E /* MemoryEfficiencyTests.swift */; };
 		FBB4B0FC354CDCDF1137BC9D /* CompanionLinkClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B38FA4E8BE113F582193C3D /* CompanionLinkClientTests.swift */; };
-		FDC5506D285BD3B14AF4EE60 /* BrokerGenerationLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -390,20 +352,6 @@
 			remoteGlobalIDString = 17E8C989CC3B5148CB5E9F8D;
 			remoteInfo = KaisolaSessionBrokerCore;
 		};
-		47609B9F37DDA655235E3640 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 17E8C989CC3B5148CB5E9F8D;
-			remoteInfo = KaisolaSessionBrokerCore;
-		};
-		5E74CCBED7EA9CDB6685115A /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = C1257D48B7D18F8C7A09749F;
-			remoteInfo = KaisolaSessionBroker;
-		};
 		832B1C42EEBDF6D88B23DD7B /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
@@ -411,31 +359,22 @@
 			remoteGlobalIDString = 9B50D5869255FBBB6D735F0F;
 			remoteInfo = Kaisola;
 		};
-		C15E1FD744DEEB6A74694F4C /* PBXContainerItemProxy */ = {
+		A7952B9D819F3945D5742250 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = C1257D48B7D18F8C7A09749F;
-			remoteInfo = KaisolaSessionBroker;
-		};
-		D839152744A3B4DC8274FA0B /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 5F21F0B81FB243F899A42E72;
-			remoteInfo = KaisolaBrokerBootstrap;
+			remoteGlobalIDString = 17E8C989CC3B5148CB5E9F8D;
+			remoteInfo = KaisolaSessionBrokerCore;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		00599FEEB522F6C880664E5E /* TerminalFontOptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFontOptions.swift; sourceTree = "<group>"; };
 		007B60933A677DAD3CB98F9D /* GitPanelModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPanelModelTests.swift; sourceTree = "<group>"; };
-		02170F9FF53891101DA8198E /* ShadowBrokerService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowBrokerService.swift; sourceTree = "<group>"; };
 		025695839B8931044DAD2F2C /* FreshTerminalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreshTerminalStore.swift; sourceTree = "<group>"; };
 		02A10A6A4198BF7AD4807A20 /* WorkspaceRestorationNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRestorationNotice.swift; sourceTree = "<group>"; };
 		02B0ACCF7CCDBD5F320201EC /* CompanionTerminalStreamHubTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalStreamHubTests.swift; sourceTree = "<group>"; };
 		0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedWindowsStoreTests.swift; sourceTree = "<group>"; };
-		03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerStartupCoordinator.swift; sourceTree = "<group>"; };
 		03D353DD4B961BC738DA5F81 /* MarkdownLivePreviewFidelityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownLivePreviewFidelityTests.swift; sourceTree = "<group>"; };
 		0441702AA1CD407632FB480D /* SessionPaneLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPaneLayoutTests.swift; sourceTree = "<group>"; };
 		055F15AB1B998161AD252189 /* DetailShowDoors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailShowDoors.swift; sourceTree = "<group>"; };
@@ -449,7 +388,6 @@
 		0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaProductMigration.swift; sourceTree = "<group>"; };
 		0AB5FB00194BD732F0ED70ED /* AcpTranscriptDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptDisplay.swift; sourceTree = "<group>"; };
 		0B2E1FD28106BD28EB2758AE /* SessionPinStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPinStoreTests.swift; sourceTree = "<group>"; };
-		0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */ = {isa = PBXFileReference; includeInIndex = 0; path = KaisolaBrokerBootstrap; sourceTree = BUILT_PRODUCTS_DIR; };
 		0D0C0AB93E53CC4CC7AA3A38 /* AccountSignInControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInControllerTests.swift; sourceTree = "<group>"; };
 		0E326DD35DF6CC17C6784988 /* NativeTerminalCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalCoordinator.swift; sourceTree = "<group>"; };
 		1186936559305BAEF5106851 /* AccountHeadroomTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountHeadroomTests.swift; sourceTree = "<group>"; };
@@ -471,11 +409,9 @@
 		1B38FA4E8BE113F582193C3D /* CompanionLinkClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionLinkClientTests.swift; sourceTree = "<group>"; };
 		1BD4781AB13C9F9EFBB84530 /* DesktopBackdropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopBackdropRenderer.swift; sourceTree = "<group>"; };
 		1CE3E6CD9D6D19BBB6E3FDCA /* MarkdownRevealStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownRevealStateTests.swift; sourceTree = "<group>"; };
-		1CF54122B716B55D67623C3F /* BrokerBootstrapXPC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapXPC.swift; sourceTree = "<group>"; };
 		1D546C26BAA99A03D0E76CA7 /* SessionPaneLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPaneLayout.swift; sourceTree = "<group>"; };
 		1DBE251CF21C42D3D77AA57C /* NativeSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeSessionStore.swift; sourceTree = "<group>"; };
 		1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
-		1E1D8BD37B438582BF78F52C /* ObserveOnlyBrokerHistoryPagingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerHistoryPagingTests.swift; sourceTree = "<group>"; };
 		1E90B4D2D24769D0CEB3DD2B /* CompanionEventLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionEventLogTests.swift; sourceTree = "<group>"; };
 		2245F534D44AA15E71263FA8 /* FilePreviewContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewContent.swift; sourceTree = "<group>"; };
 		22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageMeterPalette.swift; sourceTree = "<group>"; };
@@ -529,7 +465,6 @@
 		44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStore.swift; sourceTree = "<group>"; };
 		443F6E111E133DACE49BA345 /* CustomGrammarStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomGrammarStore.swift; sourceTree = "<group>"; };
 		446E609412A194ED4620DCDF /* AcpComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerView.swift; sourceTree = "<group>"; };
-		455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapClient.swift; sourceTree = "<group>"; };
 		45799AC8A5D80828BB3EB235 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClosedLifecycleStoreTests.swift; sourceTree = "<group>"; };
 		46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivation.swift; sourceTree = "<group>"; };
@@ -538,7 +473,6 @@
 		4847C0EA490C12B1F64A4B5C /* AccountSignInController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInController.swift; sourceTree = "<group>"; };
 		48B188286E91EA94C628221F /* TerminalFileLinkResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFileLinkResolver.swift; sourceTree = "<group>"; };
 		496E90C9073FF30527C9C128 /* ApiKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeyStore.swift; sourceTree = "<group>"; };
-		4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBrokerFallbackTests.swift; sourceTree = "<group>"; };
 		4A75B9CDDB712B8E40FD295E /* AppModelBookkeepingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeepingTests.swift; sourceTree = "<group>"; };
 		4A9119A3AFA982A1A42C4356 /* McpSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = McpSettingsTab.swift; sourceTree = "<group>"; };
 		4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatView.swift; sourceTree = "<group>"; };
@@ -548,36 +482,27 @@
 		4E6225F81B83882F5395725D /* WorkspaceRestorationNoticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRestorationNoticeView.swift; sourceTree = "<group>"; };
 		502B709E629F1098130633B7 /* FilePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewView.swift; sourceTree = "<group>"; };
 		503BC75494F340E8E97BA347 /* SwiftSessionBrokerDarwinPTYTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerDarwinPTYTests.swift; sourceTree = "<group>"; };
-		50FBA8BAA80816C3072B1FC3 /* BrokerLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerLog.swift; sourceTree = "<group>"; };
 		5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeUpdateController.swift; sourceTree = "<group>"; };
 		53455843EE4C394EEF0158BC /* MeshSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshSessionTests.swift; sourceTree = "<group>"; };
 		53F710A393B9F0B30F9D2F91 /* CompanionProjectionBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionProjectionBuilderTests.swift; sourceTree = "<group>"; };
 		54C430C9213147C88D3B98F9 /* CompanionHostFoundationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionHostFoundationTests.swift; sourceTree = "<group>"; };
-		5531DF3E35ADBE7EBBA1054E /* BrokerGenerationRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRegistryTests.swift; sourceTree = "<group>"; };
+		56037517DA6DBC5B24A76CF0 /* TerminalServing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalServing.swift; sourceTree = "<group>"; };
 		5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeyStoreTests.swift; sourceTree = "<group>"; };
 		578ABCFAF2467405A0B82B92 /* NewSessionChooserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionChooserTests.swift; sourceTree = "<group>"; };
-		58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerLaunchConfiguration.swift; sourceTree = "<group>"; };
-		58E98EB49F192C275F6621D9 /* BrokerGenerationRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRouting.swift; sourceTree = "<group>"; };
 		59057824C59D8B945BB9D032 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		5B7E991B45873080FAD43C47 /* CodeEditorViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeEditorViewTests.swift; sourceTree = "<group>"; };
 		5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptPagingTests.swift; sourceTree = "<group>"; };
-		5BFB9DD2C8A262C2BFD5EF95 /* KaisolaSessionBroker */ = {isa = PBXFileReference; includeInIndex = 0; path = KaisolaSessionBroker; sourceTree = BUILT_PRODUCTS_DIR; };
-		5C46CF60802D04C20404D2DF /* BrokerAuthentication.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerAuthentication.swift; sourceTree = "<group>"; };
 		5C7A4F2FAC61FD9BED492FAD /* MarkdownIncrementalStyleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownIncrementalStyleTests.swift; sourceTree = "<group>"; };
 		5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalInteractionTests.swift; sourceTree = "<group>"; };
 		5CC25EF79013C557429B7B46 /* CodeEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeEditorView.swift; sourceTree = "<group>"; };
-		5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicy.swift; sourceTree = "<group>"; };
 		5DBDA82C8362063F78F59EE1 /* GitDirectoryWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitDirectoryWatcher.swift; sourceTree = "<group>"; };
-		5E41619A5DB920EB695D01FD /* BrokerConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerConnection.swift; sourceTree = "<group>"; };
 		5F2770649BEF99AA932FFBDF /* AppAccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppAccountView.swift; sourceTree = "<group>"; };
 		616586FF6B1EBC62BE203518 /* GitService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitService.swift; sourceTree = "<group>"; };
 		624AC8A9BF6A06E8B6ECDB80 /* TerminalReplayFidelityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalReplayFidelityTests.swift; sourceTree = "<group>"; };
-		6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapMain.swift; sourceTree = "<group>"; };
 		678CF5145359C73DCF6F759F /* TerminalImageDrop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalImageDrop.swift; sourceTree = "<group>"; };
 		67FEB4FC59825677F0542D06 /* AcpComposerModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerModelTests.swift; sourceTree = "<group>"; };
 		681E5B3C599B2137041A4E8F /* DataPreviews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataPreviews.swift; sourceTree = "<group>"; };
 		682112A86BEA2294BA686706 /* QuietSessionStatusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietSessionStatusTests.swift; sourceTree = "<group>"; };
-		6868A3535831325A32CAC18A /* SwiftSessionBrokerFreshWireTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerFreshWireTests.swift; sourceTree = "<group>"; };
 		6ADCB2946529900DB087F329 /* KaisolaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KaisolaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettingsTests.swift; sourceTree = "<group>"; };
 		6CDF76F788AF144D1713A04E /* NotificationBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationBridge.swift; sourceTree = "<group>"; };
@@ -586,16 +511,15 @@
 		6E5069F25B113346A58119D3 /* FilePreviewRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewRecovery.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
 		6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel+Pinning.swift"; sourceTree = "<group>"; };
-		6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationLifecycle.swift; sourceTree = "<group>"; };
 		715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyCenter.swift; sourceTree = "<group>"; };
 		715C7A32E47628665B42A2F0 /* DarwinPTYProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DarwinPTYProcess.swift; sourceTree = "<group>"; };
 		723801032158344A02236DFE /* UnifiedSessionCardStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedSessionCardStateTests.swift; sourceTree = "<group>"; };
+		72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InProcessTerminalServiceTests.swift; sourceTree = "<group>"; };
 		732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionOrderStoreTests.swift; sourceTree = "<group>"; };
 		7372202EE0749274E875CC59 /* NewSessionChooserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionChooserView.swift; sourceTree = "<group>"; };
 		73B1D9B33957C20761D198F9 /* libKaisolaSessionBrokerCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libKaisolaSessionBrokerCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		73C156565BA4025A74960AD9 /* GitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitServiceTests.swift; sourceTree = "<group>"; };
 		73DA2DC376948BFD21915726 /* MeshStagedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshStagedTests.swift; sourceTree = "<group>"; };
-		745B1EA1A58041D7D42DE58D /* SwiftSessionBrokerConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerConfigurationTests.swift; sourceTree = "<group>"; };
 		74AAAAE49A6503341D8C4367 /* AcpTranscriptDisplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptDisplayTests.swift; sourceTree = "<group>"; };
 		757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRulesTests.swift; sourceTree = "<group>"; };
 		760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthModelTests.swift; sourceTree = "<group>"; };
@@ -605,7 +529,6 @@
 		7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTerminalRetentionTests.swift; sourceTree = "<group>"; };
 		7D769A7824B33191023D6BB4 /* NativeAppearanceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAppearanceViews.swift; sourceTree = "<group>"; };
 		7DDB27378A66D4739F467B46 /* TerminalOutputBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOutputBuffer.swift; sourceTree = "<group>"; };
-		7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicyTests.swift; sourceTree = "<group>"; };
 		7EDF3E26577EC54B2AC3789E /* PDFPreviewBudget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFPreviewBudget.swift; sourceTree = "<group>"; };
 		7FB737D5C0A6E0BA42FFC65E /* WorkspaceWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceWatcher.swift; sourceTree = "<group>"; };
 		7FD95A9C0C35F965BA5D79A1 /* SessionAdoptionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionAdoptionTests.swift; sourceTree = "<group>"; };
@@ -630,14 +553,11 @@
 		8BC8C1434D04E2FD29D366DE /* MarkdownInlineFormattingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownInlineFormattingTests.swift; sourceTree = "<group>"; };
 		8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NativeSessionStore+AutoTitle.swift"; sourceTree = "<group>"; };
 		8C12BBC20CE649CC674E0BF6 /* CompanionPairingCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionPairingCoordinator.swift; sourceTree = "<group>"; };
-		8C7441963D21C24B5C40A843 /* SwiftSessionBrokerShadowIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerShadowIntegrationTests.swift; sourceTree = "<group>"; };
 		8CB7DE28E2B45B884C38F876 /* UnifiedSessionCardState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedSessionCardState.swift; sourceTree = "<group>"; };
 		8D98396E44670C6412BE1415 /* BrokerModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModels.swift; sourceTree = "<group>"; };
 		8F32E2D8B5187D1E4FC770A6 /* MarkdownListIndentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownListIndentTests.swift; sourceTree = "<group>"; };
 		8F4AAA95E52F45467C0DCC39 /* SwiftSessionBrokerFreshStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerFreshStoreTests.swift; sourceTree = "<group>"; };
-		8F9EDBEF947F0725DF51BDA4 /* BrokerLaunchConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerLaunchConfigurationTests.swift; sourceTree = "<group>"; };
 		8FCBB2E107C280C3B125DF67 /* FuzzyMatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyMatch.swift; sourceTree = "<group>"; };
-		8FD5419F311EE385C8A43CD8 /* BrokerBootstrapService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapService.swift; sourceTree = "<group>"; };
 		90A94C83E7A4D1EB77644187 /* kaisola-icon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = "kaisola-icon.icns"; sourceTree = "<group>"; };
 		911A85E1C6FBFB0A08B51446 /* BrokerProtocolTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerProtocolTypes.swift; sourceTree = "<group>"; };
 		915CF887EF0A17B387C87FAF /* TerminalFontOptionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFontOptionsTests.swift; sourceTree = "<group>"; };
@@ -647,10 +567,8 @@
 		95607C26D9D00EAA7955A72D /* AuthModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthModel.swift; sourceTree = "<group>"; };
 		9586CAAF5EE496B213F01998 /* GitPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPanelView.swift; sourceTree = "<group>"; };
 		9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel+QuickActions.swift"; sourceTree = "<group>"; };
-		9608644964317043ED13E235 /* BrokerRequestGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerRequestGate.swift; sourceTree = "<group>"; };
 		9653464233B6252DE76DC814 /* TerminalSurfaceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSurfaceCache.swift; sourceTree = "<group>"; };
 		96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStoreTests.swift; sourceTree = "<group>"; };
-		96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerClientTests.swift; sourceTree = "<group>"; };
 		977E366BEE44EBE7CFFBB95C /* NativeSessionStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeSessionStoreTests.swift; sourceTree = "<group>"; };
 		991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModelsTests.swift; sourceTree = "<group>"; };
 		995477C896372B075A7640B8 /* QuickActionsBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickActionsBar.swift; sourceTree = "<group>"; };
@@ -661,25 +579,20 @@
 		9CAA069E2630D2CF6971FFE2 /* TerminalLinkRoutingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalLinkRoutingTests.swift; sourceTree = "<group>"; };
 		9D10523E5E2321CBD2C8C1C2 /* CompanionTerminalControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalControl.swift; sourceTree = "<group>"; };
 		9E8A890E106780D1EBC76860 /* WorkspacePersistenceVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspacePersistenceVisibilityTests.swift; sourceTree = "<group>"; };
-		9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerDiscoveryTests.swift; sourceTree = "<group>"; };
 		9FAD1CF1DFF4378CF3677E4A /* AcpProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		A14E04EB9F13D5A9D6834430 /* AttentionInboxModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttentionInboxModel.swift; sourceTree = "<group>"; };
 		A2C7EDA69DE3059B6E1F7333 /* OnboardingStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingStateTests.swift; sourceTree = "<group>"; };
 		A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoffTests.swift; sourceTree = "<group>"; };
-		A4AF4AEE4E9155639C2E812D /* BrokerServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerServer.swift; sourceTree = "<group>"; };
 		A5B1E8D66FD540F29E239E3E /* TerminalThemeRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalThemeRegistryTests.swift; sourceTree = "<group>"; };
 		A5F1498DA27E5128953C0E0E /* ToastOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToastOverlayView.swift; sourceTree = "<group>"; };
-		A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerStartupCoordinatorTests.swift; sourceTree = "<group>"; };
 		A84A690D14C8F442F82CE86E /* CompanionPairingCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionPairingCoordinatorTests.swift; sourceTree = "<group>"; };
 		A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTerminalHost.swift; sourceTree = "<group>"; };
 		A8A8DBF7E5E633D17ADDE128 /* RememberedSessionCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RememberedSessionCatalog.swift; sourceTree = "<group>"; };
-		A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetachedBrokerProcess.swift; sourceTree = "<group>"; };
 		A962C9CEB31001E24F6C64BE /* TerminalMetaService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMetaService.swift; sourceTree = "<group>"; };
 		A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeeping.swift; sourceTree = "<group>"; };
 		AA7EA709ECEB7766D6C3AEEE /* AcpSubagentPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpSubagentPresentation.swift; sourceTree = "<group>"; };
 		AABBF49984658B7AB571E382 /* TerminalResurrectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalResurrectionTests.swift; sourceTree = "<group>"; };
 		AADD91E3C10425B025BF5441 /* DesktopChromaMeasureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopChromaMeasureTests.swift; sourceTree = "<group>"; };
-		AB8BBD75931C41A31E12A79B /* SwiftSessionBrokerFreshEndToEndTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerFreshEndToEndTests.swift; sourceTree = "<group>"; };
 		AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivationTests.swift; sourceTree = "<group>"; };
 		ADDA11F70D5A2C27923186B5 /* WorkspaceRailNameFadeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRailNameFadeTests.swift; sourceTree = "<group>"; };
 		AF04D4E52D6D1F5FAE4E6FA2 /* NativeVisualLayoutAudit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeVisualLayoutAudit.swift; sourceTree = "<group>"; };
@@ -707,9 +620,7 @@
 		BF1963B69A68F8B8B3326F9E /* QuietProjectRail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietProjectRail.swift; sourceTree = "<group>"; };
 		C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusClockTests.swift; sourceTree = "<group>"; };
 		C0E9DAFAB20BAC2549AC31EE /* SyntaxHighlighterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyntaxHighlighterTests.swift; sourceTree = "<group>"; };
-		C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixBrokerTransport.swift; sourceTree = "<group>"; };
 		C2C127B15864D9B20EE61750 /* SessionPinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPinStore.swift; sourceTree = "<group>"; };
-		C3F91F45B36C1BE91239FA12 /* SwiftSessionBrokerCoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftSessionBrokerCoreTests.swift; sourceTree = "<group>"; };
 		C49D972FACEF9F904974B8EB /* SessionTitleTrackerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTitleTrackerTests.swift; sourceTree = "<group>"; };
 		C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownLiveEditor.swift; sourceTree = "<group>"; };
 		C5926CF38392E45AD77539A6 /* AcpAttachmentsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpAttachmentsTests.swift; sourceTree = "<group>"; };
@@ -718,23 +629,21 @@
 		C795387421EFBF56F0594EE7 /* NewSessionDraft.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionDraft.swift; sourceTree = "<group>"; };
 		C849F82D9AF2173A210BBDD8 /* AppAccountRecoveryNoticeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppAccountRecoveryNoticeTests.swift; sourceTree = "<group>"; };
 		C88BF5404563C22955EE7B51 /* UsageCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageCenter.swift; sourceTree = "<group>"; };
-		CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerClient.swift; sourceTree = "<group>"; };
 		CA7E0A7AF7C58D8926909FDB /* AcpDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpDiff.swift; sourceTree = "<group>"; };
 		CB03F186495669D5F881F00E /* UsageSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSettingsTab.swift; sourceTree = "<group>"; };
 		CBB83EF128840150F6F7103D /* RootShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootShellView.swift; sourceTree = "<group>"; };
-		CD40F6DB5889F51004BEF1C9 /* BrokerControlClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerControlClientTests.swift; sourceTree = "<group>"; };
 		CE80FA0295453D77144074F1 /* AcpComposerMenuView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerMenuView.swift; sourceTree = "<group>"; };
 		CEA4E3B7B25D187C019B2CC9 /* FileTreeModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTreeModel.swift; sourceTree = "<group>"; };
 		CF0112BAE21EFB0355FAB3CA /* RememberedSessionCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RememberedSessionCatalogTests.swift; sourceTree = "<group>"; };
 		D011FEC3CB6A3F15FA1FC5AC /* QuietRollupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietRollupTests.swift; sourceTree = "<group>"; };
-		D076BF05CC777C8363D4066D /* BrokerGenerationRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRegistry.swift; sourceTree = "<group>"; };
-		D2C2D3E0FFD2D59255FD53EC /* KaisolaSessionBrokerMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaSessionBrokerMain.swift; sourceTree = "<group>"; };
+		D1A0984F414A3C07722FA764 /* InProcessTerminalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InProcessTerminalService.swift; sourceTree = "<group>"; };
 		D2D6020A7FBF1683EB7484D0 /* MarkdownAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownAssets.swift; sourceTree = "<group>"; };
 		D2E74B62A47941983B368E8F /* ResumeChipEligibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResumeChipEligibility.swift; sourceTree = "<group>"; };
 		D35A5C6B84FD2448711464EB /* RootShellLayouts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootShellLayouts.swift; sourceTree = "<group>"; };
 		D3B5EDEC3440E3166941306C /* TerminalScrollbackDepthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScrollbackDepthTests.swift; sourceTree = "<group>"; };
 		D4605B4AACB146A75E39F597 /* MeshDiffSheetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshDiffSheetTests.swift; sourceTree = "<group>"; };
 		D52B58085865FAA876D950B5 /* GitProcessDeadlineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitProcessDeadlineTests.swift; sourceTree = "<group>"; };
+		D5C548B5809463E7B20AFB69 /* BrokerTeardownMigration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerTeardownMigration.swift; sourceTree = "<group>"; };
 		D5CC774EC646C7FF89176197 /* FilePreviewEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewEditors.swift; sourceTree = "<group>"; };
 		D5E2B204EE7B57EDF7B64A59 /* AccountSignInSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInSheet.swift; sourceTree = "<group>"; };
 		D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaMacAppDelegate.swift; sourceTree = "<group>"; };
@@ -742,11 +651,9 @@
 		D7B13A899955A8094A15E262 /* CompanionConnectionSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionConnectionSessionTests.swift; sourceTree = "<group>"; };
 		D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerHelperPackageTests.swift; sourceTree = "<group>"; };
 		D8FDE37840FBA272560EFB21 /* AcpWordDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpWordDiffTests.swift; sourceTree = "<group>"; };
-		D917DA578BC63AF251ADA075 /* BrokerGenerationRoutingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRoutingTests.swift; sourceTree = "<group>"; };
 		DA63C78CB95AECCF06926DB8 /* MeshSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshSession.swift; sourceTree = "<group>"; };
 		DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRules.swift; sourceTree = "<group>"; };
 		DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
-		DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerControlClient.swift; sourceTree = "<group>"; };
 		DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietIdentityMarkTests.swift; sourceTree = "<group>"; };
 		DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectTint.swift; sourceTree = "<group>"; };
 		DEB9B25D9F23F6967CC877CE /* GitPRPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPRPlan.swift; sourceTree = "<group>"; };
@@ -779,7 +686,6 @@
 		F415566C0592DEBE80C0A642 /* CommandRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRegistry.swift; sourceTree = "<group>"; };
 		F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyMatchTests.swift; sourceTree = "<group>"; };
 		F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAgentStore.swift; sourceTree = "<group>"; };
-		F55D6B3D9C8F9291C4F594FE /* ShadowBrokerConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowBrokerConfiguration.swift; sourceTree = "<group>"; };
 		F5BAFFCCA8277AEFF3F83AF7 /* AccountRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountRouter.swift; sourceTree = "<group>"; };
 		F60291E350621AED42329A3B /* NewSessionDraftTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionDraftTests.swift; sourceTree = "<group>"; };
 		F6886FE576953B0452EE0392 /* TerminalSemantics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSemantics.swift; sourceTree = "<group>"; };
@@ -801,15 +707,6 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		4363B9556F60AE66AB1259FA /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				CEFF0B4FF8E2FB74846A125F /* libKaisolaSessionBrokerCore.a in Frameworks */,
-				B571635820C717C9ADE49531 /* KaisolaBrokerProtocol in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		A9C1C274E5E6A0C51F015B1E /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -819,18 +716,11 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		EB6F45CEF5CC50BAEA4D005C /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				6E8756D55ADB435BF33E5D5E /* KaisolaBrokerProtocol in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		F9381F7ECD8CD88122FD68C6 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3BCCE3075B460AD12D09F50D /* libKaisolaSessionBrokerCore.a in Frameworks */,
 				25BFFB0D3C7D7C7D9800919D /* KaisolaCore in Frameworks */,
 				A8806C7327F8E8D62F9D1CE7 /* KaisolaBrokerProtocol in Frameworks */,
 				E313BDF65101B117D853A5F6 /* SwiftTerm in Frameworks */,
@@ -854,9 +744,7 @@
 			children = (
 				9E3457183DFE1FAA194F9551 /* Account */,
 				49CBF8AD1021A176C61C012C /* assets */,
-				BF422C3353CBE837F84DF2A3 /* BrokerBootstrap */,
 				2F7163840EA196069E3491D9 /* Kaisola */,
-				55866FCFF1449DC27E312073 /* KaisolaSessionBroker */,
 				4AE38326281CE148F4A67B10 /* KaisolaSessionBrokerCore */,
 				C91771205CA39A4F31928CFA /* KaisolaTests */,
 				6E798A0DDEE2A309AAC04C49 /* Packages */,
@@ -876,6 +764,7 @@
 				68463A4C18DB7D5892F72F4E /* Git */,
 				D22E4A267B6F7DFFA338B6CC /* Mesh */,
 				035593DB5E20208EAF231CC5 /* Resources */,
+				6D1D4FB88B77986912C5C642 /* Terminals */,
 				503C81FECD70EE66D684E00B /* Updates */,
 			);
 			path = Kaisola;
@@ -884,9 +773,7 @@
 		38DCDC45126B15180ED4F1C8 /* Shared */ = {
 			isa = PBXGroup;
 			children = (
-				1CF54122B716B55D67623C3F /* BrokerBootstrapXPC.swift */,
 				3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */,
-				58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -958,18 +845,10 @@
 		4AE38326281CE148F4A67B10 /* KaisolaSessionBrokerCore */ = {
 			isa = PBXGroup;
 			children = (
-				5C46CF60802D04C20404D2DF /* BrokerAuthentication.swift */,
-				5E41619A5DB920EB695D01FD /* BrokerConnection.swift */,
-				6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */,
-				50FBA8BAA80816C3072B1FC3 /* BrokerLog.swift */,
 				911A85E1C6FBFB0A08B51446 /* BrokerProtocolTypes.swift */,
-				9608644964317043ED13E235 /* BrokerRequestGate.swift */,
-				A4AF4AEE4E9155639C2E812D /* BrokerServer.swift */,
 				8871E43479CC256C0EE6B01D /* DarwinPTYChild.swift */,
 				715C7A32E47628665B42A2F0 /* DarwinPTYProcess.swift */,
 				025695839B8931044DAD2F2C /* FreshTerminalStore.swift */,
-				F55D6B3D9C8F9291C4F594FE /* ShadowBrokerConfiguration.swift */,
-				02170F9FF53891101DA8198E /* ShadowBrokerService.swift */,
 				7DDB27378A66D4739F467B46 /* TerminalOutputBuffer.swift */,
 			);
 			path = KaisolaSessionBrokerCore;
@@ -985,14 +864,6 @@
 			path = Updates;
 			sourceTree = "<group>";
 		};
-		55866FCFF1449DC27E312073 /* KaisolaSessionBroker */ = {
-			isa = PBXGroup;
-			children = (
-				D2C2D3E0FFD2D59255FD53EC /* KaisolaSessionBrokerMain.swift */,
-			);
-			path = KaisolaSessionBroker;
-			sourceTree = "<group>";
-		};
 		68463A4C18DB7D5892F72F4E /* Git */ = {
 			isa = PBXGroup;
 			children = (
@@ -1005,6 +876,15 @@
 				EC761EFF29AA2C76D917C3DA /* GitService+PR.swift */,
 			);
 			path = Git;
+			sourceTree = "<group>";
+		};
+		6D1D4FB88B77986912C5C642 /* Terminals */ = {
+			isa = PBXGroup;
+			children = (
+				D1A0984F414A3C07722FA764 /* InProcessTerminalService.swift */,
+				56037517DA6DBC5B24A76CF0 /* TerminalServing.swift */,
+			);
+			path = Terminals;
 			sourceTree = "<group>";
 		};
 		6E798A0DDEE2A309AAC04C49 /* Packages */ = {
@@ -1124,16 +1004,6 @@
 			path = Features;
 			sourceTree = "<group>";
 		};
-		BF422C3353CBE837F84DF2A3 /* BrokerBootstrap */ = {
-			isa = PBXGroup;
-			children = (
-				6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */,
-				8FD5419F311EE385C8A43CD8 /* BrokerBootstrapService.swift */,
-				A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */,
-			);
-			path = BrokerBootstrap;
-			sourceTree = "<group>";
-		};
 		C131D090B01AB3367C562B7E /* App */ = {
 			isa = PBXGroup;
 			children = (
@@ -1144,6 +1014,7 @@
 				9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */,
 				A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */,
 				BD79D4F2FC6603ED61013FA9 /* AttentionCenter.swift */,
+				D5C548B5809463E7B20AFB69 /* BrokerTeardownMigration.swift */,
 				1BD4781AB13C9F9EFBB84530 /* DesktopBackdropRenderer.swift */,
 				426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */,
 				BC22ACE9C4D6019F734568D5 /* DesktopWallpaperResolution.swift */,
@@ -1196,21 +1067,14 @@
 				5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */,
 				C849F82D9AF2173A210BBDD8 /* AppAccountRecoveryNoticeTests.swift */,
 				4A75B9CDDB712B8E40FD295E /* AppModelBookkeepingTests.swift */,
-				4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */,
 				07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */,
 				9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */,
 				7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */,
 				3CC5460B6E0069C69E57550C /* AttentionInboxModelTests.swift */,
 				760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */,
-				CD40F6DB5889F51004BEF1C9 /* BrokerControlClientTests.swift */,
-				9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */,
-				5531DF3E35ADBE7EBBA1054E /* BrokerGenerationRegistryTests.swift */,
-				D917DA578BC63AF251ADA075 /* BrokerGenerationRoutingTests.swift */,
 				D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */,
-				8F9EDBEF947F0725DF51BDA4 /* BrokerLaunchConfigurationTests.swift */,
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
-				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
 				7FE676EDAF6FA950986AB45F /* BrowserCardAccessibilityTests.swift */,
 				2D50688D03104371F2AEF0CA /* ClosedLifecycleQuitTests.swift */,
 				464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */,
@@ -1239,6 +1103,7 @@
 				143732221EC63F82B5874931 /* GitPRTests.swift */,
 				73C156565BA4025A74960AD9 /* GitServiceTests.swift */,
 				E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */,
+				72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */,
 				EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */,
 				BBC39D51D190999C81FEFA9D /* LocalhostDetectorTests.swift */,
 				5C7A4F2FAC61FD9BED492FAD /* MarkdownIncrementalStyleTests.swift */,
@@ -1265,9 +1130,6 @@
 				AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */,
 				8779132DE0F6325D261D6DEE /* NotificationBridgeBoundaryTests.swift */,
 				37780782E5170FFD4996C1D8 /* NotificationBridgeTests.swift */,
-				96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */,
-				1E1D8BD37B438582BF78F52C /* ObserveOnlyBrokerHistoryPagingTests.swift */,
-				7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */,
 				14A620CB3BAB100C84E6472B /* OmniBarDispatchTests.swift */,
 				A2C7EDA69DE3059B6E1F7333 /* OnboardingStateTests.swift */,
 				EF0C5EDE0E77BD5202969995 /* PDFPreviewBudgetTests.swift */,
@@ -1294,14 +1156,9 @@
 				FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */,
 				1A071DDD3D444167CC8B36B0 /* ShuffledAerialDesktopTests.swift */,
 				ED0277730A353A218BAC1101 /* SidebarScrollPinTests.swift */,
-				745B1EA1A58041D7D42DE58D /* SwiftSessionBrokerConfigurationTests.swift */,
-				C3F91F45B36C1BE91239FA12 /* SwiftSessionBrokerCoreTests.swift */,
 				503BC75494F340E8E97BA347 /* SwiftSessionBrokerDarwinPTYTests.swift */,
-				AB8BBD75931C41A31E12A79B /* SwiftSessionBrokerFreshEndToEndTests.swift */,
 				8F4AAA95E52F45467C0DCC39 /* SwiftSessionBrokerFreshStoreTests.swift */,
-				6868A3535831325A32CAC18A /* SwiftSessionBrokerFreshWireTests.swift */,
 				92AF8117008BD2BE93966C4B /* SwiftSessionBrokerOutputTests.swift */,
-				8C7441963D21C24B5C40A843 /* SwiftSessionBrokerShadowIntegrationTests.swift */,
 				4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */,
 				C0E9DAFAB20BAC2549AC31EE /* SyntaxHighlighterTests.swift */,
 				96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */,
@@ -1355,24 +1212,16 @@
 			isa = PBXGroup;
 			children = (
 				F9AE494034173A39FE10B346 /* AgentRegistry.swift */,
-				455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */,
-				DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */,
-				D076BF05CC777C8363D4066D /* BrokerGenerationRegistry.swift */,
-				58E98EB49F192C275F6621D9 /* BrokerGenerationRouting.swift */,
 				16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */,
 				8D98396E44670C6412BE1415 /* BrokerModels.swift */,
 				8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */,
-				03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */,
 				F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */,
 				1DBE251CF21C42D3D77AA57C /* NativeSessionStore.swift */,
 				8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */,
-				CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */,
-				5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */,
 				35BDE208E1EC7A98B2ECAA87 /* SessionAdoptionStore.swift */,
 				27165DF5641D8A7739273769 /* SessionOrderStore.swift */,
 				C2C127B15864D9B20EE61750 /* SessionPinStore.swift */,
 				44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */,
-				C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */,
 			);
 			path = Broker;
 			sourceTree = "<group>";
@@ -1411,8 +1260,6 @@
 			isa = PBXGroup;
 			children = (
 				E26113F09678188A74E298A6 /* Kaisola.app */,
-				0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */,
-				5BFB9DD2C8A262C2BFD5EF95 /* KaisolaSessionBroker */,
 				6ADCB2946529900DB087F329 /* KaisolaTests.xctest */,
 				73B1D9B33957C20761D198F9 /* libKaisolaSessionBrokerCore.a */,
 			);
@@ -1454,7 +1301,6 @@
 			dependencies = (
 				202C487DFDFD488F398465E3 /* PBXTargetDependency */,
 				42879B8FD0140899AB406AD9 /* PBXTargetDependency */,
-				5B667BA327678F1AE4336769 /* PBXTargetDependency */,
 			);
 			name = KaisolaTests;
 			packageProductDependencies = (
@@ -1464,25 +1310,6 @@
 			productReference = 6ADCB2946529900DB087F329 /* KaisolaTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		5F21F0B81FB243F899A42E72 /* KaisolaBrokerBootstrap */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = D96ED34C068A65C40443975E /* Build configuration list for PBXNativeTarget "KaisolaBrokerBootstrap" */;
-			buildPhases = (
-				BCD16D212553932142300274 /* Sources */,
-				EB6F45CEF5CC50BAEA4D005C /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = KaisolaBrokerBootstrap;
-			packageProductDependencies = (
-				BE5CAEF422CD9708D0FE4084 /* KaisolaBrokerProtocol */,
-			);
-			productName = KaisolaBrokerBootstrap;
-			productReference = 0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */;
-			productType = "com.apple.product-type.tool";
-		};
 		9B50D5869255FBBB6D735F0F /* Kaisola */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F8898D33221991457D9F6AC5 /* Build configuration list for PBXNativeTarget "Kaisola" */;
@@ -1490,13 +1317,12 @@
 				9FD90A32630D4190B8917EE6 /* Sources */,
 				A12864DC333A5EEE4981684B /* Resources */,
 				F9381F7ECD8CD88122FD68C6 /* Frameworks */,
-				7D085367F0F93BD3D8482901 /* Package standalone broker helper */,
+				0061D2B46C9E8005C0316F5F /* Package sealed Node helper */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				C3BB6821756EB54E127DF543 /* PBXTargetDependency */,
-				BF6C756AC77AE92AD325E211 /* PBXTargetDependency */,
+				C3610AF48FF091E29E50A035 /* PBXTargetDependency */,
 			);
 			name = Kaisola;
 			packageProductDependencies = (
@@ -1509,26 +1335,6 @@
 			productReference = E26113F09678188A74E298A6 /* Kaisola.app */;
 			productType = "com.apple.product-type.application";
 		};
-		C1257D48B7D18F8C7A09749F /* KaisolaSessionBroker */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 300FDF35F7C865C837EB55D3 /* Build configuration list for PBXNativeTarget "KaisolaSessionBroker" */;
-			buildPhases = (
-				285F93E97036E5318E707ECF /* Sources */,
-				4363B9556F60AE66AB1259FA /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				9F4AF1C0EC91CFFAA3AEC8A3 /* PBXTargetDependency */,
-			);
-			name = KaisolaSessionBroker;
-			packageProductDependencies = (
-				A6EC4526BD528A7E1586CBCD /* KaisolaBrokerProtocol */,
-			);
-			productName = KaisolaSessionBroker;
-			productReference = 5BFB9DD2C8A262C2BFD5EF95 /* KaisolaSessionBroker */;
-			productType = "com.apple.product-type.tool";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -1539,12 +1345,6 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					38618D2B8F26C970A99A2E07 = {
-						ProvisioningStyle = Automatic;
-					};
-					5F21F0B81FB243F899A42E72 = {
-						ProvisioningStyle = Automatic;
-					};
-					C1257D48B7D18F8C7A09749F = {
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -1569,8 +1369,6 @@
 			projectRoot = "";
 			targets = (
 				9B50D5869255FBBB6D735F0F /* Kaisola */,
-				5F21F0B81FB243F899A42E72 /* KaisolaBrokerBootstrap */,
-				C1257D48B7D18F8C7A09749F /* KaisolaSessionBroker */,
 				17E8C989CC3B5148CB5E9F8D /* KaisolaSessionBrokerCore */,
 				38618D2B8F26C970A99A2E07 /* KaisolaTests */,
 			);
@@ -1593,6 +1391,25 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		0061D2B46C9E8005C0316F5F /* Package sealed Node helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Package sealed Node helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nif [[ \"${CONFIGURATION}\" != \"Release\" && \"${CONFIGURATION}\" != \"LocalRelease\" && \"${KAISOLA_PACKAGE_BROKER_HELPER:-0}\" != \"1\" ]]; then\n  exit 0\nfi\n\nruntime_arm64=\"${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}\"\nruntime_x64=\"${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}\"\nif [[ ! -x \"${runtime_arm64}\" ]]; then\n  echo \"Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64\" >&2\n  exit 1\nfi\n\nargs=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper\"\n  --runtime-arm64 \"${runtime_arm64}\"\n  --entitlements \"${SRCROOT}/BrokerHelper/BrokerHelper.entitlements\"\n)\nif [[ \" ${ARCHS} \" == *\" x86_64 \"* ]]; then\n  if [[ ! -x \"${runtime_x64}\" ]]; then\n    echo \"Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64\" >&2\n    exit 1\n  fi\n  args+=(--runtime-x86_64 \"${runtime_x64}\")\nfi\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${args[@]}\"\n";
+		};
 		7A75F01A4AF1210B7456CA6B /* Copy Swift Objective-C Interface Header */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -1609,52 +1426,17 @@
 			shellPath = /bin/sh;
 			shellScript = "ditto \"${SCRIPT_INPUT_FILE_0}\" \"${SCRIPT_OUTPUT_FILE_0}\"\n";
 		};
-		7D085367F0F93BD3D8482901 /* Package standalone broker helper */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Package standalone broker helper";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nlaunch_agents=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents\"\nmkdir -p \"${launch_agents}\"\ncp \"${SRCROOT}/BrokerHelper/com.kaisola.mac.broker-bootstrap.plist\" \"${launch_agents}/com.kaisola.mac.broker-bootstrap.plist\"\n\nif [[ \"${CONFIGURATION}\" != \"Release\" && \"${CONFIGURATION}\" != \"LocalRelease\" && \"${KAISOLA_PACKAGE_BROKER_HELPER:-0}\" != \"1\" ]]; then\n  exit 0\nfi\n\nruntime_arm64=\"${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}\"\nruntime_x64=\"${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}\"\nif [[ ! -x \"${runtime_arm64}\" ]]; then\n  echo \"Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64\" >&2\n  exit 1\nfi\n\nargs=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper\"\n  --runtime-arm64 \"${runtime_arm64}\"\n  --bootstrap \"${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap\"\n  --entitlements \"${SRCROOT}/BrokerHelper/BrokerHelper.entitlements\"\n)\nif [[ \" ${ARCHS} \" == *\" x86_64 \"* ]]; then\n  if [[ ! -x \"${runtime_x64}\" ]]; then\n    echo \"Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64\" >&2\n    exit 1\n  fi\n  args+=(--runtime-x86_64 \"${runtime_x64}\")\nfi\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${args[@]}\"\n\n# Keep the development-selected Swift engine in its own digest-sealed\n# schema-2 root. It must never be nested inside the stable Node helper\n# package, and it must never inherit Node's JIT entitlements.\nnative_args=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerSessionHelper\"\n  --native-broker \"${BUILT_PRODUCTS_DIR}/KaisolaSessionBroker\"\n  --bootstrap \"${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap\"\n  --policy \"${SRCROOT}/BrokerHelper/native-package-policy.json\"\n  --app-release-version \"${MARKETING_VERSION}\"\n  --app-release-build \"${CURRENT_PROJECT_VERSION}\"\n)\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  native_args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${native_args[@]}\"\n";
-		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		285F93E97036E5318E707ECF /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				C48769F696CFCF2B9A0FA5F3 /* KaisolaSessionBrokerMain.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		6838513E0CDAE2DCBBBA4493 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B68BE361569352A22826DEC3 /* BrokerAuthentication.swift in Sources */,
-				50279221F9A37C996D021083 /* BrokerConnection.swift in Sources */,
-				FDC5506D285BD3B14AF4EE60 /* BrokerGenerationLifecycle.swift in Sources */,
-				1F5D94ECB9133B884B3DD0BC /* BrokerLog.swift in Sources */,
 				3B6F860742DA560F55B27009 /* BrokerProtocolTypes.swift in Sources */,
-				9DB217E145925411CB5A2A84 /* BrokerRequestGate.swift in Sources */,
-				9C3EB0769AFF798B9B98FBE1 /* BrokerServer.swift in Sources */,
 				6B55D776CEFB9CF47F289629 /* DarwinPTYChild.swift in Sources */,
 				1359E8BDC50E6B9CABE820AC /* DarwinPTYProcess.swift in Sources */,
 				9E7E972525952B3086B87964 /* FreshTerminalStore.swift in Sources */,
-				165500F38547B802787EB395 /* ShadowBrokerConfiguration.swift in Sources */,
-				13A6A60D6220A630B9631F07 /* ShadowBrokerService.swift in Sources */,
 				786500F83F08DE46B17C8103 /* TerminalOutputBuffer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1698,17 +1480,11 @@
 				61101714425568F6003C559A /* AttentionCenter.swift in Sources */,
 				D343197CB5DDE1B3A5DCE98B /* AttentionInboxModel.swift in Sources */,
 				3DF59BE4339CBB2D9339AB60 /* AuthModel.swift in Sources */,
-				EF4D751CD470308338C7C585 /* BrokerBootstrapClient.swift in Sources */,
-				F5139A7FD8A6FD7EEFABB6AB /* BrokerBootstrapXPC.swift in Sources */,
-				9871B1188DC281FDBF7088AD /* BrokerControlClient.swift in Sources */,
-				43D055006D996EBBAAA8EB67 /* BrokerGenerationRegistry.swift in Sources */,
-				5729303DDAE35AC5A424D440 /* BrokerGenerationRouting.swift in Sources */,
 				BE43B624BA0AF4B1D8CCB36E /* BrokerHelperPackage.swift in Sources */,
 				877ECA92F6EF051E2C1A5B6D /* BrokerInfo.swift in Sources */,
-				B5C0E8FF89A7B0B01445686A /* BrokerLaunchConfiguration.swift in Sources */,
 				23A111A6EC49759BCB9C3D55 /* BrokerModels.swift in Sources */,
 				C0AB4855272A0368E1F55C08 /* BrokerReconnectBackoff.swift in Sources */,
-				8B8F9D7E715AC5693879B9FC /* BrokerStartupCoordinator.swift in Sources */,
+				200D815E3963C481971281B1 /* BrokerTeardownMigration.swift in Sources */,
 				EF5C4926C6A1A69767C3ECB2 /* BrowserCardView.swift in Sources */,
 				CC1B40953E2F4F16006A3623 /* CodeEditorView.swift in Sources */,
 				7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */,
@@ -1755,6 +1531,7 @@
 				C109697A36B8E2CDC10ED68C /* GitService+PR.swift in Sources */,
 				F377CC5A92CBA50885FEE900 /* GitService.swift in Sources */,
 				CF3A73BF1400EC4646AE71EF /* GlobalHotkeyCenter.swift in Sources */,
+				00015B79C2EB96D8300D854C /* InProcessTerminalService.swift in Sources */,
 				2EEF618C0672590D5F84E02E /* InstructionFileStaleness.swift in Sources */,
 				08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */,
 				7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */,
@@ -1787,8 +1564,6 @@
 				4A0D957608380D5A77E8C001 /* NewSessionChooserView.swift in Sources */,
 				4E06416BC6CCF27195FE969D /* NewSessionDraft.swift in Sources */,
 				D067393E0B5AB8131238FAC4 /* NotificationBridge.swift in Sources */,
-				00D9F73664C48755B2B541E7 /* ObserveOnlyBrokerClient.swift in Sources */,
-				903E732834F463F07A9BAF02 /* ObserveOnlyBrokerPolicy.swift in Sources */,
 				DD88322BBB0BD5470118188E /* OmniBarView.swift in Sources */,
 				33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */,
 				0ECC0F8839FBE87FE886BEFB /* PDFPreviewBudget.swift in Sources */,
@@ -1832,13 +1607,13 @@
 				60AA9AEBE492C9A60C2E6D65 /* TerminalInputPolicy.swift in Sources */,
 				D3839D7930067DD72378D1BF /* TerminalMetaService.swift in Sources */,
 				F512DF3A0328EE87D174211C /* TerminalSemantics.swift in Sources */,
+				E73B3D87FCE1A558D5083FE9 /* TerminalServing.swift in Sources */,
 				08170963E8934AB8ED6F50AB /* TerminalSurfaceCache.swift in Sources */,
 				50E4AD9DC49C82B758116FCF /* TerminalTheme.swift in Sources */,
 				111953CC1CF47CB697278109 /* TerminalTranscriptView.swift in Sources */,
 				B9E42D4C5DC974E0AAFA2D99 /* ToastCenter.swift in Sources */,
 				209D362D9279CD14816E2F5E /* ToastOverlayView.swift in Sources */,
 				360C9587987ABD66B7ECFA59 /* UnifiedSessionCardState.swift in Sources */,
-				F958069AD757FAAC93656C6C /* UnixBrokerTransport.swift in Sources */,
 				84C10713F1568FF52C3C01B5 /* UpdateCenter.swift in Sources */,
 				DB2D418E97E6131AF8B7EE3D /* UsageCenter.swift in Sources */,
 				D9F62D7BF944B5FF7DC5F508 /* UsageMeterPalette.swift in Sources */,
@@ -1849,19 +1624,6 @@
 				72E7D52DBB843CBD3BCDB8D9 /* WorkspaceRestorationNoticeView.swift in Sources */,
 				3350165D621827432149763A /* WorkspaceRowActions.swift in Sources */,
 				0D74F8F2D3065EDE13BEB326 /* WorkspaceWatcher.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		BCD16D212553932142300274 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				461796BC63E29B3BAD8CAB8D /* BrokerBootstrapMain.swift in Sources */,
-				6FC06029C8643A919750FD77 /* BrokerBootstrapService.swift in Sources */,
-				6EAC794B55DA08FD078D9BAA /* BrokerBootstrapXPC.swift in Sources */,
-				E6781527DAD43EDB96DBD461 /* BrokerHelperPackage.swift in Sources */,
-				798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */,
-				7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1889,21 +1651,14 @@
 				2DDDCA865F413721721D800C /* ApiKeyStoreTests.swift in Sources */,
 				D591F457136FD37D5F5955DE /* AppAccountRecoveryNoticeTests.swift in Sources */,
 				F237D2EA9920CCEDF99DA792 /* AppModelBookkeepingTests.swift in Sources */,
-				51E20BB18D6A545E5DBCBD0A /* AppModelBrokerFallbackTests.swift in Sources */,
 				AC44D95F8D8934E9FA04981D /* AppModelProjectContextTests.swift in Sources */,
 				8C6E07F0D42D5F9F9BEF3EFF /* AppModelReconnectTests.swift in Sources */,
 				EBD24B42377F41E7D46E8E94 /* AppModelTerminalRetentionTests.swift in Sources */,
 				51DE82B8956A88B420079EDE /* AttentionInboxModelTests.swift in Sources */,
 				95094E0BFA321F0CDBB34A25 /* AuthModelTests.swift in Sources */,
-				027E1397790B571CBCCA2004 /* BrokerControlClientTests.swift in Sources */,
-				395CF5D2389A3A14D23A5888 /* BrokerDiscoveryTests.swift in Sources */,
-				E1DAD231CBE5620F9B604C58 /* BrokerGenerationRegistryTests.swift in Sources */,
-				2EEAAAC8E8944A0A47F12576 /* BrokerGenerationRoutingTests.swift in Sources */,
 				CDC7BC20F1CECF9BB283CA58 /* BrokerHelperPackageTests.swift in Sources */,
-				EB35F29036B0051D6ED3BCBD /* BrokerLaunchConfigurationTests.swift in Sources */,
 				AE16DBA9C3C56992F46A611A /* BrokerModelsTests.swift in Sources */,
 				6654B3A1CE2F11C7026F61B2 /* BrokerReconnectBackoffTests.swift in Sources */,
-				5EA24E714C9FF79494C0DDFA /* BrokerStartupCoordinatorTests.swift in Sources */,
 				9DFA6E1632DEEDAA96201159 /* BrowserCardAccessibilityTests.swift in Sources */,
 				181D98C2AE14BD88EDCA6458 /* ClosedLifecycleQuitTests.swift in Sources */,
 				380F8D745A8FFB7E44651A98 /* ClosedLifecycleStoreTests.swift in Sources */,
@@ -1932,6 +1687,7 @@
 				AC549E4FFE8A21A0057E7980 /* GitProcessDeadlineTests.swift in Sources */,
 				D1DF7C334CB6E3B1B0D12BBF /* GitServiceTests.swift in Sources */,
 				BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */,
+				409175ECDFD0BF3EA674B47D /* InProcessTerminalServiceTests.swift in Sources */,
 				F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */,
 				1780D63195E079FEFBD762C0 /* LocalhostDetectorTests.swift in Sources */,
 				5B9D83461433539D662A2E0E /* MarkdownIncrementalStyleTests.swift in Sources */,
@@ -1958,9 +1714,6 @@
 				73910D5FC9C8AF9C95A06F93 /* NoBoardBoundaryTests.swift in Sources */,
 				6966243948430FA43F69B729 /* NotificationBridgeBoundaryTests.swift in Sources */,
 				BA06D02D0D784812DFE9BD1C /* NotificationBridgeTests.swift in Sources */,
-				F54657F1A6F671121F2FB2B3 /* ObserveOnlyBrokerClientTests.swift in Sources */,
-				2A036B8D354950B0C99C64C9 /* ObserveOnlyBrokerHistoryPagingTests.swift in Sources */,
-				FA8353B1B2AB10089716A151 /* ObserveOnlyBrokerPolicyTests.swift in Sources */,
 				A046C6509A6463F293CBEAB7 /* OmniBarDispatchTests.swift in Sources */,
 				6A00EA5F231E518C8B154F62 /* OnboardingStateTests.swift in Sources */,
 				0C8901C89C49188C5C3DE29B /* PDFPreviewBudgetTests.swift in Sources */,
@@ -1987,14 +1740,9 @@
 				BE1FB7DB2A327E8E064C4CC6 /* SharedWebKitTests.swift in Sources */,
 				91C5C935B8D30B2E2F1358FF /* ShuffledAerialDesktopTests.swift in Sources */,
 				897B77B765BE67C87E3258C5 /* SidebarScrollPinTests.swift in Sources */,
-				229B44FDFC7BDDD805F2DDEE /* SwiftSessionBrokerConfigurationTests.swift in Sources */,
-				DDB3209BE08014BA8D392778 /* SwiftSessionBrokerCoreTests.swift in Sources */,
 				F20A050AB66C47DB5951E23F /* SwiftSessionBrokerDarwinPTYTests.swift in Sources */,
-				8BB60C4F46574BE004C9D594 /* SwiftSessionBrokerFreshEndToEndTests.swift in Sources */,
 				91EAE76D4092B4F073A20F24 /* SwiftSessionBrokerFreshStoreTests.swift in Sources */,
-				C54F3D4D964B74CE046A5040 /* SwiftSessionBrokerFreshWireTests.swift in Sources */,
 				9A0176D6B84EC53EA2667135 /* SwiftSessionBrokerOutputTests.swift in Sources */,
-				26DA6B9F10D3882138885E95 /* SwiftSessionBrokerShadowIntegrationTests.swift in Sources */,
 				104445F9A7ECA376AB39CC53 /* SwiftTermStressTests.swift in Sources */,
 				9AB1ECA6E93A6ABD5098ED2C /* SyntaxHighlighterTests.swift in Sources */,
 				E413575336FF1CA3C15A0339 /* TerminalCursorStoreTests.swift in Sources */,
@@ -2038,102 +1786,18 @@
 			target = 17E8C989CC3B5148CB5E9F8D /* KaisolaSessionBrokerCore */;
 			targetProxy = 021D2E0D3647136CB0425FEA /* PBXContainerItemProxy */;
 		};
-		5B667BA327678F1AE4336769 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = C1257D48B7D18F8C7A09749F /* KaisolaSessionBroker */;
-			targetProxy = 5E74CCBED7EA9CDB6685115A /* PBXContainerItemProxy */;
-		};
 		723F54C5D7C5A5BF446D26EE /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			productRef = 00F709AF82992010BBC8716C /* KaisolaBrokerProtocol */;
 		};
-		9F4AF1C0EC91CFFAA3AEC8A3 /* PBXTargetDependency */ = {
+		C3610AF48FF091E29E50A035 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 17E8C989CC3B5148CB5E9F8D /* KaisolaSessionBrokerCore */;
-			targetProxy = 47609B9F37DDA655235E3640 /* PBXContainerItemProxy */;
-		};
-		BF6C756AC77AE92AD325E211 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = C1257D48B7D18F8C7A09749F /* KaisolaSessionBroker */;
-			targetProxy = C15E1FD744DEEB6A74694F4C /* PBXContainerItemProxy */;
-		};
-		C3BB6821756EB54E127DF543 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 5F21F0B81FB243F899A42E72 /* KaisolaBrokerBootstrap */;
-			targetProxy = D839152744A3B4DC8274FA0B /* PBXContainerItemProxy */;
+			targetProxy = A7952B9D819F3945D5742250 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		08915419ABFC8E23B185E40C /* LocalRelease */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ARCHS = arm64;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				ONLY_ACTIVE_ARCH = NO;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-ObjC",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.session-broker-shadow";
-				PRODUCT_MODULE_NAME = KaisolaSessionBroker;
-				PRODUCT_NAME = KaisolaSessionBroker;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
-			};
-			name = LocalRelease;
-		};
-		08CE1E5C82A7CC88FACBDE67 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ARCHS = arm64;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				ONLY_ACTIVE_ARCH = NO;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-ObjC",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.session-broker-shadow";
-				PRODUCT_MODULE_NAME = KaisolaSessionBroker;
-				PRODUCT_NAME = KaisolaSessionBroker;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
-			};
-			name = Debug;
-		};
-		0A29B50931FE6BB59B541C14 /* LocalRelease */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.broker-bootstrap";
-				PRODUCT_MODULE_NAME = KaisolaBrokerBootstrap;
-				PRODUCT_NAME = KaisolaBrokerBootstrap;
-				SDKROOT = macosx;
-			};
-			name = LocalRelease;
-		};
 		216023E10285E2E5AF6203C4 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -2189,31 +1853,6 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
-			};
-			name = Release;
-		};
-		39F2334609B1BBD6FDD428CF /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ARCHS = arm64;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				ONLY_ACTIVE_ARCH = NO;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-ObjC",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.session-broker-shadow";
-				PRODUCT_MODULE_NAME = KaisolaSessionBroker;
-				PRODUCT_NAME = KaisolaSessionBroker;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
 			};
 			name = Release;
 		};
@@ -2394,28 +2033,11 @@
 			};
 			name = LocalRelease;
 		};
-		A62135DCBC283E0F5A2E027D /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.broker-bootstrap";
-				PRODUCT_MODULE_NAME = KaisolaBrokerBootstrap;
-				PRODUCT_NAME = KaisolaBrokerBootstrap;
-				SDKROOT = macosx;
-			};
-			name = Debug;
-		};
 		AA529D5536DE8EAB8F9BB0E1 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				ENABLE_APP_SANDBOX = NO;
@@ -2430,6 +2052,10 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.mac;
 				PRODUCT_MODULE_NAME = Kaisola;
@@ -2480,6 +2106,10 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.mac;
 				PRODUCT_MODULE_NAME = Kaisola;
 				PRODUCT_NAME = Kaisola;
@@ -2514,6 +2144,10 @@
 					"@executable_path/../Frameworks",
 				);
 				OTHER_CODE_SIGN_FLAGS = "$(inherited) $(KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS)";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.mac;
 				PRODUCT_MODULE_NAME = Kaisola;
 				PRODUCT_NAME = Kaisola;
@@ -2543,26 +2177,6 @@
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Kaisola.app/Contents/MacOS/Kaisola";
 			};
 			name = Debug;
-		};
-		EF1396899D2641CA65C40C4D /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				ENABLE_APP_SANDBOX = NO;
-				ENABLE_HARDENED_RUNTIME = YES;
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.kaisola.mac.broker-bootstrap";
-				PRODUCT_MODULE_NAME = KaisolaBrokerBootstrap;
-				PRODUCT_NAME = KaisolaBrokerBootstrap;
-				SDKROOT = macosx;
-			};
-			name = Release;
 		};
 		FA1D8EDFC190EB7753C90B27 /* LocalRelease */ = {
 			isa = XCBuildConfiguration;
@@ -2599,32 +2213,12 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		300FDF35F7C865C837EB55D3 /* Build configuration list for PBXNativeTarget "KaisolaSessionBroker" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				08CE1E5C82A7CC88FACBDE67 /* Debug */,
-				08915419ABFC8E23B185E40C /* LocalRelease */,
-				39F2334609B1BBD6FDD428CF /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
-		};
 		3B6FB14653B8143B018BD379 /* Build configuration list for PBXProject "KaisolaMac" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				7455A7324C13B1DAA0FECB04 /* Debug */,
 				887C1F8F41D31F9B18DE9A38 /* LocalRelease */,
 				216023E10285E2E5AF6203C4 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
-		};
-		D96ED34C068A65C40443975E /* Build configuration list for PBXNativeTarget "KaisolaBrokerBootstrap" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				A62135DCBC283E0F5A2E027D /* Debug */,
-				0A29B50931FE6BB59B541C14 /* LocalRelease */,
-				EF1396899D2641CA65C40C4D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
@@ -2691,17 +2285,9 @@
 			package = D42C2A6487628474527A819B /* XCRemoteSwiftPackageReference "SwiftTerm" */;
 			productName = SwiftTerm;
 		};
-		A6EC4526BD528A7E1586CBCD /* KaisolaBrokerProtocol */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = KaisolaBrokerProtocol;
-		};
 		AD6C0B5E5BAC7C78414F4162 /* KaisolaCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = KaisolaCore;
-		};
-		BE5CAEF422CD9708D0FE4084 /* KaisolaBrokerProtocol */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = KaisolaBrokerProtocol;
 		};
 		CDA6393EA6C175126B5799D6 /* Sparkle */ = {
 			isa = XCSwiftPackageProductDependency;

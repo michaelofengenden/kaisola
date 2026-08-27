@@ -1,9 +1,9 @@
 import Foundation
 
-/// Constants mirrored from `runtime/node-broker/ipc/brokerWire.cjs`.
-///
-/// JavaScript and Swift tests pin these values so a client cannot silently
-/// connect with different ownership or framing assumptions.
+/// Framing, capacity, and compatibility constants for the terminal engine and
+/// the sealed helper package. Originally the detached broker's wire contract;
+/// the in-process PTY core and helper-package verification still build on the
+/// same limits, and the checked-in fixtures pin them so they cannot drift.
 public enum BrokerWire {
     public static let protocolVersion = 2
     public static let securityEpoch = 1

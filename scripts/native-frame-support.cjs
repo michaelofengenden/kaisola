@@ -4,8 +4,6 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
-const { PROTOCOL } = require('../runtime/node-broker/ipc/brokerWire.cjs')
-const { requestBrokerControl } = require('../runtime/node-broker/ipc/brokerControlClient.cjs')
 
 const READY_NATIVE = 'KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY='
 const workloadAliases = new Map([
@@ -119,28 +117,16 @@ function launchAndWait(command, args, launchOptions, readyParser, timeoutMs = 45
   })
 }
 
-function brokerPIDFromRoot(root) {
-  try {
-    const payload = JSON.parse(fs.readFileSync(brokerInfoPath(root), 'utf8'))
-    return Number.isSafeInteger(payload.pid) && payload.pid > 1 ? payload.pid : null
-  } catch {
-    return null
-  }
-}
-
-function brokerInfoPath(root) {
-  // NativeResourceWorkloadConfiguration deliberately separates app state from
-  // the broker profile beneath the private fixture root. Keep the Node-side
-  // cadence observer on that same contract instead of accidentally probing the
-  // pre-isolation root layout.
-  return path.join(root, 'broker-profile', 'session-broker', 'broker.json')
+function streamHeadsPath(root) {
+  // The fixture app dumps `{terminalID: {streamEpoch, endOffset}}` from its
+  // in-process terminal engine here: once before announcing readiness, then
+  // on a one-second cadence for the after-capture read.
+  return path.join(root, 'stream-heads.json')
 }
 
 async function cleanFailedFixtureLaunch(root, appPid) {
   await terminate(appPid)
-  const brokerPid = brokerPIDFromRoot(root)
-  await terminate(brokerPid)
-  if (!isAlive(appPid) && !isAlive(brokerPid)) fs.rmSync(root, { recursive: true, force: true })
+  if (!isAlive(appPid)) fs.rmSync(root, { recursive: true, force: true })
 }
 
 async function launchNative(options) {
@@ -211,30 +197,19 @@ function terminalStreamDelta(before, after) {
   }
 }
 
-function brokerInfoForFixture(fixture) {
-  const file = brokerInfoPath(fixture.root)
-  try {
-    const info = JSON.parse(fs.readFileSync(file, 'utf8'))
-    if (Number(info.pid) === fixture.brokerPid
-        && typeof info.socketPath === 'string'
-        && typeof info.token === 'string') return info
-  } catch {}
-  fail(`isolated broker metadata does not match PID ${fixture.brokerPid}`)
-}
-
 async function terminalStreamHeads(fixture) {
-  const status = await requestBrokerControl(brokerInfoForFixture(fixture), {
-    protocol: PROTOCOL,
-    appVersion: 'kaisola-native-frame-cadence',
-    method: 'broker.status',
-  })
+  let heads
+  try {
+    heads = JSON.parse(fs.readFileSync(streamHeadsPath(fixture.root), 'utf8'))
+  } catch {
+    fail('fixture stream-heads dump is missing or unreadable')
+  }
   const terminalIDs = fixture.receipt.terminalIds || [fixture.receipt.terminalId]
-  const rows = new Map((status?.terminals || []).map((terminal) => [terminal.id, terminal]))
   return Object.fromEntries(terminalIDs.map((id) => {
-    const row = rows.get(id)
+    const row = heads[id]
     if (!row || typeof row.streamEpoch !== 'string'
         || !Number.isSafeInteger(row.endOffset) || row.endOffset < 0) {
-      fail(`broker status has no valid stream head for ${id}`)
+      fail(`stream-heads dump has no valid stream head for ${id}`)
     }
     return [id, { streamEpoch: row.streamEpoch, endOffset: row.endOffset }]
   }))
@@ -242,7 +217,7 @@ async function terminalStreamHeads(fixture) {
 
 module.exports = {
   FIXTURE_LAUNCH_ARGUMENTS,
-  brokerInfoPath,
+  streamHeadsPath,
   isAlive,
   launchNative,
   terminalStreamDelta,

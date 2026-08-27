@@ -46,59 +46,6 @@ targets:
         ONLY_ACTIVE_ARCH: NO
         SKIP_INSTALL: YES
 
-  # Arm64-only Swift broker. The application depends on the build product but
-  # never embeds the loose executable; the post-build phase below seals it in
-  # the distinct schema-2 BrokerSessionHelper package.
-  KaisolaSessionBroker:
-    type: tool
-    platform: macOS
-    sources:
-      - path: KaisolaSessionBroker
-    dependencies:
-      - target: KaisolaSessionBrokerCore
-      # Static-library dependencies do not propagate their package products to
-      # a tool link step, so the executable must link the wire protocol too.
-      - package: KaisolaCore
-        product: KaisolaBrokerProtocol
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.session-broker-shadow
-        PRODUCT_MODULE_NAME: KaisolaSessionBroker
-        PRODUCT_NAME: KaisolaSessionBroker
-        GENERATE_INFOPLIST_FILE: YES
-        ARCHS: arm64
-        ONLY_ACTIVE_ARCH: NO
-        SKIP_INSTALL: YES
-        ENABLE_APP_SANDBOX: NO
-        CODE_SIGN_STYLE: Automatic
-
-  KaisolaBrokerBootstrap:
-    type: tool
-    platform: macOS
-    sources:
-      - path: BrokerBootstrap
-      - path: Shared
-    dependencies:
-      - package: KaisolaCore
-        product: KaisolaBrokerProtocol
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.broker-bootstrap
-        PRODUCT_MODULE_NAME: KaisolaBrokerBootstrap
-        PRODUCT_NAME: KaisolaBrokerBootstrap
-        GENERATE_INFOPLIST_FILE: YES
-        ENABLE_APP_SANDBOX: NO
-        CODE_SIGN_STYLE: Automatic
-      configs:
-        LocalRelease:
-          ENABLE_HARDENED_RUNTIME: YES
-        Release:
-          # Developer-ID builds must not inherit Xcode's development-only
-          # get-task-allow base entitlement. The distribution preflight also
-          # rejects it, but preventing injection keeps the first artifact clean.
-          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
-          ENABLE_HARDENED_RUNTIME: YES
-
   Kaisola:
     type: application
     platform: macOS
@@ -118,12 +65,7 @@ targets:
       - path: ../../assets/kaisola-icon.icns
         buildPhase: resources
     dependencies:
-      - target: KaisolaBrokerBootstrap
-        embed: false
-        link: false
-      - target: KaisolaSessionBroker
-        embed: false
-        link: false
+      - target: KaisolaSessionBrokerCore
       - package: KaisolaCore
         product: KaisolaCore
       - package: KaisolaCore
@@ -180,16 +122,16 @@ targets:
           # fails against the old one.
           KAISOLA_SPARKLE_PUBLIC_ED_KEY: BQgU8WTQzeYBaYnbWrYBgoP7JPYyCXVrNgHCMBvmYrk=
         Release:
+          # Developer-ID builds must not inherit Xcode's development-only
+          # get-task-allow base entitlement. The distribution preflight also
+          # rejects it, but preventing injection keeps the first artifact clean.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           ENABLE_HARDENED_RUNTIME: YES
     postBuildScripts:
-      - name: Package standalone broker helper
+      - name: Package sealed Node helper
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
-          launch_agents="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
-          mkdir -p "${launch_agents}"
-          cp "${SRCROOT}/BrokerHelper/com.kaisola.mac.broker-bootstrap.plist" "${launch_agents}/com.kaisola.mac.broker-bootstrap.plist"
-
           if [[ "${CONFIGURATION}" != "Release" && "${CONFIGURATION}" != "LocalRelease" && "${KAISOLA_PACKAGE_BROKER_HELPER:-0}" != "1" ]]; then
             exit 0
           fi
@@ -204,7 +146,6 @@ targets:
           args=(
             --output "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper"
             --runtime-arm64 "${runtime_arm64}"
-            --bootstrap "${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap"
             --entitlements "${SRCROOT}/BrokerHelper/BrokerHelper.entitlements"
           )
           if [[ " ${ARCHS} " == *" x86_64 "* ]]; then
@@ -219,22 +160,6 @@ targets:
           fi
           /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${args[@]}"
 
-          # Keep the development-selected Swift engine in its own digest-sealed
-          # schema-2 root. It must never be nested inside the stable Node helper
-          # package, and it must never inherit Node's JIT entitlements.
-          native_args=(
-            --output "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerSessionHelper"
-            --native-broker "${BUILT_PRODUCTS_DIR}/KaisolaSessionBroker"
-            --bootstrap "${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap"
-            --policy "${SRCROOT}/BrokerHelper/native-package-policy.json"
-            --app-release-version "${MARKETING_VERSION}"
-            --app-release-build "${CURRENT_PROJECT_VERSION}"
-          )
-          if [[ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
-            native_args+=(--sign-identity "${EXPANDED_CODE_SIGN_IDENTITY}" --require-signatures)
-          fi
-          /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${native_args[@]}"
-
   KaisolaTests:
     type: bundle.unit-test
     platform: macOS
@@ -243,9 +168,6 @@ targets:
     dependencies:
       - target: Kaisola
       - target: KaisolaSessionBrokerCore
-      - target: KaisolaSessionBroker
-        embed: false
-        link: false
       - package: SwiftTerm
     settings:
       base:

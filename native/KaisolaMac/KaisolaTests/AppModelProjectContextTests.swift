@@ -159,7 +159,6 @@ final class AppModelProjectContextTests: XCTestCase {
         )
         let model = AppModel(
             brokerPreparer: ProjectContextBrokerPreparer(),
-            fallbackPreparer: nil,
             client: broker,
             sessionStore: sessionStore,
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
@@ -762,7 +761,6 @@ final class AppModelProjectContextTests: XCTestCase {
         let sessionStore = NativeSessionStore(fileURL: storeFile)
         let model = AppModel(
             brokerPreparer: ProjectContextBrokerPreparer(),
-            fallbackPreparer: nil,
             client: ProjectContextBrokerClient(),
             sessionStore: sessionStore,
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
@@ -799,7 +797,6 @@ final class AppModelProjectContextTests: XCTestCase {
         let reopenedTranscriptStore = AcpTranscriptStore(fileURL: transcriptURL)
         let reopened = AppModel(
             brokerPreparer: ProjectContextBrokerPreparer(),
-            fallbackPreparer: nil,
             client: ProjectContextBrokerClient(),
             sessionStore: NativeSessionStore(fileURL: storeFile),
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("reopened-cursors.json")),
@@ -4013,7 +4010,6 @@ final class AppModelProjectContextTests: XCTestCase {
         )
         let model = AppModel(
             brokerPreparer: ProjectContextBrokerPreparer(),
-            fallbackPreparer: nil,
             client: ProjectContextBrokerClient(),
             sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
@@ -4145,7 +4141,6 @@ final class AppModelProjectContextTests: XCTestCase {
         )
         return AppModel(
             brokerPreparer: ProjectContextBrokerPreparer(),
-            fallbackPreparer: nil,
             client: ProjectContextBrokerClient(),
             sessionStore: sessionStore,
             cursorStore: TerminalCursorStore(

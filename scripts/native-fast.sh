@@ -3,7 +3,7 @@
 #
 # Unlike native-dev.sh, this lane launches the stable DerivedData product
 # directly. It deliberately skips app installation, Launch Services cleanup,
-# and broker-helper packaging while the selected detached broker is alive.
+# and Node-helper packaging unless the helper inputs changed.
 # Use native-dev.sh whenever packaging, helper, signing, entitlements, update,
 # or production-profile behavior is part of the change.
 set -euo pipefail
@@ -15,35 +15,22 @@ CONFIGURATION="Debug"
 DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/Kaisola.noindex}"
 SOURCE_APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/Kaisola.app"
 CANONICAL_DEV_APP="${KAISOLA_NATIVE_APP:-$HOME/Applications/Kaisola Dev.app}"
-PROFILE_ROUTE="${KAISOLA_NATIVE_BROKER_PROFILE:-native}"
 BUILD_CURRENT=1
 LAUNCH_CURRENT=1
 REFRESH_HELPER=0
 SKIP_HELPER=0
 VERBOSE=0
 
-case "$PROFILE_ROUTE" in
-  native) PROFILE_NAME="Kaisola Native" ;;
-  development) PROFILE_NAME="Kaisola Dev" ;;
-  *)
-    /bin/echo "KAISOLA_NATIVE_BROKER_PROFILE must be native or development." >&2
-    exit 2
-    ;;
-esac
-
-BROKER_INFO="$HOME/Library/Application Support/$PROFILE_NAME/session-broker/broker.json"
-
 usage() {
   /bin/echo "Usage: $0 [--build-only | --launch-only] [--refresh-helper | --skip-helper] [--verbose]"
   /bin/echo ""
   /bin/echo "  --build-only      Incrementally build without launching the app"
   /bin/echo "  --launch-only     Launch the existing DerivedData product"
-  /bin/echo "  --refresh-helper  Repackage the broker helper during this build"
+  /bin/echo "  --refresh-helper  Repackage the Node helper during this build"
   /bin/echo "  --skip-helper     Skip helper packaging (isolated build timing only)"
   /bin/echo "  --verbose         Show the full xcodebuild log"
   /bin/echo ""
   /bin/echo "Environment:"
-  /bin/echo "  KAISOLA_NATIVE_BROKER_PROFILE=native|development"
   /bin/echo "  KAISOLA_NATIVE_DERIVED_DATA=/absolute/stable/path"
 }
 
@@ -81,13 +68,6 @@ if [[ "$BUILD_CURRENT" -eq 0 && "$LAUNCH_CURRENT" -eq 0 ]]; then
   exit 2
 fi
 
-broker_alive() {
-  [[ -f "$BROKER_INFO" ]] || return 1
-  local pid
-  pid="$(/usr/bin/plutil -extract pid raw "$BROKER_INFO" 2>/dev/null || true)"
-  [[ -n "$pid" ]] && /bin/kill -0 "$pid" 2>/dev/null
-}
-
 helper_input_digest() {
   /usr/bin/env node - "$ROOT" <<'NODE'
 const crypto = require('node:crypto')
@@ -96,7 +76,6 @@ const path = require('node:path')
 
 const root = process.argv[2]
 const inputs = [
-  'native/KaisolaMac/BrokerBootstrap',
   'native/KaisolaMac/BrokerHelper',
   'native/KaisolaMac/Shared',
   'native/KaisolaMac/project.yml',
@@ -195,9 +174,9 @@ build_current_source() {
   elif [[ -z "$previous_helper_digest" && -d "$SOURCE_APP/Contents/Resources/BrokerHelper" ]]; then
     package_helper=1
     helper_reason="initialize helper input seal"
-  elif ! broker_alive && [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/kaisola-broker-bootstrap" ]]; then
+  elif [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/node" ]]; then
     package_helper=1
-    helper_reason="no live broker or packaged helper"
+    helper_reason="no packaged helper"
   fi
 
   /bin/mkdir -p "$DERIVED_DATA"
@@ -234,8 +213,8 @@ build_current_source() {
     /bin/echo "Build completed without the expected app: $SOURCE_APP" >&2
     exit 1
   fi
-  if [[ "$package_helper" -eq 1 && ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/kaisola-broker-bootstrap" ]]; then
-    /bin/echo "Build completed without the requested broker helper." >&2
+  if [[ "$package_helper" -eq 1 && ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/node" ]]; then
+    /bin/echo "Build completed without the requested Node helper." >&2
     exit 1
   fi
 
@@ -258,8 +237,8 @@ if [[ "$LAUNCH_CURRENT" -eq 0 ]]; then
   exit 0
 fi
 
-if ! broker_alive && [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/kaisola-broker-bootstrap" ]]; then
-  /bin/echo "The $PROFILE_NAME broker is not running and this fast product has no helper." >&2
+if [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/node" ]]; then
+  /bin/echo "This fast product has no packaged Node helper." >&2
   /bin/echo "Run: $0 --refresh-helper" >&2
   exit 1
 fi
@@ -269,12 +248,11 @@ fi
 stop_exact_app "$SOURCE_APP"
 stop_exact_app "$CANONICAL_DEV_APP"
 
-/bin/echo "Launching the DerivedData executable directly ($PROFILE_NAME profile)…"
+/bin/echo "Launching the DerivedData executable directly…"
 LOG_DIR="$DERIVED_DATA/Logs"
 LOG_FILE="$LOG_DIR/native-fast-app.log"
 /bin/mkdir -p "$LOG_DIR"
 /usr/bin/nohup /usr/bin/env \
-  KAISOLA_NATIVE_BROKER_PROFILE="$PROFILE_ROUTE" \
   KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER=1 \
   "$SOURCE_APP/Contents/MacOS/Kaisola" >>"$LOG_FILE" 2>&1 &
 APP_PID=$!

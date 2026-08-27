@@ -571,6 +571,42 @@ public actor FreshTerminalStore {
         }
     }
 
+    /// `terminal.attach` for an in-process controller: take ownership of an
+    /// EXISTING terminal without ever spawning a replacement. Unlike `create`
+    /// with an existing id, a missing terminal throws and an ended terminal is
+    /// a successful no-op (its writes will still refuse with `terminalEnded`).
+    /// Returns whether the terminal is still live.
+    @discardableResult
+    public func adopt(
+        client: BrokerAuthenticatedClient,
+        identity: FreshTerminalIdentity
+    ) throws -> Bool {
+        let owner = try validatedOwner(
+            client: client,
+            ownerID: identity.ownerID,
+            projectID: identity.projectID
+        )
+        try validateTerminalID(identity.id)
+        guard var record = records[identity.id] else {
+            throw FreshTerminalStoreError.terminalNotFound
+        }
+        guard record.projectID == identity.projectID else {
+            throw FreshTerminalStoreError.terminalAccessDenied
+        }
+        guard pendingReleases[identity.id] == nil else {
+            throw FreshTerminalStoreError.terminalReleaseInProgress
+        }
+        guard !record.exited else { return false }
+        record.owner = owner
+        record.lastOwner = owner
+        records[identity.id] = record
+        // Same discipline as create-adoption: clear any slow-consumer pause
+        // and re-answer the primary policy atomically against output.
+        record.output.armPrimary(owner: owner, enabled: false) { _ in }
+        activityClock.advance()
+        return true
+    }
+
     public func write(
         client: BrokerAuthenticatedClient,
         identity: FreshTerminalIdentity,

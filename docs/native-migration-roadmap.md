@@ -1,5 +1,7 @@
 # Kaisola native (Swift/macOS) migration roadmap
 
+> **Superseded (2026-08-27):** terminals now run in-process (`InProcessTerminalService`); the detached broker, its bootstrap, and the continuity/rolling-update machinery described below were removed. Kept for historical context.
+
 The native app became the daily driver on 2026-07-25. The final Electron product
 is preserved at `archive/electron-v0.1.126`; selected Node broker/service files
 remain on `main` only because the native bundle still packages them. This file

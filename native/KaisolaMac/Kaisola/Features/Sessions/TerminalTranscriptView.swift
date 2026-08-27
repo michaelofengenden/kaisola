@@ -164,37 +164,11 @@ struct TerminalTranscriptView: View {
                 .monospacedDigit()
                 .foregroundStyle(.kaisolaSecondary)
             }
-            if context.diskBytes > 0 {
-                Label(
-                    TerminalHistoryStoragePolicy.usageLabel(diskBytes: context.diskBytes),
-                    systemImage: historyStorageExceeded ? "externaldrive.badge.exclamationmark" : "externaldrive"
-                )
-                .foregroundStyle(
-                    historyStorageExceeded
-                        ? KaisolaStatusTone.needsYou.foregroundColor
-                        : Color.kaisolaSecondary
-                )
-                .help(TerminalHistoryStoragePolicy.help(
-                    diskBytes: context.diskBytes,
-                    warningMiB: settings.terminalHistoryWarningMiB
-                ))
-                .accessibilityLabel(TerminalHistoryStoragePolicy.help(
-                    diskBytes: context.diskBytes,
-                    warningMiB: settings.terminalHistoryWarningMiB
-                ))
-            }
         }
         .font(.caption)
         .padding(.horizontal, 16)
         .frame(height: 34)
         .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private var historyStorageExceeded: Bool {
-        TerminalHistoryStoragePolicy.isExceeded(
-            diskBytes: context.diskBytes,
-            warningMiB: settings.terminalHistoryWarningMiB
-        )
     }
 
     private var isLoading: Bool {
@@ -649,37 +623,6 @@ struct TerminalTranscriptInitialLoadState: Equatable {
         } else {
             phase = .idle
         }
-    }
-}
-
-enum TerminalHistoryStoragePolicy {
-    static func budgetLabel(_ warningMiB: Int) -> String {
-        let value = NativePreviewSettings.clampedTerminalHistoryWarning(warningMiB)
-        return value >= 1_024 ? "\(value / 1_024) GB" : "\(value) MB"
-    }
-
-    static func warningBytes(_ warningMiB: Int) -> Int64 {
-        Int64(NativePreviewSettings.clampedTerminalHistoryWarning(warningMiB)) * 1_024 * 1_024
-    }
-
-    static func isExceeded(diskBytes: Int64, warningMiB: Int) -> Bool {
-        max(0, diskBytes) >= warningBytes(warningMiB)
-    }
-
-    static func usageLabel(diskBytes: Int64) -> String {
-        "\(ByteCountFormatter.string(fromByteCount: max(0, diskBytes), countStyle: .file)) on disk"
-    }
-
-    /// The warning stays soft: crossing it deletes nothing. It sits under the
-    /// broker's far larger disk quota, which is the only thing that ever drops
-    /// the oldest output, and which no budget offered here can reach first.
-    static func help(diskBytes: Int64, warningMiB: Int) -> String {
-        let usage = usageLabel(diskBytes: diskBytes)
-        let threshold = ByteCountFormatter.string(fromByteCount: warningBytes(warningMiB), countStyle: .file)
-        if isExceeded(diskBytes: diskBytes, warningMiB: warningMiB) {
-            return "Terminal history uses \(usage), above the \(threshold) warning. Close this terminal to reclaim it; crossing this warning deletes nothing, and only the far larger disk quota ever drops the oldest output."
-        }
-        return "Terminal history uses \(usage). Kaisola warns at \(threshold) and keeps the first byte until this terminal is closed or its far larger disk quota drops the oldest output."
     }
 }
 

@@ -483,7 +483,6 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
   assert.match(appDebug, /PROVISIONING_PROFILE_SPECIFIER = "\$\(KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER\)";/u)
   for (const dependencyDebug of [
     debugConfiguration('com.kaisola.mac.tests'),
-    debugConfiguration('"com.kaisola.mac.broker-bootstrap"'),
   ]) {
     assert.match(dependencyDebug, /CODE_SIGN_STYLE = Automatic;/u)
     assert.doesNotMatch(dependencyDebug, /KAISOLA_KEYCHAIN_BOUNDARY_/u)

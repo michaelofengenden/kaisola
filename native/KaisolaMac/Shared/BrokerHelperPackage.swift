@@ -21,21 +21,6 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
         let version: String
     }
 
-    struct AppRelease: Decodable, Equatable, Sendable {
-        let version: String
-        let build: String
-    }
-
-    struct Launch: Decodable, Equatable, Sendable {
-        enum Kind: String, Decodable, Equatable, Sendable {
-            case native
-        }
-
-        let kind: Kind
-        let executable: String
-        let arguments: [String]
-    }
-
     struct FileRecord: Decodable, Equatable, Sendable {
         struct MachO: Decodable, Equatable, Sendable {
             let architectures: [String]
@@ -52,7 +37,6 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
 
     enum PackageKind: Equatable, Sendable {
         case nodeV1(node: NodeRuntime, nodePty: NodePTY)
-        case nativeV2(appRelease: AppRelease, launch: Launch)
     }
 
     let schemaVersion: Int
@@ -76,28 +60,6 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
         case files
     }
 
-    /// Keeps the schema-1 construction surface used by the existing broker
-    /// coordinator and its tests unchanged while decoded manifests use the
-    /// explicit package discriminator.
-    init(
-        schemaVersion: Int,
-        packageVersion: String,
-        contentDigest: String,
-        brokerImplementationVersion: Int,
-        brokerProtocol: ProtocolRange,
-        node: NodeRuntime,
-        nodePty: NodePTY,
-        files: [FileRecord]
-    ) {
-        self.schemaVersion = schemaVersion
-        self.packageVersion = packageVersion
-        self.contentDigest = contentDigest
-        self.brokerImplementationVersion = brokerImplementationVersion
-        self.brokerProtocol = brokerProtocol
-        self.files = files
-        packageKind = .nodeV1(node: node, nodePty: nodePty)
-    }
-
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
@@ -112,6 +74,8 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
 
         switch schemaVersion {
         case 1:
+            // The retired schema-2 launch keys stay reserved so a manifest
+            // cannot smuggle native launch metadata under the schema-1 label.
             guard !container.contains(.appRelease), !container.contains(.launch) else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .schemaVersion,
@@ -123,18 +87,6 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
                 node: try container.decode(NodeRuntime.self, forKey: .node),
                 nodePty: try container.decode(NodePTY.self, forKey: .nodePty)
             )
-        case 2:
-            guard !container.contains(.node), !container.contains(.nodePty) else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .schemaVersion,
-                    in: container,
-                    debugDescription: "Schema 2 cannot contain schema-1 Node runtime metadata."
-                )
-            }
-            packageKind = .nativeV2(
-                appRelease: try container.decode(AppRelease.self, forKey: .appRelease),
-                launch: try container.decode(Launch.self, forKey: .launch)
-            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .schemaVersion,
@@ -145,78 +97,25 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
     }
 }
 
-struct BrokerHelperPackageExpectation: Equatable, Sendable {
-    let packageVersion: String
-    let appReleaseVersion: String
-    let appReleaseBuild: String
-}
-
-// The package discriminator stays explicit throughout verification and launch.
-// Schema 1 remains the stable Node default while schema 2 is reachable only
-// through the development-selected native package root.
-enum BrokerLaunchPayload: Equatable, Sendable {
-    case node(executable: URL, script: URL)
-    case native(executable: URL, arguments: [String])
-}
-
 struct VerifiedBrokerHelperPackage: Equatable, Sendable {
     let root: URL
     let manifest: BrokerHelperManifest
 
     var nodeExecutable: URL { root.appendingPathComponent("bin/node") }
-    var bootstrapExecutable: URL { root.appendingPathComponent("bin/kaisola-broker-bootstrap") }
-    var brokerScript: URL { root.appendingPathComponent("lib/runtime/node-broker/session-broker.cjs") }
     var usageScript: URL { root.appendingPathComponent("lib/scripts/native-usage-service.cjs") }
-
-    fileprivate var schema2Expectation: BrokerHelperPackageExpectation? {
-        guard case let .nativeV2(appRelease, _) = manifest.packageKind else {
-            return nil
-        }
-        return BrokerHelperPackageExpectation(
-            packageVersion: manifest.packageVersion,
-            appReleaseVersion: appRelease.version,
-            appReleaseBuild: appRelease.build
-        )
-    }
-
-    var launchPayload: BrokerLaunchPayload {
-        switch manifest.packageKind {
-        case .nodeV1:
-            .node(executable: nodeExecutable, script: brokerScript)
-        case let .nativeV2(_, launch):
-            .native(
-                executable: root.appendingPathComponent(launch.executable),
-                arguments: launch.arguments
-            )
-        }
-    }
 }
 
 enum BrokerHelperPackageVerification {
-    /// This is the trust-policy identity from
-    /// `BrokerHelper/native-package-policy.json`, not a value learned from the
-    /// package being verified. Keep the two values synchronized whenever the
-    /// native package format or compatibility envelope changes.
-    static let bundledNativePackageVersion = "2.0.0"
     static let maximumManifestBytes = 2 * 1_024 * 1_024
     static let maximumFileCount = 512
     static let maximumSingleFileBytes: Int64 = 512 * 1_024 * 1_024
     static let digestReadChunkBytes = 1 * 1_024 * 1_024
-    static let maximumLaunchArgumentCount = 32
-    static let maximumLaunchArgumentBytes = 4_096
 
     static func bundledRoot(bundle: Bundle = .main) throws -> URL {
         guard let resourceURL = bundle.resourceURL else {
             throw BrokerHelperPackageError.notPackaged
         }
         return resourceURL.appendingPathComponent("BrokerHelper", isDirectory: true)
-    }
-
-    static func bundledNativeRoot(bundle: Bundle = .main) throws -> URL {
-        guard let resourceURL = bundle.resourceURL else {
-            throw BrokerHelperPackageError.notPackaged
-        }
-        return resourceURL.appendingPathComponent("BrokerSessionHelper", isDirectory: true)
     }
 
     static func verifyBundled(
@@ -226,52 +125,15 @@ enum BrokerHelperPackageVerification {
         try verify(root: bundledRoot(bundle: bundle), requireSignatures: requireSignatures)
     }
 
-    static func verifyBundledNative(
-        bundle: Bundle = .main,
-        requireSignatures: Bool
-    ) throws -> VerifiedBrokerHelperPackage {
-        let expectation = try bundledNativeExpectation(bundle: bundle)
-        let verified = try verify(
-            root: bundledNativeRoot(bundle: bundle),
-            requireSignatures: requireSignatures,
-            schema2Expectation: expectation
-        )
-        try validateBundledNativeBootstrap(verified)
-        return verified
-    }
-
-    static func bundledNativeExpectation(
-        bundle: Bundle = .main
-    ) throws -> BrokerHelperPackageExpectation {
-        // Schema 2 binds a candidate to the app release that sealed it. Never
-        // accept the package's own appRelease fields as their expectation.
-        // They become trusted only after matching these outer-bundle values.
-        guard let appReleaseVersion = bundle.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String,
-        let appReleaseBuild = bundle.object(
-            forInfoDictionaryKey: "CFBundleVersion"
-        ) as? String,
-        isBoundedIdentity(appReleaseVersion),
-        isBoundedIdentity(appReleaseBuild) else {
-            throw BrokerHelperPackageError.incompatibleManifest
-        }
-        return BrokerHelperPackageExpectation(
-            packageVersion: bundledNativePackageVersion,
-            appReleaseVersion: appReleaseVersion,
-            appReleaseBuild: appReleaseBuild
-        )
-    }
-
     static func verify(
         root requestedRoot: URL,
         requireSignatures: Bool,
-        schema2Expectation: BrokerHelperPackageExpectation? = nil,
         currentUserID: uid_t = getuid()
     ) throws -> VerifiedBrokerHelperPackage {
         // `/tmp` is a symlink to `/private/tmp` on macOS. Resolve the package
         // root once so enumerated file URLs and manifest-relative paths use the
-        // same canonical prefix under app translocation and test staging.
+        // same canonical prefix under app translocation and temporary test
+        // roots.
         let standardizedRoot = requestedRoot.standardizedFileURL
         // In production the manifest is an authority for nested hashes and
         // designated requirements only because the outer app signature seals
@@ -312,7 +174,6 @@ enum BrokerHelperPackageVerification {
             throw BrokerHelperPackageError.incompatibleManifest
         }
 
-        let isNativeV2: Bool
         switch manifest.packageKind {
         case let .nodeV1(node, nodePty):
             guard manifest.schemaVersion == BrokerWire.helperPackageSchema,
@@ -321,27 +182,6 @@ enum BrokerHelperPackageVerification {
                   !nodePty.version.isEmpty else {
                 throw BrokerHelperPackageError.incompatibleManifest
             }
-            isNativeV2 = false
-        case let .nativeV2(appRelease, launch):
-            guard let schema2Expectation,
-                  manifest.schemaVersion == BrokerWire.nativeHelperPackageSchema,
-                  manifest.packageVersion == schema2Expectation.packageVersion,
-                  isBoundedIdentity(appRelease.version),
-                  isBoundedIdentity(appRelease.build),
-                  appRelease.version == schema2Expectation.appReleaseVersion,
-                  appRelease.build == schema2Expectation.appReleaseBuild,
-                  manifest.brokerImplementationVersion == BrokerWire.implementationVersion,
-                  manifest.brokerProtocol.minimum == BrokerWire.protocolVersion,
-                  manifest.brokerProtocol.maximum == BrokerWire.protocolVersion,
-                  manifest.brokerProtocol.securityEpoch == BrokerWire.securityEpoch else {
-                throw BrokerHelperPackageError.incompatibleManifest
-            }
-            try validateNativeLaunch(launch, files: manifest.files)
-            isNativeV2 = true
-        }
-
-        if isNativeV2, manifestStat.st_nlink != 1 {
-            throw BrokerHelperPackageError.invalidManifest
         }
 
         let expectedPaths = Set(manifest.files.map(\.path))
@@ -367,38 +207,17 @@ enum BrokerHelperPackageVerification {
             }
             let fileURL = root.appendingPathComponent(record.path, isDirectory: false)
             let value = try validateRegularFile(fileURL, currentUserID: currentUserID)
-            if isNativeV2,
-               record.role == "session-broker-executable",
-               record.mode != "0755" {
-                throw BrokerHelperPackageError.fileMismatch(record.path)
-            }
             guard value.st_size == record.size,
                   Int(value.st_mode & 0o777) == expectedMode,
                   value.st_mode & 0o022 == 0 else {
                 throw BrokerHelperPackageError.fileMismatch(record.path)
             }
-            if isNativeV2, value.st_nlink != 1 {
-                throw BrokerHelperPackageError.fileMismatch(record.path)
-            }
             guard try digest(fileURL) == record.sha256.lowercased() else {
-                throw BrokerHelperPackageError.fileMismatch(record.path)
-            }
-            let actualMachOArchitectures = isNativeV2
-                ? try machOArchitectures(fileURL)
-                : []
-            if isNativeV2,
-               (record.machO != nil) != !actualMachOArchitectures.isEmpty {
                 throw BrokerHelperPackageError.fileMismatch(record.path)
             }
             if let machO = record.machO {
                 guard !machO.architectures.isEmpty else {
                     throw BrokerHelperPackageError.invalidManifest
-                }
-                if isNativeV2 {
-                    guard machO.architectures == ["arm64"],
-                          actualMachOArchitectures == ["arm64"] else {
-                        throw BrokerHelperPackageError.fileMismatch(record.path)
-                    }
                 }
                 if requireSignatures {
                     guard let requirement = machO.designatedRequirement, !requirement.isEmpty else {
@@ -414,17 +233,12 @@ enum BrokerHelperPackageVerification {
         }
 
         let verified = VerifiedBrokerHelperPackage(root: root, manifest: manifest)
-        switch verified.launchPayload {
-        case .node:
-            guard FileManager.default.isExecutableFile(atPath: verified.nodeExecutable.path),
-                  FileManager.default.isExecutableFile(atPath: verified.bootstrapExecutable.path),
-                  FileManager.default.fileExists(atPath: verified.brokerScript.path) else {
-                throw BrokerHelperPackageError.inventoryMismatch("required entrypoint is missing")
-            }
-        case let .native(executable, _):
-            guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-                throw BrokerHelperPackageError.inventoryMismatch("required entrypoint is missing")
-            }
+        // Every sealed file already had to exist with its manifest mode, so
+        // this final check only proves the one entrypoint every consumer
+        // executes: the pinned Node runtime. Callers resolve their own script
+        // paths against the sealed inventory.
+        guard FileManager.default.isExecutableFile(atPath: verified.nodeExecutable.path) else {
+            throw BrokerHelperPackageError.inventoryMismatch("required entrypoint is missing")
         }
         return verified
     }
@@ -476,132 +290,6 @@ enum BrokerHelperPackageVerification {
         return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
 
-    private static func isBoundedIdentity(_ value: String) -> Bool {
-        !value.isEmpty
-            && value.utf8.count <= 64
-            && !value.contains("\0")
-    }
-
-    private static func validateNativeLaunch(
-        _ launch: BrokerHelperManifest.Launch,
-        files: [BrokerHelperManifest.FileRecord]
-    ) throws {
-        guard isSafeRelativePath(launch.executable),
-              launch.arguments.count <= maximumLaunchArgumentCount,
-              launch.arguments.allSatisfy({ argument in
-                  !argument.isEmpty
-                      && argument.utf8.count <= maximumLaunchArgumentBytes
-                      && !argument.contains("\0")
-                      && argument != "--launch"
-                      && argument != "--pty-child"
-              }),
-              files.allSatisfy({ !$0.role.isEmpty && $0.role.utf8.count <= 64 }) else {
-            throw BrokerHelperPackageError.invalidManifest
-        }
-
-        let executableRecords = files.filter { $0.role == "session-broker-executable" }
-        guard executableRecords.count == 1,
-              let executable = executableRecords.first,
-              executable.path == launch.executable,
-              let machO = executable.machO,
-              machO.architectures == ["arm64"],
-              let requirement = machO.designatedRequirement,
-              !requirement.isEmpty else {
-            throw BrokerHelperPackageError.invalidManifest
-        }
-    }
-
-    /// The runtime-neutral schema permits a package whose only executable is
-    /// the broker, but Kaisola's current detached-launch path deliberately
-    /// travels through the sealed Swift bootstrap inside the selected root.
-    /// Hold bundled candidates to that stronger deployment profile so a
-    /// missing, script-based, or substituted bootstrap fails during selection
-    /// instead of at process execution.
-    private static func validateBundledNativeBootstrap(
-        _ package: VerifiedBrokerHelperPackage
-    ) throws {
-        let records = package.manifest.files.filter {
-            $0.role == "launch-agent-bootstrap"
-        }
-        guard records.count == 1,
-              let bootstrap = records.first,
-              bootstrap.path == "bin/kaisola-broker-bootstrap",
-              bootstrap.mode == "0755",
-              bootstrap.machO?.architectures == ["arm64"],
-              let requirement = bootstrap.machO?.designatedRequirement,
-              !requirement.isEmpty,
-              FileManager.default.isExecutableFile(
-                  atPath: package.bootstrapExecutable.path
-              ) else {
-            throw BrokerHelperPackageError.inventoryMismatch(
-                "sealed native bootstrap is missing"
-            )
-        }
-    }
-
-    private static func machOArchitectures(_ url: URL) throws -> [String] {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let header = try handle.read(upToCount: 4_096) ?? Data()
-
-        func readUInt32(_ offset: Int, littleEndian: Bool) -> UInt32? {
-            guard offset >= 0, offset + 4 <= header.count else { return nil }
-            let bytes = [
-                UInt32(header[offset]),
-                UInt32(header[offset + 1]),
-                UInt32(header[offset + 2]),
-                UInt32(header[offset + 3]),
-            ]
-            if littleEndian {
-                return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)
-            }
-            return (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]
-        }
-
-        func architecture(_ cpuType: UInt32) -> String {
-            switch cpuType {
-            case 0x0100_000C: "arm64"
-            case 0x0100_0007: "x86_64"
-            case 0x0000_000C: "arm"
-            case 0x0000_0007: "x86"
-            default: "unknown-\(cpuType)"
-            }
-        }
-
-        guard let littleMagic = readUInt32(0, littleEndian: true),
-              let bigMagic = readUInt32(0, littleEndian: false) else {
-            return []
-        }
-        if littleMagic == 0xFEED_FACE || littleMagic == 0xFEED_FACF {
-            guard let cpuType = readUInt32(4, littleEndian: true) else { return [] }
-            return [architecture(cpuType)]
-        }
-        if bigMagic == 0xFEED_FACE || bigMagic == 0xFEED_FACF {
-            guard let cpuType = readUInt32(4, littleEndian: false) else { return [] }
-            return [architecture(cpuType)]
-        }
-
-        let fatEntryBytes: Int
-        switch bigMagic {
-        case 0xCAFE_BABE:
-            fatEntryBytes = 20
-        case 0xCAFE_BABF:
-            fatEntryBytes = 32
-        default:
-            return []
-        }
-        guard let rawCount = readUInt32(4, littleEndian: false),
-              rawCount > 0,
-              rawCount <= 32 else {
-            return []
-        }
-        let count = Int(rawCount)
-        guard 8 + (count * fatEntryBytes) <= header.count else { return [] }
-        return (0..<count).compactMap { index in
-            readUInt32(8 + (index * fatEntryBytes), littleEndian: false).map(architecture)
-        }
-    }
-
     private static func digest(_ url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -619,17 +307,10 @@ enum BrokerHelperPackageVerification {
     }
 
     /// Must remain byte-for-byte equivalent to
-    /// `scripts/native-broker-package.cjs:contentDigest`. It intentionally
+    /// `scripts/native-broker-package.cjs:contentDigestV1`. It intentionally
     /// excludes generated timestamps and JSON formatting while binding the
     /// compatibility envelope and every sealed behavior-bearing file.
     static func contentDigest(for manifest: BrokerHelperManifest) -> String {
-        if case let .nativeV2(appRelease, launch) = manifest.packageKind {
-            return nativeContentDigest(
-                for: manifest,
-                appRelease: appRelease,
-                launch: launch
-            )
-        }
         var hash = SHA256()
         func field(_ value: String) {
             let bytes = Data(value.utf8)
@@ -648,47 +329,6 @@ enum BrokerHelperPackageVerification {
             field(String(record.size))
             field(record.mode)
             field(record.sha256.lowercased())
-        }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func nativeContentDigest(
-        for manifest: BrokerHelperManifest,
-        appRelease: BrokerHelperManifest.AppRelease,
-        launch: BrokerHelperManifest.Launch
-    ) -> String {
-        var hash = SHA256()
-        func field(_ value: String) {
-            let bytes = Data(value.utf8)
-            hash.update(data: Data("\(bytes.count):".utf8))
-            hash.update(data: bytes)
-        }
-        field("kaisola-broker-helper-content-v2")
-        field(String(manifest.schemaVersion))
-        field(manifest.packageVersion)
-        field(appRelease.version)
-        field(appRelease.build)
-        field(String(manifest.brokerImplementationVersion))
-        field(String(manifest.brokerProtocol.minimum))
-        field(String(manifest.brokerProtocol.maximum))
-        field(String(manifest.brokerProtocol.securityEpoch))
-        field(launch.kind.rawValue)
-        field(launch.executable)
-        field(String(launch.arguments.count))
-        for argument in launch.arguments {
-            field(argument)
-        }
-        for record in manifest.files.sorted(by: { $0.path < $1.path }) {
-            field(record.path)
-            field(record.role)
-            field(String(record.size))
-            field(record.mode)
-            field(record.sha256.lowercased())
-            field(String(record.machO?.architectures.count ?? 0))
-            for architecture in record.machO?.architectures ?? [] {
-                field(architecture)
-            }
-            field(record.machO?.designatedRequirement ?? "")
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -776,160 +416,6 @@ enum BrokerHelperPackageVerification {
     }
 }
 
-/// Copies one already verified helper package out of the replaceable `.app`
-/// bundle into a private, digest-addressed generation directory. The final
-/// path is immutable by convention: an existing directory is reused only when
-/// every byte still verifies against the sealed source manifest. A mismatch
-/// fails closed instead of repairing over evidence of tampering.
-enum BrokerHelperPackageStaging {
-    static func stage(
-        _ source: VerifiedBrokerHelperPackage,
-        at requestedDestination: URL,
-        currentUserID: uid_t = getuid()
-    ) throws -> VerifiedBrokerHelperPackage {
-        let destination = requestedDestination.standardizedFileURL
-        let generations = destination.deletingLastPathComponent()
-        guard generations.lastPathComponent == "broker-generations",
-              destination.lastPathComponent == source.manifest.contentDigest else {
-            throw BrokerHelperPackageError.unsafeStagingPath
-        }
-        let schema2Expectation = source.schema2Expectation
-        try preparePrivateDirectory(generations, currentUserID: currentUserID)
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            return try verifiedExisting(
-                destination,
-                expected: source.manifest,
-                schema2Expectation: schema2Expectation,
-                currentUserID: currentUserID
-            )
-        }
-
-        let temporary = generations.appendingPathComponent(
-            ".stage-\(source.manifest.contentDigest)-\(getpid())-\(UUID().uuidString.lowercased())",
-            isDirectory: true
-        )
-        var temporaryExists = false
-        defer {
-            if temporaryExists { try? FileManager.default.removeItem(at: temporary) }
-        }
-        do {
-            try FileManager.default.copyItem(at: source.root, to: temporary)
-            temporaryExists = true
-            guard chmod(temporary.path, 0o700) == 0 else {
-                throw BrokerHelperPackageError.unsafePermissions
-            }
-            let copied = try BrokerHelperPackageVerification.verify(
-                root: temporary,
-                requireSignatures: false,
-                schema2Expectation: schema2Expectation,
-                currentUserID: currentUserID
-            )
-            guard copied.manifest == source.manifest else {
-                throw BrokerHelperPackageError.stagedPackageMismatch
-            }
-            try synchronize(copied)
-            do {
-                try FileManager.default.moveItem(at: temporary, to: destination)
-                temporaryExists = false
-            } catch {
-                // A second window may have won the same digest-addressed stage
-                // race. Adopt only its independently verified exact bytes.
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    return try verifiedExisting(
-                        destination,
-                        expected: source.manifest,
-                        schema2Expectation: schema2Expectation,
-                        currentUserID: currentUserID
-                    )
-                }
-                throw error
-            }
-            try synchronizeDirectory(generations)
-            return try verifiedExisting(
-                destination,
-                expected: source.manifest,
-                schema2Expectation: schema2Expectation,
-                currentUserID: currentUserID
-            )
-        } catch let error as BrokerHelperPackageError {
-            throw error
-        } catch {
-            throw BrokerHelperPackageError.couldNotStage
-        }
-    }
-
-    private static func verifiedExisting(
-        _ destination: URL,
-        expected: BrokerHelperManifest,
-        schema2Expectation: BrokerHelperPackageExpectation?,
-        currentUserID: uid_t
-    ) throws -> VerifiedBrokerHelperPackage {
-        let verified: VerifiedBrokerHelperPackage
-        do {
-            verified = try BrokerHelperPackageVerification.verify(
-                root: destination,
-                requireSignatures: false,
-                schema2Expectation: schema2Expectation,
-                currentUserID: currentUserID
-            )
-        } catch {
-            throw BrokerHelperPackageError.stagedPackageMismatch
-        }
-        guard verified.manifest == expected else {
-            throw BrokerHelperPackageError.stagedPackageMismatch
-        }
-        return verified
-    }
-
-    private static func preparePrivateDirectory(_ url: URL, currentUserID: uid_t) throws {
-        var value = stat()
-        if lstat(url.path, &value) == 0 {
-            guard value.st_uid == currentUserID,
-                  value.st_mode & S_IFMT == S_IFDIR,
-                  value.st_mode & 0o077 == 0 else {
-                throw BrokerHelperPackageError.unsafePermissions
-            }
-            return
-        }
-        guard errno == ENOENT else { throw BrokerHelperPackageError.unsafePermissions }
-        try FileManager.default.createDirectory(
-            at: url,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        guard chmod(url.path, 0o700) == 0,
-              lstat(url.path, &value) == 0,
-              value.st_uid == currentUserID,
-              value.st_mode & S_IFMT == S_IFDIR,
-              value.st_mode & 0o077 == 0 else {
-            throw BrokerHelperPackageError.unsafePermissions
-        }
-    }
-
-    private static func synchronize(_ package: VerifiedBrokerHelperPackage) throws {
-        for record in package.manifest.files {
-            try synchronizeFile(package.root.appendingPathComponent(record.path))
-        }
-        try synchronizeFile(package.root.appendingPathComponent("manifest.json"))
-        try synchronizeDirectory(package.root)
-    }
-
-    private static func synchronizeFile(_ url: URL) throws {
-        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
-        guard descriptor >= 0 else { throw BrokerHelperPackageError.couldNotStage }
-        defer { Darwin.close(descriptor) }
-        guard fsync(descriptor) == 0 else { throw BrokerHelperPackageError.couldNotStage }
-    }
-
-    private static func synchronizeDirectory(_ url: URL) throws {
-        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard descriptor >= 0 else { throw BrokerHelperPackageError.couldNotStage }
-        defer { Darwin.close(descriptor) }
-        guard fsync(descriptor) == 0 else { throw BrokerHelperPackageError.couldNotStage }
-    }
-}
-
 enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
     case notPackaged
     case invalidManifest
@@ -940,9 +426,6 @@ enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
     case unsealedHostApplication
     case unsignedNestedCode(String)
     case signatureMismatch(String)
-    case unsafeStagingPath
-    case stagedPackageMismatch
-    case couldNotStage
 
     var errorDescription: String? {
         switch self {
@@ -964,12 +447,6 @@ enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
             "The bundled terminal helper contains unsigned code at \(path)."
         case let .signatureMismatch(path):
             "The bundled terminal helper signature is invalid at \(path)."
-        case .unsafeStagingPath:
-            "The terminal helper generation path is invalid."
-        case .stagedPackageMismatch:
-            "The staged terminal helper no longer matches its sealed generation."
-        case .couldNotStage:
-            "The terminal helper generation could not be staged durably."
         }
     }
 }

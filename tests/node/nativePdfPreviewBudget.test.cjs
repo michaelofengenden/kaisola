@@ -179,7 +179,6 @@ test('optimized PDF qualification runs in a fresh simulator-free macOS job', () 
   const requiredSteps = [
     'Compile optimized Kaisola macOS app',
     'Verify sealed Kaisola package',
-    'Prove packaged broker and PTY continuity',
     'Gate installed optimized PDF previews',
   ]
   for (const step of requiredSteps) {
@@ -191,8 +190,6 @@ test('optimized PDF qualification runs in a fresh simulator-free macOS job', () 
 
   assert.match(qualification, /-configuration LocalRelease/u)
   assert.match(qualification, /npm run native:preflight --/u)
-  assert.match(qualification, /npm run native:helper:probe --/u)
-  assert.match(qualification, /--require-signed-host/u)
   assert.match(qualification, /npm run native:pdf-preview-budget --/u)
   assert.match(qualification, /--output "\$RUNNER_TEMP\/native-pdf-preview-budget\.json"/u)
   assert.doesNotMatch(

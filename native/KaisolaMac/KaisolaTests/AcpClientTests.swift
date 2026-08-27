@@ -2095,6 +2095,45 @@ final class AcpClientTests: XCTestCase {
         XCTAssertFalse(AcpClient.parseCapabilities(.object([:])).steering)
     }
 
+    func testSessionCapabilitiesAdvertisedAsEmptyObjectsCount() {
+        // Both shipping adapters advertise `resume`/`close` as EMPTY OBJECTS
+        // (presence is the advertisement), not booleans. Reading them with
+        // `.boolValue` parsed them false, which forced every reconnect through
+        // session/load's full-history replay — the 30-second chat open.
+        let objectShaped = AcpClient.parseCapabilities(.object([
+            "agentCapabilities": .object([
+                "loadSession": .bool(true),
+                "sessionCapabilities": .object([
+                    "resume": .object([:]),
+                    "close": .object([:]),
+                ]),
+            ]),
+        ]))
+        XCTAssertTrue(objectShaped.resumeSession)
+        XCTAssertTrue(objectShaped.closeSession)
+
+        // Boolean advertisements keep their plain meaning.
+        let booleanShaped = AcpClient.parseCapabilities(.object([
+            "agentCapabilities": .object([
+                "sessionCapabilities": .object([
+                    "resume": .bool(true),
+                    "close": .bool(false),
+                ]),
+            ]),
+        ]))
+        XCTAssertTrue(booleanShaped.resumeSession)
+        XCTAssertFalse(booleanShaped.closeSession)
+
+        // Explicit null and absence are both non-advertisements.
+        let declined = AcpClient.parseCapabilities(.object([
+            "agentCapabilities": .object([
+                "sessionCapabilities": .object(["resume": .null]),
+            ]),
+        ]))
+        XCTAssertFalse(declined.resumeSession)
+        XCTAssertFalse(declined.closeSession)
+    }
+
     func testSteerRequestIsShapedLikeAPromptWithTheIdleOptIn() throws {
         let params = try XCTUnwrap(
             AcpSteering.requestParams(sessionID: "sess-1", text: "use tabs").objectValue
@@ -2576,11 +2615,14 @@ final class AcpClientTests: XCTestCase {
     }
 
     func testRestartContinuityPrefersStableResumeThenFallsBackFresh() async throws {
+        // A chat whose transcript is already on disk does not need the
+        // adapter's full-history replay: resume reconnects in one round-trip
+        // where session/load streams every prior message back first.
         let resumedTransport = ScriptedAcpTransport(resumeCapability: true)
         let resumedClient = AcpClient(transport: resumedTransport)
         let resumed = try await resumedClient.start(
             command: "mock", arguments: [], environment: [:], cwd: "/tmp",
-            mcpServers: [], resumeSessionID: "sess-stable"
+            mcpServers: [], resumeSessionID: "sess-stable", hasLocalTranscript: true
         )
         XCTAssertEqual(resumed.sessionID, "sess-stable")
         let resumedMethods = await resumedTransport.receivedSessionMethods()
@@ -2595,6 +2637,35 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(fresh.sessionID, "sess-1")
         let staleMethods = await staleTransport.receivedSessionMethods()
         XCTAssertEqual(staleMethods, ["session/load", "session/new"])
+    }
+
+    func testConnectWithoutALocalTranscriptStillLoadsForTheReplay() async throws {
+        // Adopting a session ID with no local rows (external CLI session, lost
+        // store) leaves the load replay as the ONLY source of visible history,
+        // so resume support must not pre-empt it there.
+        let transport = ScriptedAcpTransport(resumeCapability: true)
+        let client = AcpClient(transport: transport)
+        let info = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: [], resumeSessionID: "sess-adopted"
+        )
+        XCTAssertEqual(info.sessionID, "sess-adopted")
+        let methods = await transport.receivedSessionMethods()
+        XCTAssertEqual(methods, ["session/load"])
+    }
+
+    func testTranscriptBackedConnectFallsBackToLoadWhenResumeIsRefused() async throws {
+        // An adapter can advertise resume yet not know this particular session
+        // (pruned store). The load fallback must still run before session/new.
+        let transport = ScriptedAcpTransport(resumeCapability: true, rejectResumeOnly: true)
+        let client = AcpClient(transport: transport)
+        let info = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: [], resumeSessionID: "sess-forgotten", hasLocalTranscript: true
+        )
+        XCTAssertEqual(info.sessionID, "sess-forgotten")
+        let methods = await transport.receivedSessionMethods()
+        XCTAssertEqual(methods, ["session/resume", "session/load"])
     }
 
     func testSessionUpdatesRequireTheExactActiveIdentityAndBoundDiagnostics() async throws {
@@ -4885,6 +4956,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let rejectFirstMcpSession: Bool
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
+    private let rejectResumeOnly: Bool
     private let crashOnFirstPrompt: Bool
     /// Answers the first prompt only when the test says so, standing in for an
     /// adapter that is still thinking while the caller walks away.
@@ -4928,6 +5000,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         rejectFirstMcpSession: Bool = false,
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
+        rejectResumeOnly: Bool = false,
         crashOnFirstPrompt: Bool = false,
         withholdFirstPromptReply: Bool = false,
         promptErrorMessage: String? = nil,
@@ -4948,6 +5021,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.rejectFirstMcpSession = rejectFirstMcpSession
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
+        self.rejectResumeOnly = rejectResumeOnly
         self.crashOnFirstPrompt = crashOnFirstPrompt
         self.withholdFirstPromptReply = withholdFirstPromptReply
         self.promptErrorMessage = promptErrorMessage
@@ -5131,14 +5205,16 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         switch object["method"]?.stringValue {
         case "initialize":
             clientCapabilities = object["params"]?.objectValue?["clientCapabilities"]
+            // Wire-faithful: both shipping adapters advertise session
+            // capabilities as EMPTY OBJECTS (presence = supported), never
+            // booleans. An unsupported capability is simply absent.
+            var sessionCapabilities: [String: JSONValue] = ["close": .object([:])]
+            if resumeCapability { sessionCapabilities["resume"] = .object([:]) }
             reply(id: id, result: .object([
                 "protocolVersion": .integer(protocolVersion),
                 "agentCapabilities": .object([
                     "loadSession": .bool(true),
-                    "sessionCapabilities": .object([
-                        "resume": .bool(resumeCapability),
-                        "close": .bool(true),
-                    ]),
+                    "sessionCapabilities": .object(sessionCapabilities),
                     "mcpCapabilities": .object([
                         "http": .bool(mcpHTTP),
                         "sse": .bool(mcpSSE),
@@ -5205,7 +5281,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         case "session/load", "session/resume":
             let method = object["method"]?.stringValue ?? ""
             sessionMethods.append(method)
-            if rejectRestoration {
+            if rejectRestoration || (rejectResumeOnly && method == "session/resume") {
                 replyError(id: id, message: "Unknown session")
             } else {
                 let restoredID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "sess-restored"

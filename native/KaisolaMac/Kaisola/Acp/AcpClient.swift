@@ -1206,6 +1206,8 @@ actor AcpClient {
 
     /// Spawn the adapter and complete the ACP handshake, returning the new
     /// session. `mcpServers` is the array produced by the MCP registry.
+    /// `hasLocalTranscript` says the caller can already render the thread's
+    /// history itself, making the adapter's `session/load` replay redundant.
     func start(
         command: String,
         arguments: [String],
@@ -1213,6 +1215,7 @@ actor AcpClient {
         cwd: String,
         mcpServers: [JSONValue],
         resumeSessionID: String? = nil,
+        hasLocalTranscript: Bool = false,
         access: AcpAdapterAccess = .unrestricted,
         runProfile: AcpRunProfile = .write
     ) async throws -> AcpSessionInfo {
@@ -1225,6 +1228,7 @@ actor AcpClient {
                 cwd: cwd,
                 mcpServers: mcpServers,
                 resumeSessionID: resumeSessionID,
+                hasLocalTranscript: hasLocalTranscript,
                 access: access,
                 runProfile: runProfile
             )
@@ -1247,6 +1251,7 @@ actor AcpClient {
         cwd: String,
         mcpServers: [JSONValue],
         resumeSessionID: String?,
+        hasLocalTranscript: Bool,
         access: AcpAdapterAccess,
         runProfile: AcpRunProfile
     ) async throws -> AcpSessionInfo {
@@ -1326,14 +1331,22 @@ actor AcpClient {
             var sessionResult: JSONValue?
             var resumedID: String?
             if let resumeSessionID {
-                if capabilities.resumeSession,
-                   let result = try? await openSession("session/resume", priorID: resumeSessionID) {
-                    sessionResult = result
-                    resumedID = resumeSessionID
-                }
-                if sessionResult == nil,
-                   capabilities.loadSession,
-                   let result = try? await openSession("session/load", priorID: resumeSessionID) {
+                // `session/resume` reconnects in one round-trip; `session/load`
+                // replays the thread's ENTIRE history first — tens of seconds
+                // on a long chat. Resume therefore leads, but only when the
+                // caller already holds the transcript locally: with no local
+                // rows (adopted session, lost store) the load replay is the
+                // only source of visible history.
+                let restoreMethods = hasLocalTranscript
+                    ? ["session/resume", "session/load"]
+                    : ["session/load", "session/resume"]
+                for method in restoreMethods where sessionResult == nil {
+                    let advertised = method == "session/resume"
+                        ? capabilities.resumeSession
+                        : capabilities.loadSession
+                    guard advertised,
+                          let result = try? await openSession(method, priorID: resumeSessionID)
+                    else { continue }
                     sessionResult = result
                     resumedID = resumeSessionID
                 }
@@ -3198,10 +3211,10 @@ actor AcpClient {
         caps.steering = result.objectValue?["_meta"]?.objectValue?["steering"]?
             .objectValue?["supported"]?.boolValue ?? false
         guard let agent = result.objectValue?["agentCapabilities"]?.objectValue else { return caps }
-        caps.loadSession = agent["loadSession"]?.boolValue ?? false
+        caps.loadSession = capabilityAdvertised(agent["loadSession"])
         let session = agent["sessionCapabilities"]?.objectValue
-        caps.resumeSession = session?["resume"]?.boolValue ?? false
-        caps.closeSession = session?["close"]?.boolValue ?? false
+        caps.resumeSession = capabilityAdvertised(session?["resume"])
+        caps.closeSession = capabilityAdvertised(session?["close"])
         caps.promptQueueing = agent["_meta"]?.objectValue?["claudeCode"]?.objectValue?["promptQueueing"]?.boolValue ?? false
         let mcp = agent["mcpCapabilities"]?.objectValue
         caps.mcpHTTP = mcp?["http"]?.boolValue ?? false
@@ -3210,6 +3223,17 @@ actor AcpClient {
         caps.promptImage = prompt?["image"]?.boolValue ?? false
         caps.promptEmbeddedContext = prompt?["embeddedContext"]?.boolValue ?? false
         return caps
+    }
+
+    /// Capabilities arrive as booleans OR as (possibly empty) option objects —
+    /// both shipping adapters advertise `resume: {}`. Presence is the
+    /// advertisement; only absence, `false`, or `null` decline it. Reading
+    /// these with `.boolValue` silently disabled resume for every adapter.
+    private static func capabilityAdvertised(_ value: JSONValue?) -> Bool {
+        switch value {
+        case nil, .bool(false), .null: return false
+        default: return true
+        }
     }
 
     /// JSON numbers decode as either `.integer` or `.number`; ACP cost accepts

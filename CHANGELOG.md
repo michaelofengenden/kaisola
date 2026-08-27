@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.139 — 2026-08-27
+
+- Chats open in about a second instead of thirty. Both shipping adapters advertise session resume as an empty object on the wire, and the capability parser read it with a boolean accessor — so resume always parsed as unsupported and every reconnect fell back to `session/load`, which replays the thread's entire history before the connect completes. Presence now counts as the advertisement, and a chat whose transcript is already on disk reconnects through `session/resume` in one round-trip (925ms on the wire in verification, with zero replay traffic). A chat with no local transcript — an adopted session, a lost store — still takes the load path, because the replay is its only source of visible history.
+
 ## 0.1.138 — 2026-08-26
 
 - The remembered permission mode stopped losing races. A mode chosen in the seconds after a relaunch — while the adapter was still spawning — found no session to ask and was silently snapped back; it is now kept, shown, and applied by the connect handshake, with only a real adapter refusal rolling the chip back. And a mode announcement replayed by `session/load` could rewrite the memory before the restore handshake compared against it, wiping the choice on every launch; adapter-side announcements now update the memory only after the handshake arms them. Verified against both shipping adapters on the wire.

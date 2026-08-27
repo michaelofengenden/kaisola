@@ -376,4 +376,157 @@ final class SessionPaneLayoutTests: XCTestCase {
         XCTAssertEqual(presentation.tone, .inactive)
     }
 
+    func testRunningChatHeaderParentAccessibilityLabelRetainsLiveToolStatus() {
+        let label = SessionHeaderAccessibilityLabel.resolve(
+            title: "Kaisola",
+            statusLabel: "Chat connected",
+            liveActivityLabel: "Running tests, working"
+        )
+
+        XCTAssertEqual(label, "Kaisola, Running tests, working")
+    }
+
+    func testDurablyOwnedEndedTerminalKeepsLocalChromeWithoutLiveInput() {
+        let directory = URL(fileURLWithPath: "/tmp/kaisola-ended")
+        let ended = TerminalOwnershipPresentation(
+            isLiveOwner: false,
+            hasDurableOwnership: true,
+            directory: directory
+        )
+        let observed = TerminalOwnershipPresentation(
+            isLiveOwner: false,
+            hasDurableOwnership: false,
+            directory: nil
+        )
+
+        XCTAssertFalse(ended.isObserved)
+        XCTAssertEqual(ended.gitDirectory, directory)
+        XCTAssertTrue(observed.isObserved)
+        XCTAssertNil(observed.gitDirectory)
+    }
+
+    func testMissingTerminalPresentationCoversEveryRestorationState() {
+        struct Case {
+            let name: String
+            let context: MissingTerminalPaneContext
+            let title: String
+            let symbol: String
+            let statusLabel: String
+            let contentTitle: String
+            let detail: String
+            let showsClose: Bool
+        }
+
+        let cases = [
+            Case(
+                name: "awaiting inventory, active durable",
+                context: MissingTerminalPaneContext(
+                    state: .awaitingInventory,
+                    title: "Plan agent",
+                    symbol: "hammer.fill",
+                    canClose: true
+                ),
+                title: "Plan agent",
+                symbol: "hammer.fill",
+                statusLabel: "Restoring terminal",
+                contentTitle: "Restoring terminal",
+                detail: "Checking local terminal state before restoring this session.",
+                showsClose: true
+            ),
+            Case(
+                name: "awaiting inventory, archived unowned",
+                context: MissingTerminalPaneContext(
+                    state: .awaitingInventory,
+                    title: "Archived terminal",
+                    symbol: "",
+                    canClose: false
+                ),
+                title: "Archived terminal",
+                symbol: "terminal",
+                statusLabel: "Restoring terminal",
+                contentTitle: "Restoring terminal",
+                detail: "Checking local terminal state before restoring this session.",
+                showsClose: false
+            ),
+            Case(
+                name: "restoring controller, active durable absent",
+                context: MissingTerminalPaneContext(
+                    state: .restoringController,
+                    title: "Build agent",
+                    symbol: "wrench.and.screwdriver.fill",
+                    canClose: true
+                ),
+                title: "Build agent",
+                symbol: "wrench.and.screwdriver.fill",
+                statusLabel: "Restoring terminal",
+                contentTitle: "Restoring terminal",
+                detail: "Restoring terminal input.",
+                showsClose: true
+            ),
+            Case(
+                name: "settled, active durable absent",
+                context: MissingTerminalPaneContext(
+                    state: .settledDurable,
+                    title: "Review agent",
+                    symbol: "checkmark.seal.fill",
+                    canClose: true
+                ),
+                title: "Review agent",
+                symbol: "checkmark.seal.fill",
+                statusLabel: "Terminal unavailable",
+                contentTitle: "Terminal unavailable",
+                detail: "This terminal is no longer running. Close it or start a new session.",
+                showsClose: true
+            ),
+            Case(
+                name: "ended persisted record",
+                context: MissingTerminalPaneContext(
+                    state: .invalid,
+                    title: "Ended agent",
+                    symbol: "stop.circle.fill",
+                    canClose: true
+                ),
+                title: "Terminal",
+                symbol: "terminal",
+                statusLabel: "Session unavailable",
+                contentTitle: "Session unavailable",
+                detail: "",
+                showsClose: false
+            ),
+            Case(
+                name: "stale unowned after inventory",
+                context: MissingTerminalPaneContext(
+                    state: .invalid,
+                    title: "Stale terminal",
+                    symbol: "questionmark",
+                    canClose: false
+                ),
+                title: "Terminal",
+                symbol: "terminal",
+                statusLabel: "Session unavailable",
+                contentTitle: "Session unavailable",
+                detail: "",
+                showsClose: false
+            ),
+        ]
+
+        for testCase in cases {
+            let presentation = MissingTerminalPanePresentation.resolve(
+                context: testCase.context
+            )
+
+            XCTAssertEqual(presentation.title, testCase.title, testCase.name)
+            XCTAssertEqual(presentation.symbol, testCase.symbol, testCase.name)
+            XCTAssertEqual(presentation.statusLabel, testCase.statusLabel, testCase.name)
+            XCTAssertEqual(presentation.contentTitle, testCase.contentTitle, testCase.name)
+            XCTAssertEqual(presentation.detail, testCase.detail, testCase.name)
+            XCTAssertEqual(presentation.showsClose, testCase.showsClose, testCase.name)
+            XCTAssertEqual(
+                presentation.accessibilityLabel,
+                "\(presentation.title), \(presentation.statusLabel)",
+                testCase.name
+            )
+        }
+    }
+
 }

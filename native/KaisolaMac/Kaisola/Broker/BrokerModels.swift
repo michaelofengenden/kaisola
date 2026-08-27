@@ -208,7 +208,7 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
     let id: String
     let projectID: String
     let pid: Int32?
-    let exited: Bool
+    var exited: Bool
     let streamEpoch: String?
     let endOffset: Int64
     /// Exact durable bytes reported by the broker spool. This is informational:

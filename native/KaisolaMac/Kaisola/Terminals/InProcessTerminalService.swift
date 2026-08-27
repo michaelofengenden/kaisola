@@ -804,6 +804,7 @@ extension InProcessTerminalService: BrokerControlServing {
             terminalID: creation.id,
             projectID: projectID,
             pid: creation.exited ? nil : creation.pid,
+            existed: creation.existed,
             exited: creation.exited,
             streamEpoch: creation.streamEpoch,
             recovered: nil

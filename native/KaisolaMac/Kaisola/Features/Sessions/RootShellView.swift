@@ -109,6 +109,117 @@ struct TerminalHeaderPresentation: Equatable {
     }
 }
 
+/// Separates live write authority from durable local provenance for chrome.
+/// An ended local terminal is no longer input-enabled, but it must not be
+/// relabeled as a foreign observation or lose its local Git affordance.
+struct TerminalOwnershipPresentation: Equatable {
+    let isObserved: Bool
+    let gitDirectory: URL?
+
+    init(
+        isLiveOwner: Bool,
+        hasDurableOwnership: Bool,
+        directory: URL?
+    ) {
+        let isLocal = isLiveOwner || hasDurableOwnership
+        isObserved = !isLocal
+        gitDirectory = isLocal ? directory : nil
+    }
+}
+
+/// Resolves the label applied to the whole session-header focus button. An
+/// explicit parent label must carry a running chat's live activity because it
+/// replaces the labels of the thinking indicator nested inside the button.
+struct SessionHeaderAccessibilityLabel {
+    static func resolve(
+        title: String,
+        statusLabel: String,
+        liveActivityLabel: String? = nil
+    ) -> String {
+        "\(title), \(liveActivityLabel ?? statusLabel)"
+    }
+}
+
+/// Value-only restoration state shared with the session pane. AppModel owns
+/// the lifecycle classification; the view only turns this context into copy
+/// and controls.
+struct MissingTerminalPaneContext: Equatable {
+    enum State: Equatable {
+        case awaitingInventory
+        case restoringController
+        case settledDurable
+        case invalid
+    }
+
+    let state: State
+    let title: String
+    let symbol: String
+    let canClose: Bool
+}
+
+/// One presentation contract for every place an absent terminal appears. This
+/// keeps its header, empty state, accessibility label, and Close affordance in
+/// agreement while terminal restoration is still being decided.
+struct MissingTerminalPanePresentation: Equatable {
+    let title: String
+    let symbol: String
+    let statusLabel: String
+    let contentTitle: String
+    let detail: String
+    let accessibilityLabel: String
+    let showsClose: Bool
+
+    static func resolve(context: MissingTerminalPaneContext) -> Self {
+        let title: String
+        let symbol: String
+        let statusLabel: String
+        let contentTitle: String
+        let detail: String
+        let showsClose: Bool
+
+        switch context.state {
+        case .awaitingInventory:
+            title = context.title.isEmpty ? "Terminal" : context.title
+            symbol = context.symbol.isEmpty ? "terminal" : context.symbol
+            statusLabel = "Restoring terminal"
+            contentTitle = "Restoring terminal"
+            detail = "Checking local terminal state before restoring this session."
+            showsClose = context.canClose
+        case .restoringController:
+            title = context.title.isEmpty ? "Terminal" : context.title
+            symbol = context.symbol.isEmpty ? "terminal" : context.symbol
+            statusLabel = "Restoring terminal"
+            contentTitle = "Restoring terminal"
+            detail = "Restoring terminal input."
+            showsClose = context.canClose
+        case .settledDurable:
+            title = context.title.isEmpty ? "Terminal" : context.title
+            symbol = context.symbol.isEmpty ? "terminal" : context.symbol
+            statusLabel = "Terminal unavailable"
+            contentTitle = "Terminal unavailable"
+            detail = "This terminal is no longer running. Close it or start a new session."
+            showsClose = context.canClose
+        case .invalid:
+            title = "Terminal"
+            symbol = "terminal"
+            statusLabel = "Session unavailable"
+            contentTitle = "Session unavailable"
+            detail = ""
+            showsClose = false
+        }
+
+        return Self(
+            title: title,
+            symbol: symbol,
+            statusLabel: statusLabel,
+            contentTitle: contentTitle,
+            detail: detail,
+            accessibilityLabel: "\(title), \(statusLabel)",
+            showsClose: showsClose
+        )
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -1150,10 +1261,13 @@ struct RootShellView: View {
                 model.moveTerminal(session.id, toProject: session.projectID)
             }
         }
-        if model.isOwned(session.id) {
-            if let dir = model.directory(for: session.id) {
-                Button("Git Panel…") { gitRepo = dir }
-            }
+        let ownership = TerminalOwnershipPresentation(
+            isLiveOwner: model.isOwned(session.id),
+            hasDurableOwnership: model.canClose(session.id),
+            directory: model.directory(for: session.id)
+        )
+        if let dir = ownership.gitDirectory {
+            Button("Git Panel…") { gitRepo = dir }
         }
         // Closing must be available for every state — live, exited, dormant,
         // unavailable. The commit is synchronous (closed-stays-closed §4a);
@@ -2877,6 +2991,7 @@ struct RootShellView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(surfaceAccessibilityLabel(id))
             .help("Focus \(surfaceTitle(id))")
             // Outside the focus button on purpose: the chip is its own control,
             // and the higher priority means it takes its width before the
@@ -3172,9 +3287,21 @@ struct RootShellView: View {
             )
                 .id(mesh.id)
         } else {
+            let presentation = missingTerminalPanePresentation(id)
             VStack(spacing: 12) {
-                ContentUnavailableView("Session unavailable", systemImage: "rectangle.slash")
-                if model.canClose(id) {
+                if presentation.detail.isEmpty {
+                    ContentUnavailableView(
+                        presentation.contentTitle,
+                        systemImage: presentation.symbol
+                    )
+                } else {
+                    ContentUnavailableView(
+                        presentation.contentTitle,
+                        systemImage: presentation.symbol,
+                        description: Text(presentation.detail)
+                    )
+                }
+                if presentation.showsClose {
                     Button("Close") {
                         model.commitClose(id)
                         Task { await model.drainPendingReleases() }
@@ -3295,7 +3422,7 @@ struct RootShellView: View {
             if terminal.exited {
                 HStack(spacing: 8) {
                     Label("Session ended", systemImage: "stop.circle.fill")
-                    if model.isOwned(id) {
+                    if model.canClose(id) {
                         Button {
                             Task { await model.reopenEndedSession(id) }
                         } label: {
@@ -3409,7 +3536,7 @@ struct RootShellView: View {
         }
         if let chat = model.chats.first(where: { $0.id == id }) { return chat.conversation.title }
         if let mesh = model.meshes.first(where: { $0.id == id }) { return mesh.title }
-        return "Session"
+        return missingTerminalPanePresentation(id).title
     }
 
     private func surfaceSymbol(_ id: String) -> String {
@@ -3417,7 +3544,8 @@ struct RootShellView: View {
             return model.agentProfile(for: id)?.symbol ?? "terminal"
         }
         if model.chats.contains(where: { $0.id == id }) { return "bubble.left.and.text.bubble.right" }
-        return "circle.hexagongrid.fill"
+        if model.meshes.contains(where: { $0.id == id }) { return "circle.hexagongrid.fill" }
+        return missingTerminalPanePresentation(id).symbol
     }
 
     private func surfaceTint(_ id: String) -> Color {
@@ -3464,7 +3592,44 @@ struct RootShellView: View {
         if let chat = model.chats.first(where: { $0.id == id }) {
             return chat.conversation.isConnected ? "Chat connected" : "Chat disconnected"
         }
-        return "Mesh session"
+        if model.meshes.contains(where: { $0.id == id }) { return "Mesh session" }
+        return missingTerminalPanePresentation(id).statusLabel
+    }
+
+    private func surfaceAccessibilityLabel(_ id: String) -> String {
+        if !model.sessions.contains(where: { $0.id == id }),
+           !model.chats.contains(where: { $0.id == id }),
+           !model.meshes.contains(where: { $0.id == id }) {
+            return missingTerminalPanePresentation(id).accessibilityLabel
+        }
+        let liveActivityLabel = model.chats
+            .first(where: { $0.id == id })
+            .flatMap { chat in
+                chat.conversation.isRunning
+                    ? chat.conversation.liveThinkingStatus?.spoken
+                    : nil
+            }
+        return SessionHeaderAccessibilityLabel.resolve(
+            title: surfaceTitle(id),
+            statusLabel: surfaceStatusLabel(id),
+            liveActivityLabel: liveActivityLabel
+        )
+    }
+
+    private func missingTerminalPanePresentation(_ id: String) -> MissingTerminalPanePresentation {
+        guard let projectID = activeProjectID else {
+            return MissingTerminalPanePresentation.resolve(
+                context: MissingTerminalPaneContext(
+                    state: .invalid,
+                    title: "Terminal",
+                    symbol: "terminal",
+                    canClose: false
+                )
+            )
+        }
+        return MissingTerminalPanePresentation.resolve(
+            context: model.missingTerminalPaneContext(for: id, projectID: projectID)
+        )
     }
 
     private func handleTerminalBell(_ id: String) {
@@ -6547,7 +6712,6 @@ private struct ConnectionFooter: View {
         }
     }
 
-    @ViewBuilder
     private var attentionButton: some View {
         // A storage problem keeps the bell lit on its own: the notice explaining
         // lost or unsaved work would otherwise have nowhere to live once the

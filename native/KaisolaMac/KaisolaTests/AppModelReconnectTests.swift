@@ -42,6 +42,41 @@ final class AppModelReconnectTests: XCTestCase {
         )
     }
 
+    private actor DeterministicSuspensionGate {
+        private var entered = false
+        private var released = false
+        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func suspend() async {
+            entered = true
+            let waiters = enteredWaiters
+            enteredWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            guard !released else { return }
+            await withCheckedContinuation { releaseWaiter = $0 }
+        }
+
+        func waitUntilEntered() async {
+            guard !entered else { return }
+            await withCheckedContinuation { enteredWaiters.append($0) }
+        }
+
+        func release() {
+            released = true
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
+    private struct OwnershipRestorationFixture {
+        let projectID: String
+        let activeTerminalID = "terminal:active-owned"
+        let endedTerminalID = "terminal:ended-owned"
+        let staleTerminalID = "terminal:stale-unowned"
+        let chatID = "chat:focused"
+    }
+
     func testInventoryCompletionRaceRaisesOnlyWorkingToRespondedTransitions() {
         let working = terminal("terminal-working", activity: .working)
         let idle = terminal("terminal-idle", activity: .idle)
@@ -393,6 +428,117 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testExitEventImmediatelyRevokesPrimaryAndSecondaryInputAuthority() async throws {
+        let control = RecordingBrokerControlClient()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        for terminalID in [
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ] {
+            fixture.sessionStore.upsert(NativeOwnedSession(
+                id: terminalID,
+                projectID: fixture.projectID,
+                cwd: fixture.root.path,
+                title: terminalID,
+                createdAt: 1
+            ))
+        }
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+        await waitUntil {
+            fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID)
+                && fixture.model.isOwned(ReconnectBrokerClient.secondTerminalID)
+        }
+
+        XCTAssertTrue(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+        XCTAssertTrue(fixture.model.isOwned(ReconnectBrokerClient.secondTerminalID))
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.exited,
+            false
+        )
+
+        await fixture.client.emitExit(for: ReconnectBrokerClient.firstTerminalID)
+        await waitUntil {
+            fixture.model.sessions.first(where: {
+                $0.id == ReconnectBrokerClient.firstTerminalID
+            })?.exited == true
+                && !fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID)
+        }
+
+        XCTAssertTrue(fixture.model.terminalDocument.exited)
+        XCTAssertTrue(fixture.model.canClose(ReconnectBrokerClient.firstTerminalID))
+
+        await fixture.client.emitExit(for: ReconnectBrokerClient.secondTerminalID)
+        await waitUntil {
+            fixture.model.sessions.first(where: {
+                $0.id == ReconnectBrokerClient.secondTerminalID
+            })?.exited == true
+                && !fixture.model.isOwned(ReconnectBrokerClient.secondTerminalID)
+        }
+
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.exited,
+            true
+        )
+        XCTAssertTrue(fixture.model.canClose(ReconnectBrokerClient.secondTerminalID))
+        await fixture.model.disconnect()
+    }
+
+    func testExitDuringOwnershipRetryCannotReauthorizeEndedTerminal() async throws {
+        let attachGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(
+            attachFailuresRemaining: 1,
+            onAttach: { _ in await attachGate.suspend() }
+        )
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Exit during attach",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        await fixture.model.reload()
+        XCTAssertFalse(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+
+        let retryTask = Task { await fixture.model.refreshInventory() }
+        await attachGate.waitUntilEntered()
+        await fixture.client.emitExit(for: ReconnectBrokerClient.firstTerminalID)
+        await waitUntil {
+            fixture.model.sessions.first(where: {
+                $0.id == ReconnectBrokerClient.firstTerminalID
+            })?.exited == true
+        }
+        await attachGate.release()
+        await retryTask.value
+
+        XCTAssertFalse(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: {
+                $0.id == ReconnectBrokerClient.firstTerminalID
+            })?.exited,
+            true
+        )
+        let attachCalls = await control.attachCalls()
+        XCTAssertEqual(attachCalls.count, 2)
+        await fixture.model.disconnect()
+    }
+
     func testSettledOfflineStateDoesNotStrobeWhileRetrying() async throws {
         let fixture = try Fixture(failingConnectAttempts: Set(1...500))
         defer { fixture.cleanUp() }
@@ -444,20 +590,27 @@ final class AppModelReconnectTests: XCTestCase {
             ReconnectBrokerClient.firstTerminalID,
             ReconnectBrokerClient.secondTerminalID,
         ])
+        XCTAssertEqual(fixture.model.focusedPaneID, ReconnectBrokerClient.secondTerminalID)
 
         await fixture.model.recoverAfterWake()
 
         XCTAssertEqual(fixture.model.paneLayout(for: "project.one"), before)
+        XCTAssertEqual(fixture.model.focusedPaneID, ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(fixture.model.selectedSessionID, ReconnectBrokerClient.secondTerminalID)
         XCTAssertEqual(
-            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            fixture.model.terminalDocument.output,
             "world"
+        )
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.output,
+            "hello"
         )
         let wakeSubscriptions = await fixture.client.subscriptionIDs()
         XCTAssertEqual(wakeSubscriptions, [
             ReconnectBrokerClient.firstTerminalID,
             ReconnectBrokerClient.secondTerminalID,
-            ReconnectBrokerClient.firstTerminalID,
             ReconnectBrokerClient.secondTerminalID,
+            ReconnectBrokerClient.firstTerminalID,
         ])
         await fixture.model.disconnect()
     }
@@ -498,6 +651,1705 @@ final class AppModelReconnectTests: XCTestCase {
             ReconnectBrokerClient.secondTerminalID,
         ])
         await fixture.model.disconnect()
+    }
+
+    func testColdConnectKeepsRestoredChatFocusAndSubscribesEachVisibleTerminalOnce() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.recordSelectedSession(ReconnectBrokerClient.firstTerminalID)
+        let chatID = try await saveChatWorkspace(
+            in: fixture,
+            focusedPaneID: nil
+        )
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertEqual(fixture.model.focusedPaneID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testColdConnectKeepsRestoredMeshFocusAndSubscribesEachVisibleTerminalOnce() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.recordSelectedSession(ReconnectBrokerClient.firstTerminalID)
+        let meshID = try await saveMeshWorkspace(
+            in: fixture,
+            focusedPaneID: nil
+        )
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedMeshID, meshID)
+        XCTAssertEqual(fixture.model.focusedPaneID, meshID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testSavedFocusedTerminalPrecedesPersistedLastSelection() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.recordSelectedSession(ReconnectBrokerClient.firstTerminalID)
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.secondTerminalID
+        )
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedSessionID, ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(fixture.model.focusedPaneID, ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(
+            fixture.model.terminalDocument.sessionID,
+            ReconnectBrokerClient.secondTerminalID
+        )
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testExitedPersistedLastSelectionFallsBackToALiveTerminal() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.recordSelectedSession(ReconnectBrokerClient.firstTerminalID)
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.firstTerminalID,
+            exited: true
+        )
+
+        await fixture.model.reload()
+
+        XCTAssertEqual(
+            fixture.model.selectedSessionID,
+            ReconnectBrokerClient.secondTerminalID
+        )
+        XCTAssertEqual(
+            fixture.model.terminalDocument.sessionID,
+            ReconnectBrokerClient.secondTerminalID
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testColdConnectKeepsFocusedMissingDurableTerminalAndSubscribesLivePanesOnce() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.recordSelectedSession(ReconnectBrokerClient.firstTerminalID)
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.focusedPaneID, missingID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testFocusedMissingDurableTerminalCanBeRefocusedAfterVisitingALiveTerminal() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+        await fixture.model.reload()
+
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        XCTAssertEqual(
+            fixture.model.focusedPaneID,
+            ReconnectBrokerClient.firstTerminalID
+        )
+
+        await fixture.model.focusSurface(missingID)
+
+        XCTAssertEqual(fixture.model.focusedPaneID, missingID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.selectedChatID)
+        XCTAssertNil(fixture.model.selectedMeshID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        await waitUntil {
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.sessionID
+                == ReconnectBrokerClient.firstTerminalID
+        }
+        let active = await fixture.client.activeSubscriptionIDs()
+        XCTAssertEqual(active, Set([
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ]))
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 5,
+            data: " continued"
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.output,
+            "hello continued"
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testVisibleDormantTerminalSubscribesAfterSuccessfulResurrection() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        try FileManager.default.createDirectory(
+            at: fixture.root.appendingPathComponent("missing", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+
+        await fixture.model.reload()
+        for _ in 0..<200 {
+            let subscriptions = await fixture.client.subscriptionCount(for: missingID)
+            if subscriptions == 1 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let creates = await control.createAttempts()
+        let subscriptions = await fixture.client.subscriptionCount(for: missingID)
+
+        XCTAssertEqual(creates, 1)
+        XCTAssertEqual(subscriptions, 1)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[missingID]?.sessionID,
+            missingID
+        )
+        XCTAssertFalse(fixture.model.dormantTerminalIDs.contains(missingID))
+        await fixture.model.disconnect()
+    }
+
+    func testFocusedDormantTerminalSubscribesAfterResurrectionInFullEightPaneLayout() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let additionalLiveIDs = (1...5).map { "terminal:extra-\($0)" }
+        for terminalID in additionalLiveIDs {
+            await dynamicInventory.insert(terminalID)
+        }
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        let missingDirectory = fixture.root.appendingPathComponent(
+            "missing-eight-pane",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: missingDirectory,
+            withIntermediateDirectories: true
+        )
+        let missingID = "terminal:missing-eight-pane"
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: missingID,
+            projectID: fixture.projectID,
+            cwd: missingDirectory.path,
+            title: "Missing terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let paneIDs = [
+            missingID,
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ] + additionalLiveIDs
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: fixture.projectID,
+                projects: [NativeProjectWorkspaceState(
+                    projectID: fixture.projectID,
+                    layout: SessionPaneLayout(columns: [.init(sessionIDs: paneIDs)]),
+                    panes: paneIDs.map {
+                        Self.terminalPane($0, projectID: fixture.projectID)
+                    },
+                    focusedPaneID: missingID
+                )]
+            )
+        )
+
+        await fixture.model.reload()
+        for _ in 0..<2_000 {
+            if fixture.model.splitDocuments.count == 8,
+               fixture.model.splitDocuments[missingID]?.sessionID == missingID {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertEqual(fixture.model.focusedPaneID, missingID)
+        XCTAssertEqual(
+            Set(fixture.model.splitDocuments.keys),
+            Set(paneIDs)
+        )
+        XCTAssertEqual(fixture.model.splitDocuments[missingID]?.sessionID, missingID)
+        await fixture.model.disconnect()
+    }
+
+    func testFreshInventoryPreventsDormantResurrectionFromAdoptingAnotherWindowsTerminal() async throws {
+        let controllerGate = DeterministicSuspensionGate()
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onConnect: {
+            await controllerGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        try FileManager.default.createDirectory(
+            at: fixture.root.appendingPathComponent("missing", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await controllerGate.waitUntilEntered()
+        await dynamicInventory.insert(missingID)
+        await controllerGate.release()
+        await reloadTask.value
+        await waitUntil {
+            let creates = await control.createAttempts()
+            let subscriptions = await fixture.client.subscriptionCount(for: missingID)
+            return creates > 0 || subscriptions > 0
+        }
+
+        let creates = await control.createAttempts()
+        let subscriptions = await fixture.client.subscriptionCount(for: missingID)
+        XCTAssertEqual(creates, 0)
+        XCTAssertEqual(subscriptions, 1)
+        XCTAssertFalse(fixture.model.dormantTerminalIDs.contains(missingID))
+        await fixture.model.disconnect()
+    }
+
+    func testDisconnectDuringDormantCreateCannotPublishAndCompensatesTheSpawn() async throws {
+        let createGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(onCreate: { _ in
+            await createGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let missingDirectory = fixture.root.appendingPathComponent(
+            "missing",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: missingDirectory,
+            withIntermediateDirectories: true
+        )
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+        let original = try XCTUnwrap(
+            fixture.sessionStore.sessions().first(where: { $0.id == missingID })
+        )
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await createGate.waitUntilEntered()
+        let disconnectTask = Task { await fixture.model.disconnect() }
+        await disconnectTask.value
+        await createGate.release()
+        await reloadTask.value
+        await waitUntil {
+            let releases = await control.releaseCalls()
+            return !releases.isEmpty
+                || fixture.model.sessions.contains(where: { $0.id == missingID })
+        }
+
+        XCTAssertFalse(fixture.model.sessions.contains(where: { $0.id == missingID }))
+        XCTAssertNil(fixture.model.splitDocuments[missingID])
+        XCTAssertFalse(fixture.model.isOwned(missingID))
+        XCTAssertNil(fixture.model.pendingAgentResume[missingID])
+        let stored = try XCTUnwrap(
+            fixture.sessionStore.sessions().first(where: { $0.id == missingID })
+        )
+        XCTAssertEqual(stored, original)
+        let releases = await control.releaseCalls()
+        XCTAssertEqual(releases, [missingID])
+    }
+
+    func testCloseDuringDormantCreateCannotRepublishTombstonedTerminal() async throws {
+        let createGate = DeterministicSuspensionGate()
+        let releaseGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(
+            onCreate: { _ in await createGate.suspend() },
+            onRelease: { _ in await releaseGate.suspend() }
+        )
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let missingDirectory = fixture.root.appendingPathComponent(
+            "missing",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: missingDirectory,
+            withIntermediateDirectories: true
+        )
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await createGate.waitUntilEntered()
+        fixture.model.commitClose(missingID, recordUndo: false)
+        await createGate.release()
+        await releaseGate.waitUntilEntered()
+
+        XCTAssertFalse(fixture.model.sessions.contains(where: { $0.id == missingID }))
+        XCTAssertFalse(fixture.model.isOwned(missingID))
+        XCTAssertNil(fixture.model.splitDocuments[missingID])
+        XCTAssertNil(fixture.model.pendingAgentResume[missingID])
+        XCTAssertFalse(fixture.sessionStore.owns(terminalID: missingID))
+        XCTAssertFalse(fixture.model.paneLayout(for: fixture.projectID).contains(missingID))
+
+        await releaseGate.release()
+        await reloadTask.value
+        await fixture.model.disconnect()
+    }
+
+    func testDisconnectDuringAdoptedDormantCreateDoesNotReleaseAnotherWindowsTerminal() async throws {
+        let createGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(
+            creationExisted: true,
+            onCreate: { _ in await createGate.suspend() }
+        )
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let missingDirectory = fixture.root.appendingPathComponent(
+            "missing",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: missingDirectory,
+            withIntermediateDirectories: true
+        )
+        let missingID = try await saveMissingTerminalWorkspace(in: fixture)
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await createGate.waitUntilEntered()
+        await fixture.model.disconnect()
+        await createGate.release()
+        await reloadTask.value
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertFalse(fixture.model.sessions.contains(where: { $0.id == missingID }))
+        XCTAssertFalse(fixture.model.isOwned(missingID))
+        let releases = await control.releaseCalls()
+        XCTAssertTrue(releases.isEmpty)
+    }
+
+    func testFocusedEndedTerminalKeepsHistoryAndReopenOwnershipOnColdRestore() async throws {
+        let control = RecordingBrokerControlClient()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Ended terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.firstTerminalID,
+            exited: true
+        )
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(
+            fixture.model.selectedSessionID,
+            ReconnectBrokerClient.firstTerminalID
+        )
+        XCTAssertEqual(
+            fixture.model.terminalDocument.sessionID,
+            ReconnectBrokerClient.firstTerminalID
+        )
+        XCTAssertTrue(fixture.model.terminalDocument.exited)
+        XCTAssertFalse(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+        XCTAssertTrue(fixture.model.canReopenEndedSession(
+            ReconnectBrokerClient.firstTerminalID
+        ))
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testChatFocusedColdRestoreHydratesVisibleEndedTerminalHistory() async throws {
+        let control = RecordingBrokerControlClient()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Ended terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let chatID = try await saveChatWorkspace(in: fixture, focusedPaneID: nil)
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.firstTerminalID,
+            exited: true
+        )
+
+        await fixture.model.reload()
+        let subscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.sessionID,
+            ReconnectBrokerClient.firstTerminalID
+        )
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.exited,
+            true
+        )
+        XCTAssertFalse(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+        XCTAssertTrue(fixture.model.canReopenEndedSession(
+            ReconnectBrokerClient.firstTerminalID
+        ))
+        XCTAssertEqual(subscriptions.first, 1)
+        XCTAssertEqual(subscriptions.second, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testReopeningNonPrimaryEndedPanePreservesItsPrimarySiblingAndExactPosition() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.secondTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Ended secondary",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.secondTerminalID,
+            exited: true
+        )
+        await fixture.model.reload()
+
+        await fixture.model.reopenEndedSession(ReconnectBrokerClient.secondTerminalID)
+
+        let layoutIDs = fixture.model.paneLayout(for: fixture.projectID).sessionIDs
+        let createdID = try XCTUnwrap(layoutIDs.first(where: {
+            $0 != ReconnectBrokerClient.firstTerminalID
+                && $0 != ReconnectBrokerClient.secondTerminalID
+        }))
+        XCTAssertEqual(layoutIDs.count, 2)
+        XCTAssertEqual(layoutIDs.first, ReconnectBrokerClient.firstTerminalID)
+        XCTAssertEqual(layoutIDs.last, createdID)
+        XCTAssertFalse(layoutIDs.contains(ReconnectBrokerClient.secondTerminalID))
+        XCTAssertEqual(fixture.model.selectedSessionID, ReconnectBrokerClient.firstTerminalID)
+        XCTAssertEqual(fixture.model.splitDocuments[createdID]?.sessionID, createdID)
+        await fixture.model.disconnect()
+    }
+
+    func testAdoptedDormantTerminalRemainsInItsPresentationLayout() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: RecordingBrokerControlClient(),
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let missingDirectory = fixture.root.appendingPathComponent(
+            "missing-adopted",
+            isDirectory: true
+        )
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.secondTerminalID,
+            projectID: fixture.projectID,
+            cwd: missingDirectory.path,
+            title: "Adopted terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        await fixture.model.reload()
+        let adopterDirectory = fixture.root.appendingPathComponent(
+            "adopter-project",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: adopterDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.sessionStore.openProject(directory: adopterDirectory.path)
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let adopterProjectID = NativeSessionStore.projectID(
+            forDirectory: adopterDirectory.path
+        )
+        fixture.model.moveTerminal(
+            ReconnectBrokerClient.secondTerminalID,
+            toProject: adopterProjectID
+        )
+        let adopterSnapshot = try XCTUnwrap(
+            fixture.model.workspaceSnapshotForTesting(projectID: adopterProjectID)
+        )
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: adopterProjectID,
+                projects: [adopterSnapshot]
+            )
+        )
+        await fixture.client.setTerminalHidden(
+            ReconnectBrokerClient.secondTerminalID,
+            hidden: true
+        )
+
+        await fixture.model.recoverAfterWake()
+
+        XCTAssertEqual(fixture.model.selectedProjectID, adopterProjectID)
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: adopterProjectID).contains(
+                ReconnectBrokerClient.secondTerminalID
+            )
+        )
+        XCTAssertTrue(
+            fixture.model.dormantTerminalIDs.contains(
+                ReconnectBrokerClient.secondTerminalID
+            )
+        )
+        let missingContext = fixture.model.missingTerminalPaneContext(
+            for: ReconnectBrokerClient.secondTerminalID,
+            projectID: adopterProjectID
+        )
+        XCTAssertEqual(missingContext.state, .settledDurable)
+        XCTAssertTrue(missingContext.canClose)
+        fixture.model.commitClose(
+            ReconnectBrokerClient.secondTerminalID,
+            recordUndo: false
+        )
+        XCTAssertNil(
+            fixture.model.sessionAdoptions[ReconnectBrokerClient.secondTerminalID]
+        )
+        XCTAssertNil(
+            SessionAdoptionStore(
+                fileURL: fixture.root.appendingPathComponent("session-adoptions.json")
+            ).adoptions()[ReconnectBrokerClient.secondTerminalID]
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testReopeningAdoptedEndedPaneKeepsItsAdopterAndHomeSibling() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.secondTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Adopted ended terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        await fixture.model.reload()
+        let adopterDirectory = fixture.root.appendingPathComponent(
+            "ended-adopter",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: adopterDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.sessionStore.openProject(directory: adopterDirectory.path)
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let adopterProjectID = NativeSessionStore.projectID(
+            forDirectory: adopterDirectory.path
+        )
+        fixture.model.moveTerminal(
+            ReconnectBrokerClient.secondTerminalID,
+            toProject: adopterProjectID
+        )
+        await fixture.model.focusSurface(ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(fixture.model.selectedProjectID, adopterProjectID)
+        XCTAssertEqual(
+            fixture.model.selectedSessionID,
+            ReconnectBrokerClient.secondTerminalID
+        )
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: fixture.projectID).contains(
+                ReconnectBrokerClient.firstTerminalID
+            )
+        )
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.secondTerminalID,
+            exited: true
+        )
+        await fixture.model.refreshInventory()
+
+        await fixture.model.reopenEndedSession(ReconnectBrokerClient.secondTerminalID)
+
+        let created = try XCTUnwrap(fixture.model.sessions.first(where: {
+            $0.id != ReconnectBrokerClient.firstTerminalID
+                && $0.id != ReconnectBrokerClient.secondTerminalID
+        }))
+        XCTAssertEqual(
+            fixture.model.paneLayout(for: adopterProjectID).sessionIDs,
+            [created.id]
+        )
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: fixture.projectID).contains(
+                ReconnectBrokerClient.firstTerminalID
+            )
+        )
+        XCTAssertEqual(fixture.model.displayProjectID(created), adopterProjectID)
+        XCTAssertEqual(fixture.model.selectedSessionID, ReconnectBrokerClient.firstTerminalID)
+        await fixture.model.disconnect()
+    }
+
+    func testMinimizingAdoptedEndedPaneDuringReopenRetiresOriginalOwnership() async throws {
+        let createGate = DeterministicSuspensionGate()
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await createGate.suspend()
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.secondTerminalID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.path,
+            title: "Adopted ended terminal",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        await fixture.model.reload()
+        let adopterDirectory = fixture.root.appendingPathComponent(
+            "ended-adopter-minimize",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: adopterDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.sessionStore.openProject(directory: adopterDirectory.path)
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let adopterProjectID = NativeSessionStore.projectID(
+            forDirectory: adopterDirectory.path
+        )
+        fixture.model.moveTerminal(
+            ReconnectBrokerClient.secondTerminalID,
+            toProject: adopterProjectID
+        )
+        await fixture.model.focusSurface(ReconnectBrokerClient.secondTerminalID)
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.secondTerminalID,
+            exited: true
+        )
+        await fixture.model.refreshInventory()
+
+        let reopenTask = Task {
+            await fixture.model.reopenEndedSession(ReconnectBrokerClient.secondTerminalID)
+        }
+        await createGate.waitUntilEntered()
+        await fixture.model.minimizeSurface(ReconnectBrokerClient.secondTerminalID)
+        await createGate.release()
+        await reopenTask.value
+
+        let created = try XCTUnwrap(fixture.model.sessions.first(where: {
+            $0.id != ReconnectBrokerClient.firstTerminalID
+                && $0.id != ReconnectBrokerClient.secondTerminalID
+        }))
+        XCTAssertEqual(fixture.model.displayProjectID(created), adopterProjectID)
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: adopterProjectID).contains(created.id)
+        )
+        XCTAssertFalse(
+            fixture.model.sessions.contains(where: {
+                $0.id == ReconnectBrokerClient.secondTerminalID
+            })
+        )
+        XCTAssertFalse(
+            fixture.sessionStore.owns(
+                terminalID: ReconnectBrokerClient.secondTerminalID
+            )
+        )
+        XCTAssertNil(
+            fixture.model.sessionAdoptions[ReconnectBrokerClient.secondTerminalID]
+        )
+        XCTAssertFalse(
+            fixture.model.paneLayout(for: fixture.projectID).contains(
+                ReconnectBrokerClient.secondTerminalID
+            )
+        )
+        XCTAssertFalse(
+            fixture.model.paneLayout(for: adopterProjectID).contains(
+                ReconnectBrokerClient.secondTerminalID
+            )
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testReopeningEndedPaneAfterTrackedCWDChangeKeepsOriginalPresentationProject() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let control = RecordingBrokerControlClient(onCreate: { terminalID in
+            await dynamicInventory.insert(terminalID)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        let movedCWD = fixture.root.appendingPathComponent(
+            "tracked-cwd",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: movedCWD,
+            withIntermediateDirectories: true
+        )
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.secondTerminalID,
+            projectID: fixture.projectID,
+            cwd: movedCWD.path,
+            title: "Moved cwd",
+            createdAt: 1
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.client.setTerminalExited(
+            ReconnectBrokerClient.secondTerminalID,
+            exited: true
+        )
+        await fixture.model.reload()
+
+        await fixture.model.reopenEndedSession(ReconnectBrokerClient.secondTerminalID)
+
+        let created = try XCTUnwrap(fixture.model.sessions.first(where: {
+            $0.id != ReconnectBrokerClient.firstTerminalID
+                && $0.id != ReconnectBrokerClient.secondTerminalID
+        }))
+        XCTAssertNotEqual(created.projectID, fixture.projectID)
+        XCTAssertEqual(fixture.model.displayProjectID(created), fixture.projectID)
+        XCTAssertEqual(
+            fixture.model.paneLayout(for: fixture.projectID).sessionIDs,
+            [ReconnectBrokerClient.firstTerminalID, created.id]
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testWarmReconnectKeepsChatFocusAndResubscribesEveryVisibleTerminalOnce() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let chatID = try await saveChatWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+        fixture.model.selectChat(chatID)
+        let persistedTerminalID = fixture.sessionStore.lastSelectedSessionID()
+        let beforeFirst = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        let beforeSecond = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.secondTerminalID
+        )
+
+        await fixture.model.recoverAfterWake()
+        let after = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertEqual(fixture.model.focusedPaneID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(fixture.sessionStore.lastSelectedSessionID(), persistedTerminalID)
+        XCTAssertEqual(after.first, beforeFirst + 1)
+        XCTAssertEqual(after.second, beforeSecond + 1)
+        await fixture.model.disconnect()
+    }
+
+    func testChatFocusedWakeRetainsNewestTerminalFrameWhenSecondaryRestoreFails() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let chatID = try await saveChatWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 5,
+            data: " newest"
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello newest")
+        fixture.model.selectChat(chatID)
+        await fixture.client.setSubscriptionFailure(
+            ReconnectBrokerClient.firstTerminalID,
+            failing: true
+        )
+
+        await fixture.model.recoverAfterWake()
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.output,
+            "hello newest"
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testControllerDelayDoesNotExposeConnectedTerminalSelectionBeforeFocusSettles() async throws {
+        let controllerGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(onConnect: {
+            await controllerGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let chatID = try await saveChatWorkspace(in: fixture, focusedPaneID: nil)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.firstTerminalID,
+            blocked: true
+        )
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await controllerGate.waitUntilEntered()
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+
+        let selectionTask = Task {
+            await fixture.model.select(ReconnectBrokerClient.firstTerminalID)
+        }
+        for _ in 0..<20 { await Task.yield() }
+        let controllerGapSubscriptions = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        XCTAssertEqual(controllerGapSubscriptions, 0)
+        fixture.model.selectChat(chatID)
+        await controllerGate.release()
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.firstTerminalID,
+            blocked: false
+        )
+        await selectionTask.value
+        await reloadTask.value
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertEqual(fixture.model.focusedPaneID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        await fixture.model.disconnect()
+    }
+
+    func testObserverDisconnectDuringControllerRestoreCannotPublishConnectedOnDeadRoute() async throws {
+        let controllerGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(onConnect: {
+            await controllerGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            reconnectSleeper: { nanoseconds in
+                if nanoseconds < 1_000_000_000 {
+                    throw CancellationError()
+                }
+                try await Task.sleep(nanoseconds: nanoseconds)
+            }
+        )
+        defer { fixture.cleanUp() }
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await controllerGate.waitUntilEntered()
+        await fixture.client.simulateDisconnect()
+        await waitUntil {
+            if case .unavailable = fixture.model.connectionState { return true }
+            return false
+        }
+        await controllerGate.release()
+        await reloadTask.value
+
+        guard case .unavailable = fixture.model.connectionState else {
+            return XCTFail("A dead observer route was republished as connected")
+        }
+        XCTAssertTrue(fixture.model.terminalOwnershipRestorationPhase.isRestoring)
+        XCTAssertFalse(fixture.model.controlAvailable)
+        XCTAssertFalse(fixture.model.isOwned(ReconnectBrokerClient.firstTerminalID))
+        let controllerDisconnects = await control.disconnectAttempts()
+        XCTAssertEqual(controllerDisconnects, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testObserverRetryWaitsForOldRouteSplitCleanupBeforeRestoringNewDocuments() async throws {
+        let controllerGate = DeterministicSuspensionGate()
+        let cleanupGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(onConnect: {
+            await controllerGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true,
+            beforeRouteSplitCleanup: {
+                await cleanupGate.suspend()
+            }
+        )
+        defer { fixture.cleanUp() }
+        _ = try await saveChatWorkspace(in: fixture, focusedPaneID: nil)
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await controllerGate.waitUntilEntered()
+        await fixture.client.simulateDisconnect()
+        await cleanupGate.waitUntilEntered()
+        await controllerGate.release()
+        await reloadTask.value
+        for _ in 0..<200 { await Task.yield() }
+
+        let attemptsBeforeCleanup = await fixture.client.connectionAttempts()
+        XCTAssertEqual(attemptsBeforeCleanup, 1)
+
+        await cleanupGate.release()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            return attempts >= 2
+                && fixture.model.connectionState.isConnected
+                && fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID] != nil
+                && fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID] != nil
+        }
+        let active = await fixture.client.activeSubscriptionIDs()
+        XCTAssertEqual(active, Set([
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ]))
+        await fixture.model.disconnect()
+    }
+
+    func testResumeDuringGatedReconnectDoesNotStartParallelObserverAttempt() async throws {
+        let reconnectGate = DeterministicSuspensionGate()
+        let fixture = try Fixture(
+            failingConnectAttempts: [1],
+            usesRootProjectIdentity: true,
+            onObserverConnectAttempt: { attempt in
+                if attempt == 2 { await reconnectGate.suspend() }
+            }
+        )
+        defer { fixture.cleanUp() }
+
+        await fixture.model.reload()
+        await reconnectGate.waitUntilEntered()
+
+        fixture.model.resumeIfNeeded()
+        for _ in 0..<100 { await Task.yield() }
+
+        let attemptsWhileRetryIsSuspended = await fixture.client.connectionAttempts()
+        XCTAssertEqual(attemptsWhileRetryIsSuspended, 2)
+
+        await reconnectGate.release()
+        await waitUntil {
+            fixture.model.connectionState.isConnected
+        }
+        await fixture.model.disconnect()
+    }
+
+    func testFinalDisconnectClosesCancellationResistantLateObserverDial() async throws {
+        let connectGate = DeterministicSuspensionGate()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true,
+            onObserverConnectAttempt: { attempt in
+                if attempt == 1 { await connectGate.suspend() }
+            }
+        )
+        defer { fixture.cleanUp() }
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await connectGate.waitUntilEntered()
+        let disconnectTask = Task { await fixture.model.disconnect() }
+        for _ in 0..<100 { await Task.yield() }
+
+        await connectGate.release()
+        await reloadTask.value
+        await disconnectTask.value
+
+        let observerIsActive = await fixture.client.isConnectionActive()
+        XCTAssertFalse(observerIsActive)
+    }
+
+    func testQueuedEventFromOldObserverRouteCannotMutateReconnectedState() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let terminalID = ReconnectBrokerClient.firstTerminalID
+        let subscribedOwnerID = await fixture.client.subscribedOwnerID(for: terminalID)
+        let ownerID = try XCTUnwrap(subscribedOwnerID)
+
+        await fixture.client.simulateDisconnect()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            return attempts >= 2 && fixture.model.connectionState.isConnected
+        }
+
+        await fixture.client.emitActivity(
+            for: terminalID,
+            ownerID: ownerID,
+            busy: true,
+            retainedHandlerIndex: 0
+        )
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == terminalID })?.agentActivity,
+            .idle
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testProjectChangeRejectsLateOldProjectSecondaryRestore() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: true
+        )
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await waitUntil {
+            await fixture.client.subscriptionCount(
+                for: ReconnectBrokerClient.secondTerminalID
+            ) == 1
+        }
+        fixture.model.activateProject(id: nil)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: false
+        )
+        await reloadTask.value
+
+        XCTAssertNil(fixture.model.selectedProjectID)
+        XCTAssertNil(fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID])
+        let oldProjectSubscriptionIsActive = await fixture.client.isSubscribed(
+            to: ReconnectBrokerClient.secondTerminalID
+        )
+        XCTAssertFalse(oldProjectSubscriptionIsActive)
+        await fixture.model.disconnect()
+    }
+
+    func testActivatingProjectReplacesOldObserversWithTargetProjectObservers() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let firstB = "terminal:project-b-1"
+        let secondB = "terminal:project-b-2"
+        await dynamicInventory.insert(firstB)
+        await dynamicInventory.insert(secondB)
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+
+        let projectBDirectory = fixture.root.appendingPathComponent(
+            "project-b",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectBDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.model.openProject(directory: projectBDirectory)
+        let projectB = NativeSessionStore.projectID(forDirectory: projectBDirectory.path)
+        fixture.model.moveTerminal(firstB, toProject: projectB)
+        fixture.model.moveTerminal(secondB, toProject: projectB)
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [
+                ReconnectBrokerClient.firstTerminalID,
+                ReconnectBrokerClient.secondTerminalID,
+            ])]),
+            projectID: fixture.projectID
+        )
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [firstB, secondB])]),
+            projectID: projectB
+        )
+        fixture.model.activateProject(id: fixture.projectID)
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+
+        fixture.model.activateProject(id: projectB)
+        await waitUntil {
+            fixture.model.selectedProjectID == projectB
+                && fixture.model.selectedSessionID == firstB
+                && fixture.model.splitDocuments[secondB]?.sessionID == secondB
+        }
+
+        let active = await fixture.client.activeSubscriptionIDs()
+        XCTAssertEqual(active, Set([firstB, secondB]))
+        XCTAssertNil(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testDirectTerminalSelectionReplacesOldProjectObserverSet() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let firstB = "terminal:direct-project-b-1"
+        let secondB = "terminal:direct-project-b-2"
+        await dynamicInventory.insert(firstB)
+        await dynamicInventory.insert(secondB)
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+
+        let projectBDirectory = fixture.root.appendingPathComponent(
+            "direct-project-b",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectBDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.model.openProject(directory: projectBDirectory)
+        let projectB = NativeSessionStore.projectID(forDirectory: projectBDirectory.path)
+        fixture.model.moveTerminal(firstB, toProject: projectB)
+        fixture.model.moveTerminal(secondB, toProject: projectB)
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [
+                ReconnectBrokerClient.firstTerminalID,
+                ReconnectBrokerClient.secondTerminalID,
+            ])]),
+            projectID: fixture.projectID
+        )
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [firstB, secondB])]),
+            projectID: projectB
+        )
+        fixture.model.activateProject(id: fixture.projectID)
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        await waitUntil {
+            await fixture.client.activeSubscriptionIDs() == Set([
+                ReconnectBrokerClient.firstTerminalID,
+                ReconnectBrokerClient.secondTerminalID,
+            ])
+        }
+
+        await fixture.model.select(firstB)
+        await waitUntil {
+            let active = await fixture.client.activeSubscriptionIDs()
+            return fixture.model.selectedProjectID == projectB
+                && fixture.model.selectedSessionID == firstB
+                && fixture.model.splitDocuments[secondB]?.sessionID == secondB
+                && fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID] == nil
+                && active == Set([firstB, secondB])
+        }
+
+        let active = await fixture.client.activeSubscriptionIDs()
+        XCTAssertEqual(active, Set([firstB, secondB]))
+        XCTAssertNil(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testSelectingChatKeepsSelectionWhileOldPrimaryObserverIsReleased() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let chatID = try await saveChatWorkspace(in: fixture, focusedPaneID: nil)
+        await fixture.model.reload()
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        let priorUnsubscribes = await fixture.client.unsubscribeCount(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.client.setUnsubscribeBlocked(
+            ReconnectBrokerClient.firstTerminalID,
+            blocked: true
+        )
+
+        fixture.model.selectChat(chatID)
+        await waitUntil {
+            await fixture.client.unsubscribeCount(
+                for: ReconnectBrokerClient.firstTerminalID
+            ) > priorUnsubscribes
+        }
+
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        await fixture.client.setUnsubscribeBlocked(
+            ReconnectBrokerClient.firstTerminalID,
+            blocked: false
+        )
+        await waitUntil {
+            let active = await fixture.client.activeSubscriptionIDs()
+            return fixture.model.selectedChatID == chatID
+                && fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID] != nil
+                && active == Set([
+                    ReconnectBrokerClient.firstTerminalID,
+                    ReconnectBrokerClient.secondTerminalID,
+                ])
+        }
+        await fixture.model.disconnect()
+    }
+
+    func testProjectRoundTripWhileOldCleanupIsBlockedKeepsOnlyWinningObservers() async throws {
+        let dynamicInventory = DynamicTerminalInventory()
+        let firstB = "terminal:project-round-trip-b-1"
+        let secondB = "terminal:project-round-trip-b-2"
+        await dynamicInventory.insert(firstB)
+        await dynamicInventory.insert(secondB)
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true,
+            dynamicTerminalInventory: dynamicInventory
+        )
+        defer { fixture.cleanUp() }
+        try await saveTerminalWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+
+        let projectBDirectory = fixture.root.appendingPathComponent(
+            "project-round-trip-b",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectBDirectory,
+            withIntermediateDirectories: true
+        )
+        fixture.model.openProject(directory: projectBDirectory)
+        let projectB = NativeSessionStore.projectID(forDirectory: projectBDirectory.path)
+        fixture.model.moveTerminal(firstB, toProject: projectB)
+        fixture.model.moveTerminal(secondB, toProject: projectB)
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [
+                ReconnectBrokerClient.firstTerminalID,
+                ReconnectBrokerClient.secondTerminalID,
+            ])]),
+            projectID: fixture.projectID
+        )
+        fixture.model.setPaneLayoutForTesting(
+            SessionPaneLayout(columns: [.init(sessionIDs: [firstB, secondB])]),
+            projectID: projectB
+        )
+        fixture.model.activateProject(id: fixture.projectID)
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        await fixture.client.setUnsubscribeBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: true
+        )
+
+        fixture.model.activateProject(id: projectB)
+        await waitUntil {
+            let oldCleanupStarted = await fixture.client.unsubscribeCount(
+                for: ReconnectBrokerClient.secondTerminalID
+            ) == 1
+            return oldCleanupStarted
+                && fixture.model.selectedSessionID == firstB
+                && fixture.model.splitDocuments[secondB]?.sessionID == secondB
+        }
+
+        fixture.model.activateProject(id: fixture.projectID)
+        await fixture.client.setUnsubscribeBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: false
+        )
+        await waitUntil {
+            let active = await fixture.client.activeSubscriptionIDs()
+            return fixture.model.selectedProjectID == fixture.projectID
+                && fixture.model.selectedSessionID == ReconnectBrokerClient.firstTerminalID
+                && fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID] != nil
+                && active == Set([
+                    ReconnectBrokerClient.firstTerminalID,
+                    ReconnectBrokerClient.secondTerminalID,
+                ])
+        }
+
+        XCTAssertNil(fixture.model.splitDocuments[firstB])
+        XCTAssertNil(fixture.model.splitDocuments[secondB])
+        let oldSecondarySubscriptions = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.secondTerminalID
+        )
+        XCTAssertEqual(oldSecondarySubscriptions, 2)
+        await fixture.model.disconnect()
+    }
+
+    func testWarmReconnectKeepsMeshFocusAndResubscribesEveryVisibleTerminalOnce() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let meshID = try await saveMeshWorkspace(
+            in: fixture,
+            focusedPaneID: ReconnectBrokerClient.firstTerminalID
+        )
+        await fixture.model.reload()
+        fixture.model.selectMesh(meshID)
+        let persistedTerminalID = fixture.sessionStore.lastSelectedSessionID()
+        let beforeFirst = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        let beforeSecond = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.secondTerminalID
+        )
+
+        await fixture.model.recoverAfterWake()
+        let after = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(fixture.model.selectedMeshID, meshID)
+        XCTAssertEqual(fixture.model.focusedPaneID, meshID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(fixture.sessionStore.lastSelectedSessionID(), persistedTerminalID)
+        XCTAssertEqual(after.first, beforeFirst + 1)
+        XCTAssertEqual(after.second, beforeSecond + 1)
+        await fixture.model.disconnect()
+    }
+
+    func testOwnershipClassificationPrecedesControllerConnection() async throws {
+        let controllerGate = DeterministicSuspensionGate()
+        let control = RecordingBrokerControlClient(onConnect: {
+            await controllerGate.suspend()
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control,
+            usesRootProjectIdentity: true
+        )
+        defer { fixture.cleanUp() }
+        let restoration = try await seedOwnershipRestoration(
+            in: fixture,
+            includesFocusedChat: false
+        )
+
+        let reloadTask = Task { await fixture.model.reload() }
+        await controllerGate.waitUntilEntered()
+
+        let phase = fixture.model.terminalOwnershipRestorationPhase
+        let dormantIDs = fixture.model.dormantTerminalIDs
+        let focusedID = fixture.model.focusedPaneID
+        let layoutIDs = fixture.model.paneLayout(for: restoration.projectID).sessionIDs
+        let interimSnapshot = fixture.model.workspaceSnapshotForTesting(
+            projectID: restoration.projectID
+        )
+        let restoringContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.activeTerminalID,
+            projectID: restoration.projectID
+        )
+        let endedContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.endedTerminalID,
+            projectID: restoration.projectID
+        )
+        var interimDiskSnapshot: NativeProjectWorkspaceState?
+        var interimWriteError: Error?
+        do {
+            if let interimSnapshot {
+                try await fixture.workspaceStore.saveProjectState(
+                    interimSnapshot,
+                    makeSelected: false
+                )
+            }
+            interimDiskSnapshot = try await fixture.workspaceStore.projectState(
+                for: restoration.projectID
+            )
+        } catch {
+            interimWriteError = error
+        }
+
+        await controllerGate.release()
+        await reloadTask.value
+        let settledContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.activeTerminalID,
+            projectID: restoration.projectID
+        )
+        await fixture.model.teardown()
+        let teardownDiskSnapshot = try await fixture.workspaceStore.projectState(
+            for: restoration.projectID
+        )
+        if let interimWriteError { throw interimWriteError }
+
+        guard case let .restoringController(generation) = phase else {
+            return XCTFail("Expected controller restoration phase, got \(phase)")
+        }
+        XCTAssertTrue(phase.hasAuthoritativeInventory(for: generation))
+        XCTAssertTrue(phase.isRestoring)
+        XCTAssertEqual(dormantIDs, [restoration.activeTerminalID])
+        XCTAssertEqual(focusedID, restoration.activeTerminalID)
+        XCTAssertEqual(layoutIDs, [restoration.activeTerminalID])
+        XCTAssertEqual(restoringContext.state, .restoringController)
+        XCTAssertEqual(restoringContext.title, "Active owned")
+        XCTAssertTrue(restoringContext.canClose)
+        XCTAssertEqual(endedContext.state, .invalid)
+        XCTAssertFalse(endedContext.canClose)
+        XCTAssertEqual(settledContext.state, .settledDurable)
+        XCTAssertTrue(settledContext.canClose)
+        for snapshot in [interimSnapshot, interimDiskSnapshot, teardownDiskSnapshot] {
+            XCTAssertEqual(
+                terminalIDs(in: snapshot),
+                [restoration.activeTerminalID]
+            )
+            XCTAssertEqual(
+                snapshot?.layout.sessionIDs,
+                [restoration.activeTerminalID]
+            )
+        }
+    }
+
+    func testSilentRetryKeepsUnclassifiedTerminalPanesUntilInventorySucceeds() async throws {
+        let reconnectGate = DeterministicSuspensionGate()
+        let fixture = try Fixture(
+            failingConnectAttempts: [1],
+            usesRootProjectIdentity: true,
+            reconnectSleeper: { nanoseconds in
+                if nanoseconds < 1_000_000_000 {
+                    await reconnectGate.suspend()
+                } else {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                }
+            }
+        )
+        defer { fixture.cleanUp() }
+        let restoration = try await seedOwnershipRestoration(
+            in: fixture,
+            includesFocusedChat: true
+        )
+
+        await fixture.model.reload()
+        await reconnectGate.waitUntilEntered()
+
+        let unavailableState = fixture.model.connectionState
+        let selectedChatBeforeRetry = fixture.model.selectedChatID
+        let focusedBeforeRetry = fixture.model.focusedPaneID
+        let waitingPhase = fixture.model.terminalOwnershipRestorationPhase
+        let waitingSnapshot = fixture.model.workspaceSnapshotForTesting(
+            projectID: restoration.projectID
+        )
+        let waitingStaleContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.staleTerminalID,
+            projectID: restoration.projectID
+        )
+        let waitingActiveContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.activeTerminalID,
+            projectID: restoration.projectID
+        )
+
+        await reconnectGate.release()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            return attempts >= 2
+                && fixture.model.connectionState.isConnected
+                && !fixture.model.terminalOwnershipRestorationPhase.isRestoring
+        }
+
+        let settledSnapshot = fixture.model.workspaceSnapshotForTesting(
+            projectID: restoration.projectID
+        )
+        if let settledSnapshot {
+            try await fixture.workspaceStore.saveProjectState(
+                settledSnapshot,
+                makeSelected: false
+            )
+        }
+        let settledDiskSnapshot = try await fixture.workspaceStore.projectState(
+            for: restoration.projectID
+        )
+        let settledStaleContext = fixture.model.missingTerminalPaneContext(
+            for: restoration.staleTerminalID,
+            projectID: restoration.projectID
+        )
+
+        guard case .unavailable = unavailableState else {
+            await fixture.model.teardown()
+            return XCTFail("Expected the first failed connection to remain unavailable")
+        }
+        guard case .awaitingInventory = waitingPhase else {
+            await fixture.model.teardown()
+            return XCTFail("Expected inventory to remain unclassified during the silent retry")
+        }
+        XCTAssertEqual(selectedChatBeforeRetry, restoration.chatID)
+        XCTAssertEqual(focusedBeforeRetry, restoration.chatID)
+        XCTAssertEqual(
+            terminalIDs(in: waitingSnapshot),
+            [restoration.activeTerminalID, restoration.staleTerminalID]
+        )
+        XCTAssertEqual(waitingStaleContext.state, .awaitingInventory)
+        XCTAssertEqual(waitingStaleContext.title, "Archived terminal")
+        XCTAssertFalse(waitingStaleContext.canClose)
+        XCTAssertEqual(waitingActiveContext.state, .awaitingInventory)
+        XCTAssertEqual(waitingActiveContext.title, "Active owned")
+        XCTAssertTrue(waitingActiveContext.canClose)
+        XCTAssertEqual(settledStaleContext.state, .invalid)
+        XCTAssertFalse(settledStaleContext.canClose)
+        XCTAssertEqual(fixture.model.selectedChatID, restoration.chatID)
+        XCTAssertEqual(fixture.model.focusedPaneID, restoration.chatID)
+        XCTAssertEqual(fixture.model.dormantTerminalIDs, [restoration.activeTerminalID])
+        for snapshot in [settledSnapshot, settledDiskSnapshot] {
+            XCTAssertEqual(
+                terminalIDs(in: snapshot),
+                [restoration.activeTerminalID]
+            )
+        }
+        await fixture.model.teardown()
+    }
+
+    func testSilentRetrySubscribesEachVisibleTerminalOnlyAfterSuccess() async throws {
+        let reconnectGate = DeterministicSuspensionGate()
+        let fixture = try Fixture(
+            failingConnectAttempts: [1],
+            usesRootProjectIdentity: true,
+            reconnectSleeper: { nanoseconds in
+                if nanoseconds < 1_000_000_000 {
+                    await reconnectGate.suspend()
+                } else {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                }
+            }
+        )
+        defer { fixture.cleanUp() }
+        let chatID = try await saveChatWorkspace(in: fixture, focusedPaneID: nil)
+
+        await fixture.model.reload()
+        await reconnectGate.waitUntilEntered()
+        let failedAttemptSubscriptions = await subscriptionCounts(in: fixture)
+
+        await reconnectGate.release()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            let subscriptions = await self.subscriptionCounts(in: fixture)
+            return attempts >= 2
+                && fixture.model.connectionState.isConnected
+                && subscriptions.first == 1
+                && subscriptions.second == 1
+        }
+        let successfulAttemptSubscriptions = await subscriptionCounts(in: fixture)
+
+        XCTAssertEqual(failedAttemptSubscriptions.first, 0)
+        XCTAssertEqual(failedAttemptSubscriptions.second, 0)
+        XCTAssertEqual(fixture.model.selectedChatID, chatID)
+        XCTAssertEqual(fixture.model.focusedPaneID, chatID)
+        XCTAssertNil(fixture.model.selectedSessionID)
+        XCTAssertEqual(successfulAttemptSubscriptions.first, 1)
+        XCTAssertEqual(successfulAttemptSubscriptions.second, 1)
+        await fixture.model.teardown()
     }
 
     func testMinimizingWhileSecondarySubscribeIsBlockedRejectsLateResult() async throws {
@@ -559,6 +2411,8 @@ final class AppModelReconnectTests: XCTestCase {
             fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
             "world"
         )
+        await fixture.model.focusSurface(ReconnectBrokerClient.firstTerminalID)
+        XCTAssertEqual(fixture.model.focusedPaneID, ReconnectBrokerClient.firstTerminalID)
         await fixture.client.setSubscriptionFailure(
             ReconnectBrokerClient.secondTerminalID,
             failing: true
@@ -1708,13 +3562,254 @@ final class AppModelReconnectTests: XCTestCase {
         )
     }
 
-    private static func terminalPane(_ id: String) -> NativeRestorablePaneState {
+    private func saveChatWorkspace(
+        in fixture: Fixture,
+        focusedPaneID: String?
+    ) async throws -> String {
+        let chatID = "chat:focused-\(UUID().uuidString.lowercased())"
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: fixture.projectID,
+            agentID: agent.id,
+            workspacePath: fixture.root.path,
+            acpSessionID: nil,
+            accountBinding: nil,
+            title: "Focused chat"
+        )
+        let chatPane = NativeRestorablePaneState(
+            id: chatID,
+            surface: NativeRestorableSurfaceState(agentChat: descriptor)
+        )
+        try await saveVisualSurfaceWorkspace(
+            in: fixture,
+            leadingPane: chatPane,
+            focusedPaneID: focusedPaneID ?? chatID
+        )
+        return chatID
+    }
+
+    private func saveMeshWorkspace(
+        in fixture: Fixture,
+        focusedPaneID: String?
+    ) async throws -> String {
+        let meshID = "mesh:focused-\(UUID().uuidString.lowercased())"
+        let descriptor = NativeRestorableMeshDescriptor(
+            id: meshID,
+            projectID: fixture.projectID,
+            basePath: fixture.root.path,
+            title: "Focused Mesh",
+            mode: .flat,
+            purpose: .idea,
+            lifecycle: .suspended,
+            columns: []
+        )
+        let meshPane = NativeRestorablePaneState(
+            id: meshID,
+            surface: NativeRestorableSurfaceState(mesh: descriptor)
+        )
+        try await saveVisualSurfaceWorkspace(
+            in: fixture,
+            leadingPane: meshPane,
+            focusedPaneID: focusedPaneID ?? meshID
+        )
+        return meshID
+    }
+
+    private func saveTerminalWorkspace(
+        in fixture: Fixture,
+        focusedPaneID: String
+    ) async throws {
+        let terminalPanes = [
+            Self.terminalPane(
+                ReconnectBrokerClient.firstTerminalID,
+                projectID: fixture.projectID
+            ),
+            Self.terminalPane(
+                ReconnectBrokerClient.secondTerminalID,
+                projectID: fixture.projectID
+            ),
+        ]
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: fixture.projectID,
+                projects: [NativeProjectWorkspaceState(
+                    projectID: fixture.projectID,
+                    layout: SessionPaneLayout(columns: [
+                        .init(sessionIDs: terminalPanes.map(\.id)),
+                    ]),
+                    panes: terminalPanes,
+                    focusedPaneID: focusedPaneID
+                )]
+            )
+        )
+    }
+
+    private func saveMissingTerminalWorkspace(in fixture: Fixture) async throws -> String {
+        let missingID = "terminal:active-missing"
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: missingID,
+            projectID: fixture.projectID,
+            cwd: fixture.root.appendingPathComponent("missing", isDirectory: true).path,
+            title: "Missing terminal",
+            createdAt: 1,
+            agentID: agent.id
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+        let missingPane = NativeRestorablePaneState(
+            id: missingID,
+            surface: NativeRestorableSurfaceState(
+                kind: .terminal,
+                id: missingID,
+                projectID: fixture.projectID,
+                agentID: agent.id,
+                title: "Missing terminal"
+            )
+        )
+        try await saveVisualSurfaceWorkspace(
+            in: fixture,
+            leadingPane: missingPane,
+            focusedPaneID: missingID
+        )
+        return missingID
+    }
+
+    private func saveVisualSurfaceWorkspace(
+        in fixture: Fixture,
+        leadingPane: NativeRestorablePaneState,
+        focusedPaneID: String
+    ) async throws {
+        let terminalPanes = [
+            Self.terminalPane(
+                ReconnectBrokerClient.firstTerminalID,
+                projectID: fixture.projectID
+            ),
+            Self.terminalPane(
+                ReconnectBrokerClient.secondTerminalID,
+                projectID: fixture.projectID
+            ),
+        ]
+        let panes = [leadingPane] + terminalPanes
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: fixture.projectID,
+                projects: [NativeProjectWorkspaceState(
+                    projectID: fixture.projectID,
+                    layout: SessionPaneLayout(columns: [
+                        .init(sessionIDs: panes.map(\.id)),
+                    ]),
+                    panes: panes,
+                    focusedPaneID: focusedPaneID
+                )]
+            )
+        )
+    }
+
+    private func seedOwnershipRestoration(
+        in fixture: Fixture,
+        includesFocusedChat: Bool
+    ) async throws -> OwnershipRestorationFixture {
+        let restoration = OwnershipRestorationFixture(projectID: fixture.projectID)
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: restoration.activeTerminalID,
+            projectID: restoration.projectID,
+            cwd: fixture.root.appendingPathComponent("does-not-exist", isDirectory: true).path,
+            title: "Active owned",
+            createdAt: 1,
+            agentID: agent.id
+        ))
+        fixture.sessionStore.upsert(NativeOwnedSession(
+            id: restoration.endedTerminalID,
+            projectID: restoration.projectID,
+            cwd: fixture.root.path,
+            title: "Ended owned",
+            createdAt: 2,
+            agentID: agent.id,
+            endedAt: 3
+        ))
+        fixture.model.refreshPersistedNavigationState(publish: false)
+
+        let terminalPane: (String, String, String?) -> NativeRestorablePaneState = {
+            id, title, agentID in
+            NativeRestorablePaneState(
+                id: id,
+                surface: NativeRestorableSurfaceState(
+                    kind: .terminal,
+                    id: id,
+                    projectID: restoration.projectID,
+                    agentID: agentID,
+                    title: title
+                )
+            )
+        }
+        var panes = [
+            terminalPane(restoration.activeTerminalID, "Active owned", agent.id),
+            terminalPane(restoration.endedTerminalID, "Ended owned", agent.id),
+            terminalPane(restoration.staleTerminalID, "Archived terminal", nil),
+        ]
+        var paneIDs = panes.map(\.id)
+        if includesFocusedChat {
+            let descriptor = NativeRestorableAgentChatDescriptor(
+                id: restoration.chatID,
+                projectID: restoration.projectID,
+                agentID: agent.id,
+                workspacePath: fixture.root.path,
+                acpSessionID: nil,
+                accountBinding: nil,
+                title: "Focused chat"
+            )
+            panes.insert(NativeRestorablePaneState(
+                id: restoration.chatID,
+                surface: NativeRestorableSurfaceState(agentChat: descriptor)
+            ), at: 0)
+            paneIDs.insert(restoration.chatID, at: 0)
+        }
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: restoration.projectID,
+                projects: [NativeProjectWorkspaceState(
+                    projectID: restoration.projectID,
+                    layout: SessionPaneLayout(columns: [.init(sessionIDs: paneIDs)]),
+                    panes: panes,
+                    focusedPaneID: includesFocusedChat
+                        ? restoration.chatID
+                        : restoration.activeTerminalID
+                )]
+            )
+        )
+        return restoration
+    }
+
+    private func terminalIDs(
+        in snapshot: NativeProjectWorkspaceState?
+    ) -> Set<String> {
+        Set(snapshot?.panes.compactMap { pane in
+            pane.surface.kind == .terminal ? pane.id : nil
+        } ?? [])
+    }
+
+    private func subscriptionCounts(in fixture: Fixture) async -> (first: Int, second: Int) {
+        let first = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        let second = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.secondTerminalID
+        )
+        return (first, second)
+    }
+
+    private static func terminalPane(
+        _ id: String,
+        projectID: String = "project.one"
+    ) -> NativeRestorablePaneState {
         NativeRestorablePaneState(
             id: id,
             surface: NativeRestorableSurfaceState(
                 kind: .terminal,
                 id: id,
-                projectID: "project.one",
+                projectID: projectID,
                 title: id
             )
         )
@@ -1727,6 +3822,18 @@ private struct RecordedTerminalResize: Equatable, Sendable {
     let rows: Int
 }
 
+private actor DynamicTerminalInventory {
+    private var terminalIDs: Set<String> = []
+
+    func insert(_ terminalID: String) {
+        terminalIDs.insert(terminalID)
+    }
+
+    func allTerminalIDs() -> [String] {
+        terminalIDs.sorted()
+    }
+}
+
 private actor RecordingBrokerControlClient: BrokerControlServing {
     private var recordedResizes: [RecordedTerminalResize] = []
     private var recordedWrites: [String] = []
@@ -1734,21 +3841,38 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     private var writeAttemptCountsByTerminalID: [String: Int] = [:]
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
     private var connectCount = 0
+    private var disconnectCount = 0
     private var createCount = 0
+    private var attachFailuresRemaining: Int
     private var recordedAttaches: [String] = []
+    private var recordedReleases: [String] = []
     private let agentTurnAccepted: Bool
     private let createFailure: BrokerClientError?
+    private let creationExisted: Bool
     private let onConnect: (@Sendable () async -> Void)?
+    private let onAttach: (@Sendable (String) async -> Void)?
+    private let onCreate: (@Sendable (String) async -> Void)?
+    private let onRelease: (@Sendable (String) async -> Void)?
     private var recordedAgentTurns: [Bool] = []
 
     init(
         agentTurnAccepted: Bool = true,
         createFailure: BrokerClientError? = nil,
-        onConnect: (@Sendable () async -> Void)? = nil
+        creationExisted: Bool = false,
+        attachFailuresRemaining: Int = 0,
+        onConnect: (@Sendable () async -> Void)? = nil,
+        onAttach: (@Sendable (String) async -> Void)? = nil,
+        onCreate: (@Sendable (String) async -> Void)? = nil,
+        onRelease: (@Sendable (String) async -> Void)? = nil
     ) {
         self.agentTurnAccepted = agentTurnAccepted
         self.createFailure = createFailure
+        self.creationExisted = creationExisted
+        self.attachFailuresRemaining = attachFailuresRemaining
         self.onConnect = onConnect
+        self.onAttach = onAttach
+        self.onCreate = onCreate
+        self.onRelease = onRelease
     }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
@@ -1772,16 +3896,23 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     ) async throws -> TerminalCreation {
         createCount += 1
         if let createFailure { throw createFailure }
+        await onCreate?(terminalID)
         return TerminalCreation(
             terminalID: terminalID,
             projectID: projectID,
             pid: 1,
+            existed: creationExisted,
             streamEpoch: "recording"
         )
     }
 
     func attach(projectID: String, terminalID: String) async throws {
         recordedAttaches.append(terminalID)
+        if attachFailuresRemaining > 0 {
+            attachFailuresRemaining -= 1
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
+        await onAttach?(terminalID)
     }
 
     func write(projectID: String, terminalID: String, data: String) async throws {
@@ -1801,7 +3932,10 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     }
 
     func kill(projectID: String, terminalID: String) async throws {}
-    func release(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {
+        recordedReleases.append(terminalID)
+        await onRelease?(terminalID)
+    }
     func detachOwner(projectID: String, terminalID: String) async throws {}
     /// Mirrors `BrokerControlClient`, which now turns the broker's inner
     /// `{ok:false}` into this error instead of discarding it.
@@ -1813,7 +3947,7 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     }
 
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
-    func disconnect() async {}
+    func disconnect() async { disconnectCount += 1 }
 
     func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }
     func agentTurnCalls() -> [Bool] { recordedAgentTurns }
@@ -1825,8 +3959,10 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         writeAttemptCountsByTerminalID[terminalID, default: 0]
     }
     func connectionCount() -> Int { connectCount }
+    func disconnectAttempts() -> Int { disconnectCount }
     func createAttempts() -> Int { createCount }
     func attachCalls() -> [String] { recordedAttaches }
+    func releaseCalls() -> [String] { recordedReleases }
     func simulateDisconnect() { disconnectHandler?(BrokerClientError.connectionClosed) }
 }
 
@@ -2147,7 +4283,9 @@ private final class AgentTurnGateFixture {
 @MainActor
 private final class Fixture {
     let root: URL
+    let projectID: String
     let client: ReconnectBrokerClient
+    let sessionStore: NativeSessionStore
     let transcriptStore: AcpTranscriptStore
     let workspaceStore: NativeWorkspaceStateStore
     let attentionCenter: AttentionCenter
@@ -2164,7 +4302,12 @@ private final class Fixture {
         completedAtByTerminalID: [String: Int64] = [:],
         transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
         transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil,
-        advertisesObserverCoalescing: Bool = false
+        advertisesObserverCoalescing: Bool = false,
+        usesRootProjectIdentity: Bool = false,
+        reconnectSleeper: (@Sendable (UInt64) async throws -> Void)? = nil,
+        dynamicTerminalInventory: DynamicTerminalInventory? = nil,
+        beforeRouteSplitCleanup: (@Sendable () async -> Void)? = nil,
+        onObserverConnectAttempt: (@Sendable (Int) async -> Void)? = nil
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -2173,10 +4316,16 @@ private final class Fixture {
             attributes: [.posixPermissions: 0o700]
         )
         _ = chmod(root.path, 0o700)
+        projectID = usesRootProjectIdentity
+            ? NativeSessionStore.projectID(forDirectory: root.path)
+            : "project.one"
         client = ReconnectBrokerClient(
             failingConnectAttempts: failingConnectAttempts,
             completedAtByTerminalID: completedAtByTerminalID,
-            advertisesObserverCoalescing: advertisesObserverCoalescing
+            advertisesObserverCoalescing: advertisesObserverCoalescing,
+            projectID: projectID,
+            dynamicTerminalInventory: dynamicTerminalInventory,
+            onConnectAttempt: onObserverConnectAttempt
         )
         let legacyTranscriptURL = root.appendingPathComponent("agent-chat-transcripts-v1.json")
         transcriptStore = AcpTranscriptStore(
@@ -2204,15 +4353,24 @@ private final class Fixture {
             postsNotifications: false,
             updatesDockBadge: false
         )
+        sessionStore = NativeSessionStore(
+            fileURL: root.appendingPathComponent("native-sessions.json")
+        )
+        if usesRootProjectIdentity {
+            sessionStore.openProject(directory: root.path)
+        }
         model = AppModel(
             brokerPreparer: brokerPreparer
                 ?? LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
             client: client,
             controlClient: controlClient,
-            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("native-sessions.json")),
+            sessionStore: sessionStore,
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
             workspaceStateStore: workspaceStore,
             transcriptStore: transcriptStore,
+            adoptionStore: SessionAdoptionStore(
+                fileURL: root.appendingPathComponent("session-adoptions.json")
+            ),
             usageCenter: UsageCenter(persistenceStore: transcriptStore),
             attentionCenter: attentionCenter,
             chatDraftDefaults: chatDraftDefaults,
@@ -2222,7 +4380,7 @@ private final class Fixture {
                 maximumNanoseconds: 2,
                 jitterFraction: 0
             ),
-            sleep: { nanoseconds in
+            sleep: reconnectSleeper ?? { nanoseconds in
                 // Keep nanosecond reconnect backoffs deterministic and fast,
                 // but do not turn the 2.5-second inventory poll into a hot
                 // loop. That unrelated refresh publishes structural model
@@ -2234,7 +4392,8 @@ private final class Fixture {
                     await Task.yield()
                 }
             },
-            jitter: { 0 }
+            jitter: { 0 },
+            beforeRouteSplitCleanup: beforeRouteSplitCleanup
         )
     }
 
@@ -2269,19 +4428,24 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
 
     private let failingConnectAttempts: Set<Int>
     private let completedAtByTerminalID: [String: Int64]
+    private let projectID: String
     /// Whether this double stands in for a broker that batches observer output
     /// on its own frame window. Off by default so the existing tests keep
     /// describing a broker that does not, where the app's window is the only
     /// coalescer in the path.
     private let advertisesObserverCoalescing: Bool
+    private let dynamicTerminalInventory: DynamicTerminalInventory?
+    private let onConnectAttempt: (@Sendable (Int) async -> Void)?
     private var connectCount = 0
     private var disconnectCount = 0
+    private var connectionActive = false
     private var inventoryFailuresRemaining = 0
     private var cursors: [TerminalCursor?] = []
     private var subscribedTerminalIDs: [String] = []
     private var activeTerminalIDs: Set<String> = []
     private var ownerIDsByTerminal: [String: String] = [:]
     private var hiddenTerminalIDs: Set<String> = []
+    private var exitedTerminalIDs: Set<String> = []
     private var blockedSubscriptionIDs: Set<String> = []
     private var failingSubscriptionIDs: Set<String> = []
     private var unsubscribeBlocked = false
@@ -2289,20 +4453,28 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     private var unsubscribeCalls = 0
     private var unsubscribedTerminalIDs: [String] = []
     private var eventHandler: (@Sendable (BrokerEvent) -> Void)?
+    private var retainedEventHandlers: [@Sendable (BrokerEvent) -> Void] = []
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
 
     init(
         failingConnectAttempts: Set<Int>,
         completedAtByTerminalID: [String: Int64] = [:],
-        advertisesObserverCoalescing: Bool = false
+        advertisesObserverCoalescing: Bool = false,
+        projectID: String = "project.one",
+        dynamicTerminalInventory: DynamicTerminalInventory? = nil,
+        onConnectAttempt: (@Sendable (Int) async -> Void)? = nil
     ) {
         self.advertisesObserverCoalescing = advertisesObserverCoalescing
         self.failingConnectAttempts = failingConnectAttempts
         self.completedAtByTerminalID = completedAtByTerminalID
+        self.projectID = projectID
+        self.dynamicTerminalInventory = dynamicTerminalInventory
+        self.onConnectAttempt = onConnectAttempt
     }
 
     func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async {
         eventHandler = handler
+        if let handler { retainedEventHandlers.append(handler) }
     }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
@@ -2311,9 +4483,12 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
 
     func connect(to info: BrokerInfo) async throws -> BrokerHello {
         connectCount += 1
-        if failingConnectAttempts.contains(connectCount) {
+        let attempt = connectCount
+        await onConnectAttempt?(attempt)
+        if failingConnectAttempts.contains(attempt) {
             throw BrokerClientError.connectionClosed
         }
+        connectionActive = true
         return BrokerHello(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
@@ -2370,39 +4545,58 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         if let completedAt = completedAtByTerminalID[Self.secondTerminalID] {
             secondLive["agentCompletedAt"] = .integer(completedAt)
         }
+        let dynamicTerminalIDs = await dynamicTerminalInventory?.allTerminalIDs() ?? []
+        let diagnostics: [JSONValue] = [
+            .object([
+                "id": .string(Self.firstTerminalID),
+                "owner": .string("instance|42|\(projectID)"),
+                "pid": .integer(123),
+                "exited": .bool(exitedTerminalIDs.contains(Self.firstTerminalID)),
+                "streamEpoch": .string("epoch"),
+                "endOffset": .integer(5),
+            ]),
+            .object([
+                "id": .string(Self.secondTerminalID),
+                "owner": .string("instance|42|\(projectID)"),
+                "pid": .integer(124),
+                "exited": .bool(exitedTerminalIDs.contains(Self.secondTerminalID)),
+                "streamEpoch": .string("epoch-2"),
+                "endOffset": .integer(5),
+            ]),
+        ] + dynamicTerminalIDs.map { terminalID in
+            .object([
+                "id": .string(terminalID),
+                "owner": .string("instance|42|\(projectID)"),
+                "pid": .integer(125),
+                "streamEpoch": .string("dynamic-\(terminalID)"),
+                "endOffset": .integer(5),
+            ])
+        }
+        let live: [JSONValue] = [
+            .object(firstLive),
+            .object(secondLive),
+        ] + dynamicTerminalIDs.map { terminalID in
+            .object([
+                "id": .string(terminalID),
+                "pid": .integer(125),
+            ])
+        }
         return try BrokerStatus(
             status: .object([
                 "ok": .bool(true),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),
                 "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
             ]),
-            diagnostics: .array([
-                .object([
-                    "id": .string(Self.firstTerminalID),
-                    "owner": .string("instance|42|project.one"),
-                    "pid": .integer(123),
-                    "streamEpoch": .string("epoch"),
-                    "endOffset": .integer(5),
-                ]),
-                .object([
-                    "id": .string(Self.secondTerminalID),
-                    "owner": .string("instance|42|project.one"),
-                    "pid": .integer(124),
-                    "streamEpoch": .string("epoch-2"),
-                    "endOffset": .integer(5),
-                ]),
-            ].filter { record in
+            diagnostics: .array(diagnostics.filter { record in
                 guard case .object(let fields) = record,
                       case .string(let id)? = fields["id"] else { return true }
                 return !hiddenTerminalIDs.contains(id)
             }),
-            live: .array([
-                .object(firstLive),
-                .object(secondLive),
-            ].filter { record in
+            live: .array(live.filter { record in
                 guard case .object(let fields) = record,
                       case .string(let id)? = fields["id"] else { return true }
                 return !hiddenTerminalIDs.contains(id)
+                    && !exitedTerminalIDs.contains(id)
             }),
             expectedHello: expectedHello
         )
@@ -2424,13 +4618,17 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         if let cursor { return .current(cursor) }
         let output = terminal.id == Self.secondTerminalID ? "world" : "hello"
         let epoch = terminal.id == Self.secondTerminalID ? "epoch-2" : "epoch"
+        var snapshot: [String: JSONValue] = [
+            "streamEpoch": .string(epoch),
+            "output": .string(output),
+            "startOffset": .integer(0),
+            "endOffset": .integer(5),
+        ]
+        if exitedTerminalIDs.contains(terminal.id) {
+            snapshot["exited"] = .bool(true)
+        }
         return .snapshot(
-            try TerminalSnapshot(value: .object([
-                "streamEpoch": .string(epoch),
-                "output": .string(output),
-                "startOffset": .integer(0),
-                "endOffset": .integer(5),
-            ])),
+            try TerminalSnapshot(value: .object(snapshot)),
             resetReason: nil
         )
     }
@@ -2443,9 +4641,13 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         }
         activeTerminalIDs.remove(terminal.id)
     }
-    func disconnect() async { disconnectCount += 1 }
+    func disconnect() async {
+        disconnectCount += 1
+        connectionActive = false
+    }
 
     func simulateDisconnect() {
+        connectionActive = false
         disconnectHandler?(BrokerClientError.connectionClosed)
     }
 
@@ -2453,7 +4655,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         guard let ownerID = ownerIDsByTerminal[id] else { return }
         eventHandler?(BrokerEvent(
             ownerID: ownerID,
-            projectID: "project.one",
+            projectID: projectID,
             terminalID: id,
             kind: .output(
                 epoch: epoch,
@@ -2464,18 +4666,34 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         ))
     }
 
+    func emitExit(for id: String) {
+        guard let ownerID = ownerIDsByTerminal[id] else { return }
+        eventHandler?(BrokerEvent(
+            ownerID: ownerID,
+            projectID: projectID,
+            terminalID: id,
+            kind: .exit
+        ))
+    }
+
     /// Activity frames are emitted with an explicit routing identity so a test
     /// can forge one that claims another owner or another project.
     func emitActivity(
         for id: String,
         ownerID: String,
-        projectID: String = "project.one",
+        projectID: String? = nil,
         busy: Bool,
-        completedAt: Int64? = nil
+        completedAt: Int64? = nil,
+        retainedHandlerIndex: Int? = nil
     ) {
-        eventHandler?(BrokerEvent(
+        let handler = retainedHandlerIndex.flatMap { index in
+            retainedEventHandlers.indices.contains(index)
+                ? retainedEventHandlers[index]
+                : nil
+        } ?? eventHandler
+        handler?(BrokerEvent(
             ownerID: ownerID,
-            projectID: projectID,
+            projectID: projectID ?? self.projectID,
             terminalID: id,
             kind: .activity(busy: busy, completedAt: completedAt)
         ))
@@ -2487,6 +4705,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
 
     func connectionAttempts() -> Int { connectCount }
     func disconnectAttempts() -> Int { disconnectCount }
+    func isConnectionActive() -> Bool { connectionActive }
     func failNextInventoryRequests(_ count: Int) {
         inventoryFailuresRemaining = max(0, count)
     }
@@ -2500,6 +4719,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         unsubscribedTerminalIDs.filter { $0 == id }.count
     }
     func isSubscribed(to id: String) -> Bool { activeTerminalIDs.contains(id) }
+    func activeSubscriptionIDs() -> Set<String> { activeTerminalIDs }
     func setUnsubscribeBlocked(_ blocked: Bool) { unsubscribeBlocked = blocked }
     func setUnsubscribeBlocked(_ id: String, blocked: Bool) {
         if blocked { blockedUnsubscribeIDs.insert(id) }
@@ -2515,6 +4735,11 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         if hidden { hiddenTerminalIDs.insert(id) } else { hiddenTerminalIDs.remove(id) }
     }
 
+    func setTerminalExited(_ id: String, exited: Bool) {
+        if exited { exitedTerminalIDs.insert(id) }
+        else { exitedTerminalIDs.remove(id) }
+    }
+
     func setSubscriptionBlocked(_ id: String, blocked: Bool) {
         if blocked {
             blockedSubscriptionIDs.insert(id)
@@ -2528,7 +4753,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         guard let event = BrokerEvent(frame: .object([
             "type": .string("event"),
             "ownerId": .string(ownerID),
-            "projectId": .string("project.one"),
+            "projectId": .string(projectID),
             "channel": .string("terminal:observer-snapshot-required"),
             "payload": .object(["id": .string(id)]),
         ])) else { return }

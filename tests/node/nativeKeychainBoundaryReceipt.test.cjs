@@ -77,7 +77,7 @@ function signedHost(overrides = {}) {
       'keychain-access-groups': [`${TEST_TEAM_IDENTIFIER}.com.kaisola.mac`],
     },
     provisioningProfile: {
-      UUID: '00000000-0000-0000-0000-000000000001',
+      UUID: 'abcdef12-3456-7890-abcd-ef1234567890',
       Name: 'Kaisola Keychain Boundary',
       TeamIdentifier: [TEST_TEAM_IDENTIFIER],
       ApplicationIdentifierPrefix: [TEST_TEAM_IDENTIFIER],
@@ -330,10 +330,16 @@ test('accepts only an exact unexpired Developer ID input profile', () => {
     Platform: ['OSX'],
   }
 
-  assert.deepEqual(
-    validateInputProvisioningProfile(profile, TEST_TEAM_IDENTIFIER),
-    { uuid: '00000000-0000-0000-0000-000000000001' },
-  )
+  for (const uuid of [
+    'abcdef12-3456-7890-abcd-ef1234567890',
+    'ABCDEF12-3456-7890-ABCD-EF1234567890',
+    'AbCdEf12-3456-7890-aBcD-Ef1234567890',
+  ]) {
+    assert.deepEqual(
+      validateInputProvisioningProfile({ ...profile, UUID: uuid }, TEST_TEAM_IDENTIFIER),
+      { uuid },
+    )
+  }
 
   const legacyPrefix = 'LEGACYID01'
   assert.deepEqual(
@@ -345,7 +351,7 @@ test('accepts only an exact unexpired Developer ID input profile', () => {
         'keychain-access-groups': [`${legacyPrefix}.com.kaisola.mac`],
       },
     }, TEST_TEAM_IDENTIFIER),
-    { uuid: '00000000-0000-0000-0000-000000000001' },
+    { uuid: 'abcdef12-3456-7890-abcd-ef1234567890' },
   )
 
   for (const [changedProfile, message] of [

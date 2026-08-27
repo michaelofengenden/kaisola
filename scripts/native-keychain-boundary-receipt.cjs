@@ -232,7 +232,7 @@ function validateInputProvisioningProfile(profile, teamIdentifier) {
     { kind: 'developer-id', teamIdentifier },
     { applicationIdentifier, identifierPrefix },
   )
-  return { uuid: uuid.toUpperCase() }
+  return { uuid }
 }
 
 function validateBoundaryEvidence(evidence, options = {}) {

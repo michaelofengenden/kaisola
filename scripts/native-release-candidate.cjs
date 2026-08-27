@@ -166,7 +166,6 @@ function validatePreflight(preflight, options) {
   const architectures = {
     app: requireArchitectures(preflight.architectures?.app, 'preflight app architectures'),
     node: requireArchitectures(preflight.architectures?.node, 'preflight Node architectures'),
-    bootstrap: requireArchitectures(preflight.architectures?.bootstrap, 'preflight bootstrap architectures'),
   }
   const helper = {
     packageVersion: requireString(preflight.helper?.packageVersion, 'helper package version', /^[A-Za-z0-9._-]{1,64}$/),
@@ -359,7 +358,6 @@ function verifyReceipt(options) {
   }
   requireArchitectures(receipt.application.architectures?.app, 'candidate app architectures')
   requireArchitectures(receipt.application.architectures?.node, 'candidate Node architectures')
-  requireArchitectures(receipt.application.architectures?.bootstrap, 'candidate bootstrap architectures')
   requireString(receipt.brokerHelper?.packageVersion, 'candidate helper package version', /^[A-Za-z0-9._-]{1,64}$/)
   requireString(receipt.brokerHelper?.contentDigest, 'candidate helper content digest', /^[0-9a-f]{64}$/)
   requireInteger(receipt.brokerHelper?.schemaVersion, 'candidate helper schema version', { minimum: 1 })

@@ -49,7 +49,6 @@ function fixture(t) {
     architectures: {
       app: ['arm64'],
       node: ['arm64'],
-      bootstrap: ['arm64'],
     },
     helper: {
       packageVersion: '1.1.0',

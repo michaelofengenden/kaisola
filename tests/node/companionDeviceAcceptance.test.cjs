@@ -191,7 +191,7 @@ function macPreflight(overrides = {}) {
     bundleIdentifier: 'com.kaisola.mac',
     version: '0.1.114',
     build: '15510',
-    architectures: { app: ['arm64'], node: ['arm64'], bootstrap: ['arm64'] },
+    architectures: { app: ['arm64'], node: ['arm64'] },
     developerID: true,
     teamIdentifier,
     secureTimestamp: true,
@@ -522,7 +522,7 @@ test('receipt binds one commit and signing team and strips absolute build paths'
   }), /Developer ID/)
   assert.throws(() => createAcceptanceReceipt({
     ...input,
-    macPreflight: macPreflight({ architectures: { app: ['arm64'], node: ['x86_64'], bootstrap: ['arm64'] } }),
+    macPreflight: macPreflight({ architectures: { app: ['arm64'], node: ['x86_64'] } }),
   }), /Node runtime architectures/)
 })
 

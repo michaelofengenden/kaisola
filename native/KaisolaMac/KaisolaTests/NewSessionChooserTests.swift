@@ -100,6 +100,26 @@ final class NewSessionChooserTests: XCTestCase {
             NewSessionChooserPresentation.launchFailureMessage(detail: "  "),
             "Session did not start. Review the error and try again."
         )
+        XCTAssertNil(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: false,
+                detail: "A stale error"
+            )
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: true,
+                detail: "Kaisola already has its limit of 8 terminals open. Close one and try again."
+            ),
+            "Kaisola already has its limit of 8 terminals open. Close one and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: true,
+                detail: nil
+            ),
+            "Session did not start. Review the error and try again."
+        )
     }
 
     /// The choice cards answer the pointer: rest, hover, and press are three

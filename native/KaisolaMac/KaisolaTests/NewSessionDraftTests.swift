@@ -81,14 +81,24 @@ final class NewSessionDraftTests: XCTestCase {
         XCTAssertTrue(state.isLaunching(projectID: "project-a"))
         XCTAssertEqual(state.selectedDraft, draft, "starting is not the same as succeeding")
 
-        state.finishLaunch(projectID: "project-a", launchID: failedLaunchID, succeeded: false)
+        state.finishLaunch(
+            projectID: "project-a",
+            launchID: failedLaunchID,
+            succeeded: false,
+            failureMessage: "Kaisola already has its limit of 8 terminals open. Close one and try again."
+        )
 
         XCTAssertFalse(state.isLaunching(projectID: "project-a"))
         XCTAssertTrue(state.didLastLaunchFail(projectID: "project-a"))
+        XCTAssertEqual(
+            state.lastLaunchFailureMessage(projectID: "project-a"),
+            "Kaisola already has its limit of 8 terminals open. Close one and try again."
+        )
         XCTAssertEqual(state.selectedDraft, draft, "a failed launch must remain retryable")
 
         let successfulLaunchID = try XCTUnwrap(state.beginLaunch(projectID: "project-a"))
         XCTAssertFalse(state.didLastLaunchFail(projectID: "project-a"))
+        XCTAssertNil(state.lastLaunchFailureMessage(projectID: "project-a"))
         state.finishLaunch(
             projectID: "project-a",
             launchID: successfulLaunchID,

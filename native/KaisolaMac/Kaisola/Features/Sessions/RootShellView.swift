@@ -1512,7 +1512,8 @@ struct RootShellView: View {
                 let accepted = newSessionDrafts.finishLaunch(
                     projectID: draft.projectID,
                     launchID: launchID,
-                    succeeded: result.terminalID != nil
+                    succeeded: result.terminalID != nil,
+                    failureMessage: result.failureMessage
                 )
                 if accepted, result.terminalID == nil {
                     ToastCenter.shared.show(
@@ -1545,7 +1546,8 @@ struct RootShellView: View {
                     let accepted = newSessionDrafts.finishLaunch(
                         projectID: draft.projectID,
                         launchID: launchID,
-                        succeeded: result.terminalID != nil
+                        succeeded: result.terminalID != nil,
+                        failureMessage: result.failureMessage
                     )
                     if accepted, result.terminalID == nil {
                         ToastCenter.shared.show(
@@ -1949,7 +1951,15 @@ struct RootShellView: View {
                     catalog: .live,
                     terminalControlAvailable: model.controlAvailable,
                     isLaunching: newSessionDrafts.isLaunching(projectID: draft.projectID),
-                    launchFailed: newSessionDrafts.didLastLaunchFail(projectID: draft.projectID),
+                    launchFailureMessage: NewSessionChooserPresentation
+                        .retainedLaunchFailureMessage(
+                            didFail: newSessionDrafts.didLastLaunchFail(
+                                projectID: draft.projectID
+                            ),
+                            detail: newSessionDrafts.lastLaunchFailureMessage(
+                                projectID: draft.projectID
+                            )
+                        ),
                     choose: { chooseNewSession($0, draft: draft) },
                     cancel: { cancelNewSession(draft.projectID) }
                 )
@@ -2489,7 +2499,7 @@ struct RootShellView: View {
                 catalog: .live,
                 terminalControlAvailable: model.controlAvailable,
                 isLaunching: false,
-                launchFailed: false,
+                launchFailureMessage: nil,
                 showsCancel: false,
                 choose: { chooseNewSessionFromEmptyWorkspace($0, project: project) },
                 cancel: {}

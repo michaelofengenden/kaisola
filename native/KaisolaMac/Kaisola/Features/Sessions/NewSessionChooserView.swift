@@ -28,6 +28,14 @@ enum NewSessionChooserPresentation {
         return detail
     }
 
+    static func retainedLaunchFailureMessage(
+        didFail: Bool,
+        detail: String?
+    ) -> String? {
+        guard didFail else { return nil }
+        return launchFailureMessage(detail: detail)
+    }
+
     static func terminalRowsEnabled(
         terminalControlAvailable: Bool,
         isLaunching: Bool
@@ -95,7 +103,7 @@ struct NewSessionChooserView: View {
     let catalog: NewSessionChoiceCatalog
     let terminalControlAvailable: Bool
     let isLaunching: Bool
-    let launchFailed: Bool
+    let launchFailureMessage: String?
     var showsCancel = true
     let choose: (NewSessionChoice) -> Void
     let cancel: () -> Void
@@ -160,9 +168,9 @@ struct NewSessionChooserView: View {
                         .controlSize(.small)
                     Text("Starting session…")
                         .foregroundStyle(.kaisolaSecondary)
-                } else if launchFailed {
+                } else if let launchFailureMessage {
                     Label {
-                        Text(NewSessionChooserPresentation.launchFailureMessage)
+                        Text(launchFailureMessage)
                             .foregroundStyle(.kaisolaPrimary)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")

@@ -136,8 +136,12 @@ targets:
             exit 0
           fi
 
-          runtime_arm64="${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}"
-          runtime_x64="${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}"
+          # The one source of truth for the sealed runtime's version is the
+          # package policy; restating it here is what broke the 0.1.141
+          # candidate when the weekly refresh moved the policy.
+          node_version="$(/usr/bin/env node -p "require('${SRCROOT}/BrokerHelper/package-policy.json').node.version")"
+          runtime_arm64="${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v${node_version}-darwin-arm64/bin/node}"
+          runtime_x64="${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v${node_version}-darwin-x64/bin/node}"
           if [[ ! -x "${runtime_arm64}" ]]; then
             echo "Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64" >&2
             exit 1

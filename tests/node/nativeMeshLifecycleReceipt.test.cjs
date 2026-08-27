@@ -55,9 +55,18 @@ test('required Mesh workflow pins the runtime, selector, receipt gate, and artif
   assert.ok(fs.existsSync(workflow), 'the dedicated required workflow must exist')
   const source = fs.readFileSync(workflow, 'utf8')
   assert.match(source, /actions\/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38/)
-  assert.match(source, /node-version:\s*['"]22\.23\.1['"]/)
+  // The runtime version is single-sourced from the package policy: the
+  // workflow must READ it (a hardcoded copy is what broke the 0.1.141
+  // candidate) and must not restate it anywhere.
+  assert.match(source, /package-policy\.json'\)\.node\.version/)
+  assert.match(source, /node-version:\s*\$\{\{\s*steps\.pinned-node\.outputs\.version\s*\}\}/)
+  assert.match(source, /KAISOLA_EXPECTED_NODE_VERSION=\$version/)
+  assert.doesNotMatch(
+    source,
+    /\d+\.\d+\.\d+-darwin|node-version:\s*['"]\d/,
+    'the workflow must not restate the pinned runtime version'
+  )
   assert.match(source, /KAISOLA_REQUIRE_MESH_INTEGRATION:\s*['"]1['"]/)
-  assert.match(source, /KAISOLA_EXPECTED_NODE_VERSION:\s*['"]22\.23\.1['"]/)
   assert.match(source, /KAISOLA_MESH_LIFECYCLE_RECEIPT:/)
   const jobEnvironment = source.slice(source.indexOf('    env:'), source.indexOf('    steps:'))
   assert.doesNotMatch(

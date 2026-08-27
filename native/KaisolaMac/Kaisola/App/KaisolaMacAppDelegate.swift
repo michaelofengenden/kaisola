@@ -770,6 +770,80 @@ enum KaisolaMacMain {
 }
 
 @MainActor
+struct PreparedApplicationTerminationHooks {
+    let dismissAttachedSheets: @MainActor () -> Void
+    let hasBlockingPresentation: @MainActor () -> Bool
+    let hasModalWindow: @MainActor () -> Bool
+    let abortModal: @MainActor () -> Void
+    let schedule: @MainActor (
+        TimeInterval,
+        @escaping @MainActor () -> Void
+    ) -> Void
+    let terminate: @MainActor () -> Void
+
+    static var live: PreparedApplicationTerminationHooks {
+        PreparedApplicationTerminationHooks(
+            dismissAttachedSheets: {
+                KaisolaMacAppDelegate.endAttachedSheets(in: NSApplication.shared)
+            },
+            hasBlockingPresentation: {
+                UpdateInstallGateHooks.applicationHasBlockingPresentation(NSApplication.shared)
+            },
+            hasModalWindow: { NSApplication.shared.modalWindow != nil },
+            abortModal: { NSApplication.shared.abortModal() },
+            schedule: { delay, work in
+                Task { @MainActor in
+                    if delay > 0 {
+                        try? await Task.sleep(for: .seconds(delay))
+                    } else {
+                        await Task.yield()
+                    }
+                    guard !Task.isCancelled else { return }
+                    work()
+                }
+            },
+            terminate: { NSApplication.shared.terminate(nil) }
+        )
+    }
+}
+
+/// AppKit leaves `modalWindow` populated until a modal session has unwound,
+/// even after `abortModal()`. Drive the prepared quit from one scheduled probe
+/// at a time and call `terminate` only on a turn where every AppKit modal
+/// boundary is already clear.
+@MainActor
+final class PreparedApplicationTerminationCoordinator {
+    private let hooks: PreparedApplicationTerminationHooks
+    private var advanceScheduled = false
+    private var completed = false
+
+    init(hooks: PreparedApplicationTerminationHooks = .live) {
+        self.hooks = hooks
+    }
+
+    func attempt() {
+        guard !completed else { return }
+        hooks.dismissAttachedSheets()
+        if hooks.hasBlockingPresentation() {
+            if hooks.hasModalWindow() {
+                hooks.abortModal()
+            }
+            guard !advanceScheduled else { return }
+            advanceScheduled = true
+            hooks.schedule(0.05) { [weak self] in
+                guard let self else { return }
+                self.advanceScheduled = false
+                self.attempt()
+            }
+            return
+        }
+
+        completed = true
+        hooks.terminate()
+    }
+}
+
+@MainActor
 final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     /// Hosted visual fixtures must never write appearance/layout choices into
     /// the signed app's production defaults domain. A per-process suite keeps
@@ -911,6 +985,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var terminationDeadlineTask: Task<Void, Never>?
     private var terminationPreparationInProgress = false
     private var terminationPrepared = false
+    private lazy var preparedTerminationCoordinator = PreparedApplicationTerminationCoordinator()
     static let terminationDrainDeadlineNanoseconds: UInt64 = 12_000_000_000
     private var windowCounter = 0
     private var wakeObserver: NSObjectProtocol?
@@ -4321,6 +4396,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     /// a wedged adapter or continuously painting terminal must never leave every
     /// workspace window hidden while the app consumes CPU forever.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        UpdateCenter.shared.applicationTerminationDidReachDelegate()
+        Self.endAttachedSheets(in: sender)
         if terminationPrepared { return .terminateNow }
         if terminationPreparationInProgress { return .terminateCancel }
         terminationPreparationInProgress = true
@@ -4366,6 +4443,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return .terminateCancel
     }
 
+    /// Once AppKit has admitted a quit request, no attached sheet should be
+    /// allowed to block Kaisola's prepared second request. Snapshot the pairs
+    /// first because ending one sheet mutates the application's window list.
+    static func endAttachedSheets(in application: NSApplication) {
+        let attachedSheets = application.windows.compactMap { owner -> (NSWindow, NSWindow)? in
+            guard let sheet = owner.attachedSheet else { return nil }
+            return (owner, sheet)
+        }
+        for (owner, sheet) in attachedSheets {
+            owner.endSheet(sheet)
+        }
+    }
+
     private func finishTerminationPreparation(timedOut: Bool) {
         guard terminationPreparationInProgress else { return }
         if timedOut {
@@ -4378,7 +4468,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         terminationDeadlineTask = nil
         terminationPreparationInProgress = false
         terminationPrepared = true
-        NSApp.terminate(nil)
+        preparedTerminationCoordinator.attempt()
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -4822,6 +4912,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let view = SettingsView(
             settings: settings,
             checkForUpdates: { [weak self] in self?.updateController.checkForUpdates(nil) },
+            installPendingUpdate: { UpdateCenter.shared.installAndRelaunch() },
             updateDetail: updateController.availability.detail,
             interruptibleTurnCount: { [weak capturedModel] in capturedModel?.interruptibleTurnCount ?? 0 },
             workspace: capturedModel?.currentProjectDirectory,

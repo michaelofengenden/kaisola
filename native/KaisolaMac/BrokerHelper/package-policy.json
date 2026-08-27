@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "1.1.0",
+  "packageVersion": "1.2.0",
   "brokerImplementationVersion": 2,
   "brokerProtocol": {
     "minimum": 2,
@@ -8,19 +8,19 @@
     "securityEpoch": 1
   },
   "node": {
-    "version": "22.23.1",
+    "version": "22.23.2",
     "abi": "127",
     "archives": {
       "arm64": {
-        "name": "node-v22.23.1-darwin-arm64.tar.xz",
-        "sha256": "fb526811860f81dcac7dd8b2b55eca4accfc5d61c3b7c2508f2639faee8a738d"
+        "name": "node-v22.23.2-darwin-arm64.tar.xz",
+        "sha256": "5eff7a9011895aae3f29d06f167b84a62b028a591370c7cafb59103559fd26e1"
       },
       "x86_64": {
-        "name": "node-v22.23.1-darwin-x64.tar.xz",
-        "sha256": "efeec6641a2f15f5396d27cd0b32f5062d6689d1e9e5d89607d0b29bda890233"
+        "name": "node-v22.23.2-darwin-x64.tar.xz",
+        "sha256": "96dff79f4e19a78715da559ec7cac2028f4985a175ea0c3454625a269c21deb7"
       }
     }
   },
   "nodePtyVersion": "1.1.0",
-  "claudeAgentSDKVersion": "0.3.205"
+  "claudeAgentSDKVersion": "0.3.247"
 }

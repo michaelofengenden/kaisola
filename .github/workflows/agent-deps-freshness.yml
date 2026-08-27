@@ -1,0 +1,54 @@
+name: agent deps freshness
+
+# The durable backstop for "the agent stack keeps being updated": a weekly
+# check that the pinned agent surfaces (claude-agent-sdk, the sealed Node
+# runtime, node-pty) still match what is published. The ACP adapters are not
+# checked because they are not pinned — every chat launch resolves
+# @agentclientprotocol/…@latest at spawn. When something is stale this opens
+# (or refreshes) one labeled issue; the bump itself lands through the normal
+# refresh script + pull request so the landing gate still fences it.
+# GITHUB_TOKEN-created PRs would not trigger required checks, which is why
+# this reports instead of pushing.
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  freshness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+      - name: Check agent dependency freshness
+        id: check
+        run: |
+          set +e
+          node scripts/agent-deps-refresh.cjs --check | tee freshness.txt
+          status=$?
+          set -e
+          if [ "$status" != "0" ] && [ "$status" != "3" ]; then exit "$status"; fi
+          echo "stale=$([ "$status" = "3" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Open or refresh the staleness issue
+        if: steps.check.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Agent dependencies are stale"
+          body="$(printf 'The weekly freshness check found stale agent pins:\n\n```\n%s\n```\n\nRun `node scripts/agent-deps-refresh.cjs`, run `npm run test:node` and the BrokerHelperPackage Swift suite, and land the bump through a pull request.' "$(cat freshness.txt)")"
+          existing=$(gh issue list --label agent-deps --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body" --label agent-deps
+          fi

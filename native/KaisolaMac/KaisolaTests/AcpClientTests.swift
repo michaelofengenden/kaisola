@@ -486,10 +486,22 @@ final class AcpClientTests: XCTestCase {
     func testPinnedNodeRuntimeExecutesJavaScriptInsideTheBoundary() throws {
         let configuredRuntime = ProcessInfo.processInfo.environment["KAISOLA_TEST_NODE_RUNTIME"]
             .map { URL(fileURLWithPath: $0) }
-        let repositoryRuntime = URL(fileURLWithPath: #filePath)
+        // The fixture path follows the package policy's pinned version, so a
+        // runtime refresh cannot strand this test on a stale hardcode.
+        let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appending(path: ".artifacts/node-v22.23.1-darwin-arm64/bin/node")
+        struct RuntimePolicy: Decodable {
+            struct Node: Decodable { let version: String }
+            let node: Node
+        }
+        let policyURL = projectRoot.appending(path: "BrokerHelper/package-policy.json")
+        let pinnedVersion = (try? JSONDecoder().decode(
+            RuntimePolicy.self,
+            from: Data(contentsOf: policyURL)
+        ))?.node.version
+        let repositoryRuntime = projectRoot
+            .appending(path: ".artifacts/node-v\(pinnedVersion ?? "unpinned")-darwin-arm64/bin/node")
         let runtime = configuredRuntime ?? repositoryRuntime
         guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
             throw XCTSkip("checksum-pinned Node fixture is unavailable; run download-native-node-runtime.cjs")

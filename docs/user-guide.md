@@ -1,25 +1,25 @@
 # Kaisola User Guide
 
-Kaisola keeps project files, agent chats, Mesh runs, and durable terminal
-sessions together in one native macOS app. This guide covers setup,
+Kaisola keeps project files, agent chats, Mesh runs, and terminal session
+records together in one native macOS app. This guide covers setup,
 everyday controls, and the recovery steps to use when something is not ready.
 
 ## Get ready
 
 1. Choose **File > Open Folder…** and select a project folder.
-2. Check the footer. **Connected** means saved terminals are visible; new
-   terminals additionally require the connection to have write control.
-3. For Claude or Codex, open **Settings > Accounts**. Use **Sign In to Claude**
+2. For Claude or Codex, open **Settings > Accounts**. Use **Sign In to Claude**
    or **Sign In to Codex**, or choose an already configured named account.
-4. Optional direct-provider keys live under **Settings > Models & Keys**. The
+3. Optional direct-provider keys live under **Settings > Models & Keys**. The
    **Test** action checks the provider's model-list endpoint without sending a
    model prompt.
-5. Start a terminal with **Command-T**, or choose a specific agent from
+4. Start a terminal with **Command-T**, or choose a specific agent from
    **File > New Agent Session**.
 
-Kaisola terminals are durable. Closing a window or updating the app does not
-end a running terminal. A terminal ends only when its process exits or you
-explicitly choose **End Session**.
+Terminal processes run inside Kaisola and end when Kaisola quits or installs an
+update. Kaisola keeps each session record, including its working folder, title,
+and agent choice. On relaunch, records that were active reopen as fresh shells
+in their saved working folders. An individual terminal also ends when its
+process exits or you choose **End Session**.
 
 ## Work with projects and sessions
 
@@ -83,15 +83,16 @@ version and disables actions that do not apply to the focused surface.
 
 ### New Terminal is disabled
 
-Choose a project first. If saved sessions are visible but new terminals remain
-disabled, the connection is temporarily read-only. Choose **Reconnect** in the
-footer. Existing terminal processes remain untouched while Kaisola reconnects.
+Choose a project first. If a project is already open, terminals are still
+preparing. Wait a moment and try again. Chat and Mesh remain available while
+terminal startup finishes.
 
-### Kaisola is offline
+### Terminal input is temporarily unavailable
 
-Choose **Reconnect**. If macOS asks about a Login Item, allow the Kaisola session
-helper in **System Settings > General > Login Items** and reconnect. Do not kill
-an existing terminal process to repair the app connection.
+The terminal header explains which local state applies. Kaisola retries input
+automatically for a terminal it owns. If another window or Companion controls
+input, return to that controller or close it before typing in this window. Other
+terminals remain usable.
 
 ### Claude or Codex asks you to sign in
 
@@ -129,13 +130,16 @@ Revocation intentionally invalidates old resume access immediately.
 
 Open **Kaisola > Check for Updates…**. Automatic checks and downloads can be
 configured under **Settings > General** in signed builds. Kaisola asks before a
-restart when active in-process agent turns would be interrupted.
+restart when active in-process agent turns would be interrupted. Terminal
+records reopen as fresh shells after the update relaunches Kaisola.
 
 ## Report a problem
 
-Include the Kaisola version, macOS version, the visible connection state, the
-project action you attempted, and the exact safe error text. Never include API
-keys, OAuth tokens, or credential files in a report.
+Include the Kaisola version, macOS version, the affected project and terminal,
+the action you attempted, and the exact safe error text. If input was not
+available, include whether the header said Kaisola was retrying or another
+window or Companion had control. Never include API keys, OAuth tokens, or
+credential files in a report.
 
 Report reproducible problems at
 [github.com/michaelofengenden/kaisola/issues](https://github.com/michaelofengenden/kaisola/issues).

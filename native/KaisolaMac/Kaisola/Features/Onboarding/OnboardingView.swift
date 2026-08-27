@@ -19,6 +19,16 @@ struct OnboardingReadinessStatus: Equatable, Sendable {
 /// state, while tests can pin the important distinctions without launching a
 /// window or touching a real provider account.
 enum OnboardingReadiness {
+    static func firstSessionHelp(
+        hasProject: Bool,
+        terminalControlAvailable: Bool
+    ) -> String {
+        guard hasProject else { return "Choose a project to start a session." }
+        return terminalControlAvailable
+            ? "Start the selected session in the active project"
+            : "Terminals are preparing. Try again in a moment."
+    }
+
     static func project(directory: URL?) -> OnboardingReadinessStatus {
         guard let directory else {
             return .init(
@@ -117,7 +127,7 @@ enum OnboardingReadiness {
 /// First-run setup is an operational checklist rather than a feature tour. It
 /// reflects the active project's real session-control and provider-account
 /// state, keeps failed checks actionable, and can launch the first session only
-/// when the project and terminal service are ready.
+/// when the project is chosen and terminals are ready.
 struct OnboardingView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: NativePreviewSettings
@@ -343,7 +353,10 @@ struct OnboardingView: View {
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
                 .disabled(!canStart)
-                .help(canStart ? "Start the selected session in the active project" : "Choose a project and reconnect first")
+                .help(OnboardingReadiness.firstSessionHelp(
+                    hasProject: model.currentProjectDirectory != nil,
+                    terminalControlAvailable: model.controlAvailable
+                ))
                 .fixedSize()
         }
         .padding(.horizontal, 24)

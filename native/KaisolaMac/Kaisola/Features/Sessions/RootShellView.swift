@@ -53,6 +53,62 @@ final class SettingsSheetUpdateCoordinator: ObservableObject {
     }
 }
 
+/// The terminal header is resolved from the terminal's own lifecycle and input
+/// authority so its icon and VoiceOver label always describe the same state.
+struct TerminalHeaderPresentation: Equatable {
+    enum Tone: Equatable {
+        case ready
+        case inactive
+    }
+
+    let systemImage: String
+    let accessibilityLabel: String
+    let tone: Tone
+
+    static func resolve(
+        exited: Bool,
+        authority: TerminalSurfaceAuthority,
+        inputDegraded: Bool = false
+    ) -> Self {
+        if exited {
+            return Self(
+                systemImage: "stop.circle.fill",
+                accessibilityLabel: "Session ended",
+                tone: .inactive
+            )
+        }
+
+        if inputDegraded {
+            return Self(
+                systemImage: "exclamationmark.triangle.fill",
+                accessibilityLabel: "Terminal input paused",
+                tone: .inactive
+            )
+        }
+
+        switch authority {
+        case .localController(active: true):
+            return Self(
+                systemImage: "checkmark.circle.fill",
+                accessibilityLabel: "Terminal ready",
+                tone: .ready
+            )
+        case .localController(active: false):
+            return Self(
+                systemImage: "clock.arrow.circlepath",
+                accessibilityLabel: "Terminal input retrying automatically",
+                tone: .inactive
+            )
+        case .observerOnly:
+            return Self(
+                systemImage: "eye",
+                accessibilityLabel: "Terminal controlled by another window or Companion",
+                tone: .inactive
+            )
+        }
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -1452,15 +1508,18 @@ struct RootShellView: View {
                 return
             }
             Task { @MainActor in
-                let terminalID = await model.createTerminal(inDirectory: directory)
+                let result = await model.createTerminalLaunch(inDirectory: directory)
                 let accepted = newSessionDrafts.finishLaunch(
                     projectID: draft.projectID,
                     launchID: launchID,
-                    succeeded: terminalID != nil
+                    succeeded: result.terminalID != nil,
+                    failureMessage: result.failureMessage
                 )
-                if accepted, terminalID == nil {
+                if accepted, result.terminalID == nil {
                     ToastCenter.shared.show(
-                        NewSessionChooserPresentation.launchFailureMessage,
+                        NewSessionChooserPresentation.launchFailureMessage(
+                            detail: result.failureMessage
+                        ),
                         style: .info
                     )
                 }
@@ -1483,15 +1542,18 @@ struct RootShellView: View {
                         launchID: launchID
                     )
                 },
-                completed: { terminalID in
+                completed: { result in
                     let accepted = newSessionDrafts.finishLaunch(
                         projectID: draft.projectID,
                         launchID: launchID,
-                        succeeded: terminalID != nil
+                        succeeded: result.terminalID != nil,
+                        failureMessage: result.failureMessage
                     )
-                    if accepted, terminalID == nil {
+                    if accepted, result.terminalID == nil {
                         ToastCenter.shared.show(
-                            NewSessionChooserPresentation.launchFailureMessage,
+                            NewSessionChooserPresentation.launchFailureMessage(
+                                detail: result.failureMessage
+                            ),
                             style: .info
                         )
                     }
@@ -1889,7 +1951,15 @@ struct RootShellView: View {
                     catalog: .live,
                     terminalControlAvailable: model.controlAvailable,
                     isLaunching: newSessionDrafts.isLaunching(projectID: draft.projectID),
-                    launchFailed: newSessionDrafts.didLastLaunchFail(projectID: draft.projectID),
+                    launchFailureMessage: NewSessionChooserPresentation
+                        .retainedLaunchFailureMessage(
+                            didFail: newSessionDrafts.didLastLaunchFail(
+                                projectID: draft.projectID
+                            ),
+                            detail: newSessionDrafts.lastLaunchFailureMessage(
+                                projectID: draft.projectID
+                            )
+                        ),
                     choose: { chooseNewSession($0, draft: draft) },
                     cancel: { cancelNewSession(draft.projectID) }
                 )
@@ -1903,8 +1973,6 @@ struct RootShellView: View {
 
     private var footer: some View {
         ConnectionFooter(
-            state: model.connectionState,
-            reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             attentionContext: { model.attentionContext(for: $0) },
             newMesh: { runCommand(.newMesh) },
@@ -1966,7 +2034,7 @@ struct RootShellView: View {
         model: AppModel,
         preferredDirectory: URL?,
         cancelled: @escaping @MainActor () -> Void,
-        completed: @escaping @MainActor (String?) -> Void
+        completed: @escaping @MainActor (AppModel.TerminalLaunchResult) -> Void
     ) {
         promptForRunOn(
             agent,
@@ -1975,12 +2043,12 @@ struct RootShellView: View {
             cancelled: cancelled
         ) { directory, profile in
             Task { @MainActor in
-                let terminalID = await model.createAgentSession(
+                let result = await model.createAgentSessionLaunch(
                     agent,
                     inDirectory: directory,
                     accountProfile: profile
                 )
-                completed(terminalID)
+                completed(result)
             }
         }
     }
@@ -2431,7 +2499,7 @@ struct RootShellView: View {
                 catalog: .live,
                 terminalControlAvailable: model.controlAvailable,
                 isLaunching: false,
-                launchFailed: false,
+                launchFailureMessage: nil,
                 showsCancel: false,
                 choose: { chooseNewSessionFromEmptyWorkspace($0, project: project) },
                 cancel: {}
@@ -2463,7 +2531,7 @@ struct RootShellView: View {
         } description: {
             Text(model.controlAvailable
                 ? "Start a terminal, agent, chat, or Mesh run for this project."
-                : "Chats and Mesh are ready. Saved terminals are view-only right now, so new terminals are temporarily unavailable.")
+                : "Chats and Mesh are ready. \(NewSessionChooserPresentation.terminalUnavailableReason)")
         } actions: {
             HStack(spacing: 10) {
                 Button {
@@ -2472,7 +2540,7 @@ struct RootShellView: View {
                     Label("New Terminal", systemImage: "terminal")
                 }
                 .disabled(!model.controlAvailable)
-                .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while saved sessions are view-only")
+                .help(model.controlAvailable ? "Open a shell in the active project" : NewSessionChooserPresentation.terminalUnavailableReason)
                 if let chatAgent {
                     Button {
                         runCommand(.newChat(chatAgent.id))
@@ -2786,15 +2854,23 @@ struct RootShellView: View {
                                 .accessibilityLabel(surfaceStatusLabel(id))
                         }
                     } else {
-                        Image(systemName: surfaceLive(id) ? "checkmark.circle.fill" : "circle.slash")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(
-                                surfaceLive(id)
-                                    ? KaisolaStatusTone.done.foregroundColor
-                                    : Color.kaisolaSecondary
-                            )
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel(surfaceStatusLabel(id))
+                        if let terminal = terminalHeaderPresentation(id) {
+                            Image(systemName: terminal.systemImage)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(terminalHeaderStatusColor(terminal))
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(terminal.accessibilityLabel)
+                        } else {
+                            Image(systemName: surfaceLive(id) ? "checkmark.circle.fill" : "circle.slash")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(
+                                    surfaceLive(id)
+                                        ? KaisolaStatusTone.done.foregroundColor
+                                        : Color.kaisolaSecondary
+                                )
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(surfaceStatusLabel(id))
+                        }
                     }
                     Spacer(minLength: 4)
                 }
@@ -3187,10 +3263,9 @@ struct RootShellView: View {
                         onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
-                // Live controller ownership may flap while the control socket
-                // reconnects. Keep the exact parsed view for durable local
-                // sessions and revoke its input capability in place; only a
-                // genuine observer/controller class change may remount.
+                // Local ownership can be temporarily unavailable. Keep the
+                // exact parsed view and revoke its input capability in place;
+                // only a genuine observer/controller class change may remount.
                 .id("unified-\(id)-\(authority.controllerCapable)")
                 .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
                 .onChange(of: model.keyboardFocusRequest) { _, _ in
@@ -3300,19 +3375,6 @@ struct RootShellView: View {
                 .accessibilityLabel("Pasting into \(surfaceTitle(id))")
                 .accessibilityValue("\(progress.sentBytes) of \(progress.totalBytes) bytes sent")
                 .accessibilityHint("Cancel stops chunks that have not started sending")
-            } else if case let .reconnecting(attempt) = model.connectionState {
-                Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.kaisolaSecondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.regularMaterial, in: Capsule())
-                    .overlay {
-                        Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
-                    }
-                    .padding(10)
-                    .accessibilityLabel("Reconnecting to \(surfaceTitle(id))")
-                    .accessibilityValue("Attempt \(attempt). Running terminals keep going in the background.")
             }
         }
     }
@@ -3371,23 +3433,33 @@ struct RootShellView: View {
         return false
     }
 
-    private func surfaceLive(_ id: String) -> Bool {
-        if let terminal = model.sessions.first(where: { $0.id == id }) {
-            return !terminal.exited && model.connectionState.isConnected
+    private func terminalHeaderPresentation(_ id: String) -> TerminalHeaderPresentation? {
+        guard let terminal = model.sessions.first(where: { $0.id == id }) else { return nil }
+        return TerminalHeaderPresentation.resolve(
+            exited: terminal.exited,
+            authority: TerminalSurfaceAuthority(
+                isOwned: model.isOwned(id),
+                hasDurableOwnership: model.canClose(id)
+            ),
+            inputDegraded: model.isTerminalInputDegraded(id)
+        )
+    }
+
+    private func terminalHeaderStatusColor(_ presentation: TerminalHeaderPresentation) -> Color {
+        switch presentation.tone {
+        case .ready: KaisolaStatusTone.done.foregroundColor
+        case .inactive: .kaisolaSecondary
         }
+    }
+
+    private func surfaceLive(_ id: String) -> Bool {
         if let chat = model.chats.first(where: { $0.id == id }) { return chat.conversation.isConnected }
         return model.meshes.contains(where: { $0.id == id })
     }
 
     private func surfaceStatusLabel(_ id: String) -> String {
-        if let terminal = model.sessions.first(where: { $0.id == id }) {
-            if terminal.exited { return "Session ended" }
-            switch model.connectionState {
-            case .reconnecting: return "Terminal reconnecting"
-            case .connected: return "Terminal live"
-            case .looking, .connecting: return "Terminal connecting"
-            case .unavailable: return "Terminal offline"
-            }
+        if let terminal = terminalHeaderPresentation(id) {
+            return terminal.accessibilityLabel
         }
         if let chat = model.chats.first(where: { $0.id == id }) {
             return chat.conversation.isConnected ? "Chat connected" : "Chat disconnected"
@@ -3863,8 +3935,8 @@ enum SidebarScrollPin {
     /// How long after the sidebar appears the list is held at its top.
     ///
     /// Long enough to cover the row-diff batches a restored workspace produces
-    /// (measured: the first compensation lands between 0.5s and 1.0s, and a
-    /// broker reconnect can add more), short enough that it can never be
+    /// (measured: the first compensation lands between 0.5s and 1.0s, and
+    /// restored terminal state can add more), short enough that it can never be
     /// confused with owning the scroll position. Any deliberate scroll ends it
     /// early — see `SidebarScrollTopPin`.
     static let pinDuration: TimeInterval = 3.0
@@ -6052,11 +6124,94 @@ struct RunOnPickerSelection: Equatable, Sendable {
     let accountProfileID: String?
 }
 
+/// The account menu's visible contract. Keeping the rows as values makes the
+/// shipping menu and its diagnostics use the same presentation decisions.
+struct ConnectionFooterPresentation: Equatable {
+    enum SectionID: String, Hashable {
+        case authentication
+        case destinations
+        case about
+    }
+
+    enum Action: String, Hashable {
+        case signInWithGoogle
+        case signOut
+        case settings
+        case usage
+        case copyDiagnostics
+
+        var title: String {
+            switch self {
+            case .signInWithGoogle: "Sign In with Google"
+            case .signOut: "Sign Out"
+            case .settings: "Settings…"
+            case .usage: "Usage…"
+            case .copyDiagnostics: "Copy Diagnostics"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .signInWithGoogle: "person.crop.circle.badge.plus"
+            case .signOut: "rectangle.portrait.and.arrow.right"
+            case .settings: "gearshape"
+            case .usage: "gauge.with.dots.needle.bottom.50percent"
+            case .copyDiagnostics: "doc.on.doc"
+            }
+        }
+    }
+
+    enum Row: Hashable, Identifiable {
+        case action(Action)
+
+        var id: String {
+            switch self {
+            case let .action(action): "action:\(action.rawValue)"
+            }
+        }
+    }
+
+    struct Section: Equatable, Identifiable {
+        let id: SectionID
+        let title: String?
+        let rows: [Row]
+    }
+
+    let sections: [Section]
+    let diagnosticLines: [String]
+
+    init(
+        accountName: String?,
+        appVersion: String
+    ) {
+        sections = [
+            Section(
+                id: .authentication,
+                title: accountName,
+                rows: [.action(accountName == nil ? .signInWithGoogle : .signOut)]
+            ),
+            Section(
+                id: .destinations,
+                title: nil,
+                rows: [.action(.settings), .action(.usage)]
+            ),
+            Section(
+                id: .about,
+                title: "Kaisola v\(appVersion)",
+                rows: [.action(.copyDiagnostics)]
+            ),
+        ]
+        diagnosticLines = ["Kaisola \(appVersion)"]
+    }
+
+    static func attentionInboxIsPresented(afterActivating isPresented: Bool) -> Bool {
+        !isPresented
+    }
+}
+
 
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
-    let state: AppModel.ConnectionState
-    let reload: () -> Void
     var jumpToAttention: ((String) -> Void)?
     /// Resolves an inbox target to its project and liveness at render time —
     /// see `AttentionInboxModel`. Nil (previews, fixtures) renders the flat
@@ -6099,7 +6254,6 @@ private struct ConnectionFooter: View {
     var body: some View {
         HStack(spacing: FooterAccountBudget.gap) {
             accountMenu
-                .help(state.detail ?? state.title)
             usageChip
             settingsButton
             attentionButton
@@ -6188,6 +6342,13 @@ private struct ConnectionFooter: View {
         return account.displayName ?? account.email
     }
 
+    private var presentation: ConnectionFooterPresentation {
+        ConnectionFooterPresentation(
+            accountName: auth.account.map { $0.displayName ?? $0.email },
+            appVersion: Self.appVersion
+        )
+    }
+
     /// What the compact chip draws; see `FooterAccountName`.
     private var displayedAccountName: String {
         FooterAccountName.displayed(accountName)
@@ -6196,9 +6357,7 @@ private struct ConnectionFooter: View {
     /// The tooltip leads with the whole name whenever the chip is showing less
     /// than all of it, so the first-name label is never the only copy on screen.
     private var accountHelp: String {
-        let base = state.isConnected
-            ? "Account and project settings"
-            : "Connection needs attention — account and project settings"
+        let base = "Account and project settings"
         return displayedAccountName == accountName ? base : "\(accountName) — \(base)"
     }
 
@@ -6269,15 +6428,11 @@ private struct ConnectionFooter: View {
     /// actions. Lines that say nothing are no longer said.
     /// Everything the menu used to print, on the clipboard instead.
     ///
-    /// The version and connection detail are genuinely useful — they are the
-    /// first thing anyone asks for when terminals misbehave — they were just
-    /// useful in the wrong place. One item collects them in a form that can
-    /// be pasted into an issue, which the menu rows never could.
+    /// The version and available usage detail remain useful when reporting a
+    /// problem. One item collects them in a form that can be pasted into an
+    /// issue, which the menu rows never could.
     private func copyDiagnostics() {
-        var lines = ["Kaisola \(Self.appVersion)", "Connection: \(state.title)"]
-        if let detail = state.detail, !detail.isEmpty {
-            lines.append("  \(detail)")
-        }
+        var lines = presentation.diagnosticLines
         if usage.totalPeakTokens > 0 {
             lines.append(
                 "Usage: \(usage.totalPeakTokens / 1000)k tokens · "
@@ -6291,45 +6446,15 @@ private struct ConnectionFooter: View {
 
     private var accountMenu: some View {
         Menu {
-            if let account = auth.account {
-                Section(account.displayName ?? account.email) {
-                    Button {
-                        Task { await auth.signOut() }
-                    } label: {
-                        Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+            ForEach(presentation.sections) { section in
+                if let title = section.title {
+                    Section(title) {
+                        accountMenuRows(section.rows)
                     }
-                }
-            } else {
-                Button {
-                    Task { await auth.signInWithGoogle() }
-                } label: {
-                    Label("Sign In with Google", systemImage: "person.crop.circle.badge.plus")
-                }
-                .disabled(accountSignInIsRunning)
-            }
-            Section {
-                Button(action: showSettings) {
-                    Label("Settings…", systemImage: "gearshape")
-                }
-                Button(action: showUsage) {
-                    Label("Usage…", systemImage: "gauge.with.dots.needle.bottom.50percent")
-                }
-            }
-            Section {
-                Button(action: reload) {
-                    Label("Reconnect", systemImage: "arrow.clockwise")
-                }
-            }
-            // Status, in at most one short sentence, and a way to get the rest.
-            //
-            // This section used to print the connection detail and a usage
-            // tally in bare rows that read as disabled commands. None of it is
-            // lost: `copyDiagnostics` puts every string on the clipboard, in
-            // full, which is the form anyone reporting a bug wanted anyway.
-            Section("Kaisola v\(Self.appVersion)") {
-                Text(state.title)
-                Button(action: copyDiagnostics) {
-                    Label("Copy Diagnostics", systemImage: "doc.on.doc")
+                } else {
+                    Section {
+                        accountMenuRows(section.rows)
+                    }
                 }
             }
         } label: {
@@ -6365,26 +6490,40 @@ private struct ConnectionFooter: View {
         // dimensions and drops its SwiftUI mask when the image finishes loading.
         .overlay(alignment: .leading) {
             AccountAvatarView(account: auth.account, size: FooterAccountBudget.avatarSize)
-                .overlay(alignment: .bottomTrailing) {
-                    // Connected is the silent default; only a broken connection
-                    // earns a labelled-shape mark. The old orange dot was both
-                    // low contrast and colour-only.
-                    if !state.isConnected {
-                        KaisolaStatusGlyph(
-                            systemImage: "exclamationmark",
-                            tone: .needsYou,
-                            size: 11
-                        )
-                    }
-                }
                 .allowsHitTesting(false)
         }
         .help(accountHelp)
-        .accessibilityLabel(
-            state.isConnected
-                ? "Kaisola account and settings"
-                : "Kaisola account and settings, connection needs attention"
-        )
+        .accessibilityLabel("Kaisola account and settings")
+    }
+
+    @ViewBuilder
+    private func accountMenuRows(_ rows: [ConnectionFooterPresentation.Row]) -> some View {
+        ForEach(rows) { row in
+            switch row {
+            case let .action(action):
+                Button {
+                    performAccountMenuAction(action)
+                } label: {
+                    Label(action.title, systemImage: action.systemImage)
+                }
+                .disabled(action == .signInWithGoogle && accountSignInIsRunning)
+            }
+        }
+    }
+
+    private func performAccountMenuAction(_ action: ConnectionFooterPresentation.Action) {
+        switch action {
+        case .signInWithGoogle:
+            Task { await auth.signInWithGoogle() }
+        case .signOut:
+            Task { await auth.signOut() }
+        case .settings:
+            showSettings()
+        case .usage:
+            showUsage()
+        case .copyDiagnostics:
+            copyDiagnostics()
+        }
     }
 
     /// Inbox row glyphs. Exhaustive on purpose: a new `AttentionCenter.Kind`
@@ -6415,7 +6554,9 @@ private struct ConnectionFooter: View {
         // inbox reads empty.
         let needsYou = attention.count > 0 || !attention.storageNotices.isEmpty
         return Button {
-            showInbox.toggle()
+            showInbox = ConnectionFooterPresentation.attentionInboxIsPresented(
+                afterActivating: showInbox
+            )
         } label: {
             Image(systemName: needsYou ? "bell.badge.fill" : "bell")
                 .font(.system(size: 14, weight: .medium))

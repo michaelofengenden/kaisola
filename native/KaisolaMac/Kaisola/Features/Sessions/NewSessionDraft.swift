@@ -11,10 +11,15 @@ struct NewSessionDraft: Identifiable, Equatable, Sendable {
 /// draft apiece so repeated presses focus the existing choice instead of
 /// accumulating empty tabs.
 struct NewSessionDraftState: Equatable, Sendable {
+    private struct LaunchFailure: Equatable, Sendable {
+        let draftID: String
+        let message: String?
+    }
+
     private(set) var draftsByProject: [String: NewSessionDraft] = [:]
     private(set) var selectedDraftID: String?
     private var launchingDraftIDsByProject: [String: String] = [:]
-    private var failedLaunchDraftIDsByProject: [String: String] = [:]
+    private var launchFailuresByProject: [String: LaunchFailure] = [:]
 
     var selectedDraft: NewSessionDraft? {
         guard let selectedDraftID else { return nil }
@@ -57,7 +62,14 @@ struct NewSessionDraftState: Equatable, Sendable {
 
     func didLastLaunchFail(projectID: String) -> Bool {
         guard let draft = draftsByProject[projectID] else { return false }
-        return failedLaunchDraftIDsByProject[projectID] == draft.id
+        return launchFailuresByProject[projectID]?.draftID == draft.id
+    }
+
+    func lastLaunchFailureMessage(projectID: String) -> String? {
+        guard let draft = draftsByProject[projectID],
+              let failure = launchFailuresByProject[projectID],
+              failure.draftID == draft.id else { return nil }
+        return failure.message
     }
 
     /// A click starts work but does not consume the draft. The chooser remains
@@ -67,7 +79,7 @@ struct NewSessionDraftState: Equatable, Sendable {
         guard let draft = draftsByProject[projectID],
               launchingDraftIDsByProject[projectID] == nil else { return nil }
         launchingDraftIDsByProject[projectID] = draft.id
-        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
+        launchFailuresByProject.removeValue(forKey: projectID)
         selectedDraftID = draft.id
         return draft.id
     }
@@ -76,7 +88,8 @@ struct NewSessionDraftState: Equatable, Sendable {
     mutating func finishLaunch(
         projectID: String,
         launchID: String,
-        succeeded: Bool
+        succeeded: Bool,
+        failureMessage: String? = nil
     ) -> Bool {
         guard draftsByProject[projectID]?.id == launchID,
               launchingDraftIDsByProject[projectID] == launchID else { return false }
@@ -84,7 +97,12 @@ struct NewSessionDraftState: Equatable, Sendable {
         if succeeded {
             remove(projectID: projectID)
         } else {
-            failedLaunchDraftIDsByProject[projectID] = launchID
+            let normalizedMessage = failureMessage?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            launchFailuresByProject[projectID] = LaunchFailure(
+                draftID: launchID,
+                message: normalizedMessage.flatMap { $0.isEmpty ? nil : $0 }
+            )
         }
         return true
     }
@@ -95,7 +113,7 @@ struct NewSessionDraftState: Equatable, Sendable {
         guard draftsByProject[projectID]?.id == launchID,
               launchingDraftIDsByProject[projectID] == launchID else { return }
         launchingDraftIDsByProject.removeValue(forKey: projectID)
-        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
+        launchFailuresByProject.removeValue(forKey: projectID)
     }
 
     mutating func cancel(projectID: String) {
@@ -112,7 +130,7 @@ struct NewSessionDraftState: Equatable, Sendable {
         launchingDraftIDsByProject = launchingDraftIDsByProject.filter {
             projectIDs.contains($0.key)
         }
-        failedLaunchDraftIDsByProject = failedLaunchDraftIDsByProject.filter {
+        launchFailuresByProject = launchFailuresByProject.filter {
             projectIDs.contains($0.key)
         }
         if selectedDraft == nil {
@@ -122,7 +140,7 @@ struct NewSessionDraftState: Equatable, Sendable {
 
     private mutating func remove(projectID: String) {
         launchingDraftIDsByProject.removeValue(forKey: projectID)
-        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
+        launchFailuresByProject.removeValue(forKey: projectID)
         guard let removed = draftsByProject.removeValue(forKey: projectID) else { return }
         if selectedDraftID == removed.id {
             selectedDraftID = nil

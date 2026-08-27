@@ -49,6 +49,21 @@ final class AppModel: ObservableObject {
         let message: String
     }
 
+    enum TerminalLaunchResult: Equatable, Sendable {
+        case launched(String)
+        case failed(String)
+
+        var terminalID: String? {
+            guard case let .launched(terminalID) = self else { return nil }
+            return terminalID
+        }
+
+        var failureMessage: String? {
+            guard case let .failed(message) = self else { return nil }
+            return message
+        }
+    }
+
     struct TerminalTranscriptContext: Identifiable, Equatable, Sendable {
         let id: String
         let title: String
@@ -377,9 +392,21 @@ final class AppModel: ObservableObject {
     private var terminalPasteGenerationByTerminalID: [String: UInt64] = [:]
     @Published private(set) var terminalPasteProgressByTerminalID: [String: TerminalPasteProgress] = [:]
     static let terminalInputDiscardNoticeSuffix =
-        ": unsent input was discarded. Try again after input reconnects."
+        ": unsent input was discarded. Try again when input is available."
     static let terminalInputDiscardAggregateNotice =
-        "Unsent input was discarded after terminal control changed. Try again after input reconnects."
+        "Unsent input was discarded after terminal control changed. Try again when input is available."
+    static let terminalCreationUnavailableMessage =
+        "Terminals are preparing. Try again in a moment. Chats and Mesh are available now."
+    static func terminalInputFailureMessage(scopedToTerminal: Bool) -> String {
+        scopedToTerminal
+            ? "Input paused for this terminal because the last write could not be confirmed. Choose Resume input to revalidate this terminal."
+            : "Input is temporarily unavailable for this terminal. Kaisola retries automatically."
+    }
+    static func terminalAttachRefusalMessage(count: Int) -> String {
+        "Another window or Companion controls input for \(count) terminal\(count == 1 ? "" : "s"). Kaisola retries automatically."
+    }
+    nonisolated static let terminalObserverFallbackMessage =
+        "The terminal engine could not complete the operation. Existing terminals were left unchanged."
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
     /// Terminals whose open agent turn the broker acknowledged. Local activity
     /// state only advances on a positive `terminal.agentTurn` reply, so the app
@@ -659,14 +686,17 @@ final class AppModel: ObservableObject {
 
     /// Turns a relaunch would abort, across every project in this window.
     ///
-    /// Terminals are deliberately excluded: native-created terminals live in the
-    /// detached broker and survive app quit, relaunch, and update, resuming from
-    /// their exact byte cursor. ACP chats and Mesh columns are in-process child
-    /// processes that `teardown()` stops, so those are the only turns a restart
-    /// actually interrupts. Kept cheap and separate from `projects`, which
-    /// regroups and sorts everything.
+    /// A working terminal is included because relaunch ends its in-process PTY;
+    /// restoring the pane as a fresh shell does not preserve the running command
+    /// or agent turn. Kept cheap and separate from `projects`, which regroups and
+    /// sorts everything.
     var interruptibleTurnCount: Int {
-        chats.filter(\.conversation.isRunning).count
+        sessions.filter { terminal in
+            guard !terminal.exited else { return false }
+            if case .working = terminal.agentActivity { return true }
+            return false
+        }.count
+            + chats.filter(\.conversation.isRunning).count
             + meshes.reduce(into: 0) { count, mesh in
                 count += mesh.columns.filter(\.conversation.isRunning).count
             }
@@ -6304,6 +6334,14 @@ final class AppModel: ObservableObject {
     /// Creates a plain shell the native app owns in the given directory.
     @discardableResult
     func createTerminal(inDirectory directory: URL) async -> String? {
+        (await createTerminalLaunch(inDirectory: directory)).terminalID
+    }
+
+    /// Request-scoped terminal creation result. Unlike `terminalDocument`, the
+    /// failure belongs to this exact launch even if another terminal publishes
+    /// output while the engine request is suspended.
+    @discardableResult
+    func createTerminalLaunch(inDirectory directory: URL) async -> TerminalLaunchResult {
         await createOwnedSession(inDirectory: directory, agent: nil)
     }
 
@@ -6316,6 +6354,19 @@ final class AppModel: ObservableObject {
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil
     ) async -> String? {
+        (await createAgentSessionLaunch(
+            agent,
+            inDirectory: directory,
+            accountProfile: accountProfile
+        )).terminalID
+    }
+
+    @discardableResult
+    func createAgentSessionLaunch(
+        _ agent: AgentProfile,
+        inDirectory directory: URL,
+        accountProfile: UsageAccountProfile? = nil
+    ) async -> TerminalLaunchResult {
         await createOwnedSession(
             inDirectory: directory,
             agent: agent,
@@ -6323,13 +6374,13 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// Registers a durable owned session and selects it. The PTY lives on the
-    /// broker, so it survives this app quitting, updating, or crashing exactly
-    /// like Electron's do. An agent session boots its CLI via a login shell so
-    /// the user's PATH and CLI config apply.
-    /// Returns the created terminal's id on success, nil on failure — so a
-    /// caller (e.g. a Quick Action) can target exactly the shell it spawned
-    /// rather than racing the shared `selectedSessionID`.
+    /// Registers an owned session and selects it. The terminal runs in Kaisola;
+    /// its saved record keeps the working folder, title, and agent choice so a
+    /// fresh shell can reopen after relaunch. An agent session boots its CLI via
+    /// a login shell so the user's PATH and CLI config apply.
+    /// Returns a request-scoped result so a caller can target exactly the shell
+    /// it spawned, or present the matching failure, without racing shared
+    /// selection or terminal-document state.
     @discardableResult
     private func createOwnedSession(
         inDirectory directory: URL,
@@ -6343,16 +6394,14 @@ final class AppModel: ObservableObject {
         restore: Bool = false,
         select: Bool = true,
         environmentBinding: SessionAccountBinding? = nil
-    ) async -> String? {
+    ) async -> TerminalLaunchResult {
         guard controlAvailable, connectionState.isConnected else {
             // Never fail silently: say WHY sessions can't be created here.
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
-                message: connectionState.isConnected
-                    ? "This terminal service is view-only right now, so new terminals are disabled. Chats and Mesh still work — they don't need it."
-                    : "Kaisola isn't connected to saved terminal sessions, so new terminals are disabled. Chats and Mesh still work without that connection."
+                message: Self.terminalCreationUnavailableMessage
             ))
-            return nil
+            return .failed(Self.terminalCreationUnavailableMessage)
         }
         let cwd = directory.path
         let projectID = NativeSessionStore.projectID(forDirectory: cwd)
@@ -6368,14 +6417,20 @@ final class AppModel: ObservableObject {
         // Account isolation (custom CLAUDE_CONFIG_DIR / CODEX_HOME) rides in
         // as exported variables ahead of the CLI. Per-project overrides win
         // over the app-wide setting, key by key.
-        guard var overlay = projectAccountOverlay(forProject: projectID) else { return nil }
+        guard var overlay = projectAccountOverlay(forProject: projectID) else {
+            return .failed(
+                projectAccountRecoveryCenter.issue?.summary
+                    ?? "Kaisola could not read this project's account settings."
+            )
+        }
         let accountBinding: SessionAccountBinding?
         if let agent, SessionAccountBinding.provider(forAgentID: agent.id) != nil {
             if let lockedAccountBinding {
                 guard lockedAccountBinding.normalized?.provider
                     == SessionAccountBinding.provider(forAgentID: agent.id) else {
-                    ToastCenter.shared.show("The saved account does not match \(agent.name).", style: .error)
-                    return nil
+                    let message = "The saved account does not match \(agent.name)."
+                    ToastCenter.shared.show(message, style: .error)
+                    return .failed(message)
                 }
                 accountBinding = lockedAccountBinding.normalized
             } else {
@@ -6385,8 +6440,9 @@ final class AppModel: ObservableObject {
                     fallbackEnvironment: ProcessInfo.processInfo.environment
                         .merging(overlay) { _, configured in configured }
                 ) else {
-                    ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
-                    return nil
+                    let message = "That account does not match \(agent.name)."
+                    ToastCenter.shared.show(message, style: .error)
+                    return .failed(message)
                 }
                 accountBinding = resolved
             }
@@ -6489,7 +6545,7 @@ final class AppModel: ObservableObject {
                 )
                 refreshPersistedNavigationState(publish: false)
                 Task { [weak self] in await self?.refreshInventory() }
-                return terminalID
+                return .launched(terminalID)
             }
             // Ensure the session's folder is a persistent project tab — but
             // never on the resurrection path: a respawn must not re-open a
@@ -6528,10 +6584,11 @@ final class AppModel: ObservableObject {
                 armTerminalDraftRestore(draftRestoreSeed, terminalID: terminalID)
             }
             Task { [weak self] in await self?.refreshInventory() }
-            return terminalID
+            return .launched(terminalID)
         } catch {
-            publishPrimaryDocument(.failure(sessionID: terminalID, message: error.kaisolaSafeDescription))
-            return nil
+            let message = error.kaisolaSafeDescription
+            publishPrimaryDocument(.failure(sessionID: terminalID, message: message))
+            return .failed(message)
         }
     }
 
@@ -7179,9 +7236,7 @@ final class AppModel: ObservableObject {
            now.timeIntervalSince(last) < 2 { return }
         terminalInputFailureNoticeAt[terminalID] = now
         ToastCenter.shared.show(
-            scopedToTerminal
-                ? "Input paused for this terminal; the last write could not be confirmed. Other sessions remain connected."
-                : "Terminal connection is recovering; input was not sent",
+            Self.terminalInputFailureMessage(scopedToTerminal: scopedToTerminal),
             style: .error,
             duration: 4
         )
@@ -7595,14 +7650,14 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        return await createOwnedSession(
+        return (await createOwnedSession(
             inDirectory: directory,
             agent: agent,
             lockedAccountBinding: closed.accountBinding,
             resumeAgent: agent?.resumeCommand != nil,
             titleOverride: closed.title,
             draftRestoreSeed: draftSeed
-        )
+        )).terminalID
     }
 
     var hasClosedSessions: Bool { !sessionStore.closedSessions().isEmpty }
@@ -7826,9 +7881,7 @@ final class AppModel: ObservableObject {
         dormantTerminalIDs = dormant
         if attachRefusals > 0 {
             ToastCenter.shared.show(
-                attachRefusals == 1
-                    ? "1 terminal is read-only — another window or a stale connection holds its input. Reload to retry."
-                    : "\(attachRefusals) terminals are read-only — another window or a stale connection holds their input. Reload to retry.",
+                Self.terminalAttachRefusalMessage(count: attachRefusals),
                 style: .error
             )
         }
@@ -7898,7 +7951,7 @@ final class AppModel: ObservableObject {
     /// UI is up; failures leave the pane dormant for the next attempt.
     func resurrectDormantTerminals() async {
         guard controlAvailable, !dormantTerminalIDs.isEmpty else { return }
-        // One sweep at a time: reload, reconnect, and launch can all schedule
+        // One sweep at a time: startup, automatic recovery, and launch can all schedule
         // this, and two overlapping sweeps could double-spawn the same id.
         guard !resurrectionSweepInFlight else { return }
         resurrectionSweepInFlight = true
@@ -7946,7 +7999,7 @@ final class AppModel: ObservableObject {
                 dormantTerminalIDs.remove(stored.id)
                 continue
             }
-            guard created == stored.id else { continue }
+            guard created.terminalID == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)
             // A restore can resolve to a COLD record (the terminal had ended
             // before the reboot): the fresh store record carries endedAt, and
@@ -9699,6 +9752,6 @@ private extension Error {
         if let localized = self as? LocalizedError, let description = localized.errorDescription {
             return description
         }
-        return "The terminal observer could not connect. Everything already running was left untouched."
+        return AppModel.terminalObserverFallbackMessage
     }
 }

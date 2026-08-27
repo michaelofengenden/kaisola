@@ -22,7 +22,7 @@ final class NewSessionChooserTests: XCTestCase {
         XCTAssertFalse(options[1].isEnabled)
         XCTAssertTrue(options[2].isEnabled)
         XCTAssertTrue(options[3].isEnabled)
-        XCTAssertEqual(options[0].disabledReason, "Saved terminals are view-only right now.")
+        XCTAssertEqual(options[0].disabledReason, "Terminals are preparing. Try again in a moment.")
     }
 
     func testAvailableTerminalChoicesEnableWhenControlReturns() {
@@ -85,10 +85,40 @@ final class NewSessionChooserTests: XCTestCase {
         ))
     }
 
-    func testLaunchFailureCopyNamesTheTwoRecoveryChecks() {
+    func testLaunchFailureCopyDoesNotInventAFolderDiagnosis() {
         XCTAssertEqual(
             NewSessionChooserPresentation.launchFailureMessage,
-            "Session did not start. Check the terminal connection or Run On choice, then try again."
+            "Session did not start. Review the error and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.launchFailureMessage(
+                detail: "Terminal limit reached. Close a terminal and try again."
+            ),
+            "Terminal limit reached. Close a terminal and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.launchFailureMessage(detail: "  "),
+            "Session did not start. Review the error and try again."
+        )
+        XCTAssertNil(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: false,
+                detail: "A stale error"
+            )
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: true,
+                detail: "Kaisola already has its limit of 8 terminals open. Close one and try again."
+            ),
+            "Kaisola already has its limit of 8 terminals open. Close one and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.retainedLaunchFailureMessage(
+                didFail: true,
+                detail: nil
+            ),
+            "Session did not start. Review the error and try again."
         )
     }
 

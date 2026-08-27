@@ -212,6 +212,69 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(RootShellView.shouldAutomaticallyRefreshPlanUsage(environment: [:]))
     }
 
+    func testConnectionFooterPresentationKeepsSignedInAccountDestinationsAndDiagnostics() {
+        let presentation = ConnectionFooterPresentation(
+            accountName: "Michael Ofengenden",
+            appVersion: "0.1.142"
+        )
+
+        XCTAssertEqual(
+            presentation.sections,
+            [
+                .init(
+                    id: .authentication,
+                    title: "Michael Ofengenden",
+                    rows: [.action(.signOut)]
+                ),
+                .init(
+                    id: .destinations,
+                    title: nil,
+                    rows: [.action(.settings), .action(.usage)]
+                ),
+                .init(
+                    id: .about,
+                    title: "Kaisola v0.1.142",
+                    rows: [.action(.copyDiagnostics)]
+                ),
+            ]
+        )
+        XCTAssertEqual(presentation.diagnosticLines, ["Kaisola 0.1.142"])
+    }
+
+    func testConnectionFooterPresentationKeepsSignedOutAuthenticationAndDestinations() {
+        let presentation = ConnectionFooterPresentation(
+            accountName: nil,
+            appVersion: "Dev"
+        )
+
+        XCTAssertEqual(
+            presentation.sections,
+            [
+                .init(
+                    id: .authentication,
+                    title: nil,
+                    rows: [.action(.signInWithGoogle)]
+                ),
+                .init(
+                    id: .destinations,
+                    title: nil,
+                    rows: [.action(.settings), .action(.usage)]
+                ),
+                .init(
+                    id: .about,
+                    title: "Kaisola vDev",
+                    rows: [.action(.copyDiagnostics)]
+                ),
+            ]
+        )
+        XCTAssertEqual(presentation.diagnosticLines, ["Kaisola Dev"])
+    }
+
+    func testConnectionFooterNotificationsControlStillTogglesItsInbox() {
+        XCTAssertTrue(ConnectionFooterPresentation.attentionInboxIsPresented(afterActivating: false))
+        XCTAssertFalse(ConnectionFooterPresentation.attentionInboxIsPresented(afterActivating: true))
+    }
+
     func testApplicationTerminationDrainHasABoundedDeadline() {
         XCTAssertEqual(
             KaisolaMacAppDelegate.terminationDrainDeadlineNanoseconds,

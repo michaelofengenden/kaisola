@@ -500,6 +500,21 @@ final class NativeUpdateConfigurationTests: XCTestCase {
         )
     }
 
+    func testRestartWarningNamesAllInterruptibleSessionKinds() {
+        XCTAssertEqual(
+            SettingsView.softwareUpdateRestartWarning(interruptibleTurnCount: 0),
+            "Open terminal sessions will close. Chats reconnect automatically."
+        )
+        XCTAssertEqual(
+            SettingsView.softwareUpdateRestartWarning(interruptibleTurnCount: 1),
+            "1 session is mid-turn and will be interrupted. Open terminal sessions will close. Chats reconnect automatically."
+        )
+        XCTAssertEqual(
+            SettingsView.softwareUpdateRestartWarning(interruptibleTurnCount: 2),
+            "2 sessions are mid-turn and will be interrupted. Open terminal sessions will close. Chats reconnect automatically."
+        )
+    }
+
     private func makeUpdateTestWindow() -> NSWindow {
         NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),

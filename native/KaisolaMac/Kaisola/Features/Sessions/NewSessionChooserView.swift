@@ -18,9 +18,23 @@ struct NewSessionPrimaryOption: Identifiable, Equatable, Sendable {
 }
 
 enum NewSessionChooserPresentation {
-    static let terminalUnavailableReason = "Saved terminals are view-only right now."
+    static let terminalUnavailableReason = "Terminals are preparing. Try again in a moment."
     static let launchFailureMessage =
-        "Session did not start. Check the terminal connection or Run On choice, then try again."
+        "Session did not start. Review the error and try again."
+
+    static func launchFailureMessage(detail: String?) -> String {
+        guard let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty else { return launchFailureMessage }
+        return detail
+    }
+
+    static func retainedLaunchFailureMessage(
+        didFail: Bool,
+        detail: String?
+    ) -> String? {
+        guard didFail else { return nil }
+        return launchFailureMessage(detail: detail)
+    }
 
     static func terminalRowsEnabled(
         terminalControlAvailable: Bool,
@@ -83,13 +97,13 @@ enum NewSessionChooserPresentation {
 
 /// A temporary session tab becomes a real surface only after one of these
 /// choices is made. Until then this view owns presentation only and starts no
-/// process or broker work.
+/// process or terminal work.
 struct NewSessionChooserView: View {
     let projectName: String
     let catalog: NewSessionChoiceCatalog
     let terminalControlAvailable: Bool
     let isLaunching: Bool
-    let launchFailed: Bool
+    let launchFailureMessage: String?
     var showsCancel = true
     let choose: (NewSessionChoice) -> Void
     let cancel: () -> Void
@@ -154,9 +168,9 @@ struct NewSessionChooserView: View {
                         .controlSize(.small)
                     Text("Starting session…")
                         .foregroundStyle(.kaisolaSecondary)
-                } else if launchFailed {
+                } else if let launchFailureMessage {
                     Label {
-                        Text(NewSessionChooserPresentation.launchFailureMessage)
+                        Text(launchFailureMessage)
                             .foregroundStyle(.kaisolaPrimary)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")

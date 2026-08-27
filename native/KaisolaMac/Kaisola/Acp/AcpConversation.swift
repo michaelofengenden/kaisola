@@ -694,6 +694,9 @@ final class AcpConversation: ObservableObject {
                 cwd: launch.cwd,
                 mcpServers: mcpServers,
                 resumeSessionID: providerSessionID ?? resumeSessionID,
+                // Persisted rows already render the history, so the connect
+                // can take the replay-free resume path when it is offered.
+                hasLocalTranscript: !rows.isEmpty,
                 access: launch.access,
                 runProfile: runProfile
             )

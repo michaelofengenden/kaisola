@@ -180,6 +180,7 @@ final class AcpAttachmentsTests: XCTestCase {
         XCTAssertEqual(middle.attachments, [])
     }
 
+    @MainActor
     func testAttachmentChipGlyphJudgesByExtension() {
         XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "Dropped image.png"), "photo")
         XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "photo.HEIC"), "photo")

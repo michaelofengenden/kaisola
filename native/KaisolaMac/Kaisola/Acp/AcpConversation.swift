@@ -1112,6 +1112,20 @@ final class AcpConversation: ObservableObject {
         return text + "\n📎 " + label
     }
 
+    /// The exact inverse of `userText`, for presentation. The suffix format is
+    /// pinned by tests and lives in persisted rows and the adapter echo ledger,
+    /// so the bubble parses names back out rather than the row changing shape:
+    /// attachments render as chips above the prompt, not as a trailing line.
+    nonisolated static func userTextParts(_ text: String) -> (body: String, attachments: [String]) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let last = lines.last, last.hasPrefix("📎 ") else { return (text, []) }
+        let names = last.dropFirst("📎 ".count)
+            .split(separator: ", ", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard !names.isEmpty else { return (text, []) }
+        return (lines.dropLast().joined(separator: "\n"), names)
+    }
+
     private func dispatch(_ trimmed: String, attachments: [AcpAttachment] = []) {
         turnCounter += 1
         statusMessage = nil

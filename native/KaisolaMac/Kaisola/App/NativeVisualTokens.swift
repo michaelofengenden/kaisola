@@ -199,6 +199,14 @@ enum LightGlassFrost {
     /// spending a point of wallpaper transmission. The ceiling is ~0.87 —
     /// past it the dark warmth overlay (which divides by this value) falls
     /// through its measured floor.
+    ///
+    /// The fourth round of the same report was a white desktop, and no value
+    /// of this constant can fix that one: any shared destination under white
+    /// is grey. It is therefore the **floor** the light bake lifts dim stills
+    /// onto, while a still already brighter passes through at its own
+    /// lightness — see `DesktopBackdropRenderer.solveToneMap`. Everything
+    /// priced against this number (veil arithmetic, warmth, ink floors) keeps
+    /// it as the worst case, which brighter stills only improve on.
     static let backdropLuminance: Double = 0.85
 
     /// The workspace is a white-led plane the desktop still shines through.

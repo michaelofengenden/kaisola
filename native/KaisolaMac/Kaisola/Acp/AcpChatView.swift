@@ -1491,6 +1491,43 @@ struct HarnessNoticeRow: View {
     }
 }
 
+/// The sent message's files, as small figures leading the bubble. Names come
+/// back out of the row's pinned "📎" suffix via `userTextParts`; the glyph is
+/// judged from the extension because the row deliberately stores only names.
+struct AcpUserAttachmentChips: View {
+    let names: [String]
+
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "bmp",
+    ]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(names, id: \.self) { name in
+                HStack(spacing: 4) {
+                    Image(systemName: Self.glyph(for: name))
+                        .accessibilityHidden(true)
+                    Text(name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.5), in: Capsule())
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Attached \(name)")
+            }
+        }
+    }
+
+    static func glyph(for name: String) -> String {
+        let ext = (name as NSString).pathExtension.lowercased()
+        return imageExtensions.contains(ext) ? "photo" : "doc.text"
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -1539,21 +1576,35 @@ struct TranscriptRowView: View {
                 // Capped, not guttered: the old 40pt gutter turned a message
                 // on a wide pane into a full-width band. The bubble hugs its
                 // text up to the cap and wraps past it.
-                Text(text)
-                    .padding(.horizontal, AcpBubble.horizontalPadding)
-                    .padding(.vertical, AcpBubble.verticalPadding)
-                    .background(
-                        failed ? Color.red.opacity(0.12) : AcpBubble.userFill,
-                        in: RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
-                    )
-                    .overlay {
-                        if failed {
-                            RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
-                                .strokeBorder(.red.opacity(0.5))
-                        }
+                //
+                // Attachments lead. The stored text keeps its pinned trailing
+                // "📎 names" line (persistence and the echo ledger both match
+                // on it); the bubble parses it back out and shows the files as
+                // small figures above the prompt, where every modern chat
+                // surface puts them.
+                let parts = AcpConversation.userTextParts(text)
+                VStack(alignment: .leading, spacing: 6) {
+                    if !parts.attachments.isEmpty {
+                        AcpUserAttachmentChips(names: parts.attachments)
                     }
-                    .textSelection(.enabled)
-                    .frame(maxWidth: AcpBubble.maximumWidth, alignment: .trailing)
+                    if !parts.body.isEmpty {
+                        Text(parts.body)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(.horizontal, AcpBubble.horizontalPadding)
+                .padding(.vertical, AcpBubble.verticalPadding)
+                .background(
+                    failed ? Color.red.opacity(0.12) : AcpBubble.userFill,
+                    in: RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
+                )
+                .overlay {
+                    if failed {
+                        RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
+                            .strokeBorder(.red.opacity(0.5))
+                    }
+                }
+                .frame(maxWidth: AcpBubble.maximumWidth, alignment: .trailing)
             }
             // Identified so the user's own side of the transcript — including a
             // prompt restored from a resumed thread, and a message steered into

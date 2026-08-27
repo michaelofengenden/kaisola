@@ -3,6 +3,31 @@ import XCTest
 @testable import Kaisola
 
 final class BrokerModelsTests: XCTestCase {
+    func testTerminalOperationErrorsUseEngineAndOperationLanguage() {
+        let cases: [(BrokerClientError, String)] = [
+            (.notConnected, "The terminal engine is not ready."),
+            (.connectionClosed, "The terminal engine stopped responding. Existing terminals were left unchanged."),
+            (.frameRejected, "The terminal engine rejected an invalid or oversized operation."),
+            (.malformedResponse, "The terminal engine returned invalid terminal data."),
+            (.authenticationRejected, "Kaisola could not verify terminal access."),
+            (.protocolMismatch, "The terminal engine is incompatible with this Kaisola version."),
+            (.securityEpochMismatch, "The terminal engine cannot enforce project isolation."),
+            (.implementationMismatch, "The terminal engine is outside this Kaisola version's compatibility window."),
+            (.identityChanged, "The terminal engine changed while the operation was running."),
+            (.observeFeatureMissing, "The terminal engine cannot observe terminal output."),
+            (.connectionTimedOut, "The terminal engine did not become ready in time."),
+            (.requestTimedOut, "The terminal operation did not finish in time."),
+            (.terminalCapacityExceeded(maximum: 4), "Kaisola already has its limit of 4 terminals open. Close one and try again."),
+            (.requestFailed("terminal.write"), "The terminal engine rejected terminal.write."),
+            (.socketFailure(54), "The terminal engine failed (54). Existing terminals were left unchanged."),
+            (.socketPathTooLong, "Kaisola could not prepare the terminal engine because its local path is too long."),
+        ]
+
+        for (error, expected) in cases {
+            XCTAssertEqual(error.localizedDescription, expected, "\(error)")
+        }
+    }
+
     func testStatusParsesExactProcessWideTerminalCapacity() throws {
         var object = validStatus.objectValue!
         object["terminalCapacity"] = .object([
@@ -193,7 +218,7 @@ final class BrokerModelsTests: XCTestCase {
             XCTAssertEqual(error as? BrokerInventoryError, .invalidDiagnosticRow(index: 1))
             XCTAssertEqual(
                 error.localizedDescription,
-                "The session service returned an invalid terminal inventory row at index 1; running sessions were left untouched."
+                "The terminal engine returned an invalid inventory row at index 1. Existing terminals were left unchanged."
             )
             XCTAssertFalse(error.localizedDescription.contains("forged-secret-terminal"))
         }

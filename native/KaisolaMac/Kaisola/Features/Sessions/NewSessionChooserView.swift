@@ -18,9 +18,9 @@ struct NewSessionPrimaryOption: Identifiable, Equatable, Sendable {
 }
 
 enum NewSessionChooserPresentation {
-    static let terminalUnavailableReason = "Saved terminals are view-only right now."
+    static let terminalUnavailableReason = "Terminals are preparing. Try again in a moment."
     static let launchFailureMessage =
-        "Session did not start. Check the terminal connection or Run On choice, then try again."
+        "Session did not start. Check the Run On folder and try again."
 
     static func terminalRowsEnabled(
         terminalControlAvailable: Bool,
@@ -83,7 +83,7 @@ enum NewSessionChooserPresentation {
 
 /// A temporary session tab becomes a real surface only after one of these
 /// choices is made. Until then this view owns presentation only and starts no
-/// process or broker work.
+/// process or terminal work.
 struct NewSessionChooserView: View {
     let projectName: String
     let catalog: NewSessionChoiceCatalog

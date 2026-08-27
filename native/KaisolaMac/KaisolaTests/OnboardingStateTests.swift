@@ -14,6 +14,30 @@ final class OnboardingStateTests: XCTestCase {
         return defaults
     }
 
+    func testFirstSessionHelpSeparatesProjectChoiceFromTerminalPreparation() {
+        XCTAssertEqual(
+            OnboardingReadiness.firstSessionHelp(
+                hasProject: false,
+                terminalControlAvailable: false
+            ),
+            "Choose a project to start a session."
+        )
+        XCTAssertEqual(
+            OnboardingReadiness.firstSessionHelp(
+                hasProject: true,
+                terminalControlAvailable: false
+            ),
+            "Terminals are preparing. Try again in a moment."
+        )
+        XCTAssertEqual(
+            OnboardingReadiness.firstSessionHelp(
+                hasProject: true,
+                terminalControlAvailable: true
+            ),
+            "Start the selected session in the active project"
+        )
+    }
+
     func testShowsInitiallyThenHiddenAfterMarkSeen() {
         let defaults = makeDefaults()
         XCTAssertTrue(OnboardingState.shouldShow(defaults: defaults),

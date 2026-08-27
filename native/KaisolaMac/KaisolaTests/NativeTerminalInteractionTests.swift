@@ -1457,6 +1457,17 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertEqual(captured, ["ls -la\r"])
     }
 
+    func testUnavailableInputNoticeSeparatesTemporaryRecoveryFromObserverAuthority() {
+        XCTAssertEqual(
+            ReadOnlyTerminalView.inputUnavailableMessage(controllerCapable: true),
+            "Input is temporarily paused. Kaisola retries this terminal automatically."
+        )
+        XCTAssertEqual(
+            ReadOnlyTerminalView.inputUnavailableMessage(controllerCapable: false),
+            "Another window or Companion controls input for this terminal."
+        )
+    }
+
     func testObserverSurfaceCannotBePromotedByMismatchedAuthority() {
         let coordinator = NativeTerminalSurface.Coordinator()
         var captured: [String] = []

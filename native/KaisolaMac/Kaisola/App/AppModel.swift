@@ -377,9 +377,21 @@ final class AppModel: ObservableObject {
     private var terminalPasteGenerationByTerminalID: [String: UInt64] = [:]
     @Published private(set) var terminalPasteProgressByTerminalID: [String: TerminalPasteProgress] = [:]
     static let terminalInputDiscardNoticeSuffix =
-        ": unsent input was discarded. Try again after input reconnects."
+        ": unsent input was discarded. Try again when input is available."
     static let terminalInputDiscardAggregateNotice =
-        "Unsent input was discarded after terminal control changed. Try again after input reconnects."
+        "Unsent input was discarded after terminal control changed. Try again when input is available."
+    static let terminalCreationUnavailableMessage =
+        "Terminals are preparing. Try again in a moment. Chats and Mesh are available now."
+    static func terminalInputFailureMessage(scopedToTerminal: Bool) -> String {
+        scopedToTerminal
+            ? "Input paused for this terminal because the last write could not be confirmed. Kaisola retries this terminal automatically."
+            : "Input is temporarily unavailable for this terminal. Kaisola retries automatically."
+    }
+    static func terminalAttachRefusalMessage(count: Int) -> String {
+        "Another window or Companion controls input for \(count) terminal\(count == 1 ? "" : "s"). Kaisola retries automatically."
+    }
+    nonisolated static let terminalObserverFallbackMessage =
+        "The terminal engine could not complete the operation. Existing terminals were left unchanged."
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
     /// Terminals whose open agent turn the broker acknowledged. Local activity
     /// state only advances on a positive `terminal.agentTurn` reply, so the app
@@ -6348,9 +6360,7 @@ final class AppModel: ObservableObject {
             // Never fail silently: say WHY sessions can't be created here.
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
-                message: connectionState.isConnected
-                    ? "This terminal service is view-only right now, so new terminals are disabled. Chats and Mesh still work — they don't need it."
-                    : "Kaisola isn't connected to saved terminal sessions, so new terminals are disabled. Chats and Mesh still work without that connection."
+                message: Self.terminalCreationUnavailableMessage
             ))
             return nil
         }
@@ -7179,9 +7189,7 @@ final class AppModel: ObservableObject {
            now.timeIntervalSince(last) < 2 { return }
         terminalInputFailureNoticeAt[terminalID] = now
         ToastCenter.shared.show(
-            scopedToTerminal
-                ? "Input paused for this terminal; the last write could not be confirmed. Other sessions remain connected."
-                : "Terminal connection is recovering; input was not sent",
+            Self.terminalInputFailureMessage(scopedToTerminal: scopedToTerminal),
             style: .error,
             duration: 4
         )
@@ -7826,9 +7834,7 @@ final class AppModel: ObservableObject {
         dormantTerminalIDs = dormant
         if attachRefusals > 0 {
             ToastCenter.shared.show(
-                attachRefusals == 1
-                    ? "1 terminal is read-only — another window or a stale connection holds its input. Reload to retry."
-                    : "\(attachRefusals) terminals are read-only — another window or a stale connection holds their input. Reload to retry.",
+                Self.terminalAttachRefusalMessage(count: attachRefusals),
                 style: .error
             )
         }
@@ -7898,7 +7904,7 @@ final class AppModel: ObservableObject {
     /// UI is up; failures leave the pane dormant for the next attempt.
     func resurrectDormantTerminals() async {
         guard controlAvailable, !dormantTerminalIDs.isEmpty else { return }
-        // One sweep at a time: reload, reconnect, and launch can all schedule
+        // One sweep at a time: startup, automatic recovery, and launch can all schedule
         // this, and two overlapping sweeps could double-spawn the same id.
         guard !resurrectionSweepInFlight else { return }
         resurrectionSweepInFlight = true
@@ -9699,6 +9705,6 @@ private extension Error {
         if let localized = self as? LocalizedError, let description = localized.errorDescription {
             return description
         }
-        return "The terminal observer could not connect. Everything already running was left untouched."
+        return AppModel.terminalObserverFallbackMessage
     }
 }

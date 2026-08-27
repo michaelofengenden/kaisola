@@ -22,7 +22,7 @@ final class NewSessionChooserTests: XCTestCase {
         XCTAssertFalse(options[1].isEnabled)
         XCTAssertTrue(options[2].isEnabled)
         XCTAssertTrue(options[3].isEnabled)
-        XCTAssertEqual(options[0].disabledReason, "Saved terminals are view-only right now.")
+        XCTAssertEqual(options[0].disabledReason, "Terminals are preparing. Try again in a moment.")
     }
 
     func testAvailableTerminalChoicesEnableWhenControlReturns() {
@@ -85,10 +85,10 @@ final class NewSessionChooserTests: XCTestCase {
         ))
     }
 
-    func testLaunchFailureCopyNamesTheTwoRecoveryChecks() {
+    func testLaunchFailureCopyNamesTheRunOnFolderWithoutAConnectionCheck() {
         XCTAssertEqual(
             NewSessionChooserPresentation.launchFailureMessage,
-            "Session did not start. Check the terminal connection or Run On choice, then try again."
+            "Session did not start. Check the Run On folder and try again."
         )
     }
 

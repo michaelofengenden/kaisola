@@ -7,6 +7,41 @@ import XCTest
 
 @MainActor
 final class AppModelReconnectTests: XCTestCase {
+    func testTerminalFailurePresentationUsesLocalEngineAndInputFacts() {
+        XCTAssertEqual(
+            AppModel.terminalCreationUnavailableMessage,
+            "Terminals are preparing. Try again in a moment. Chats and Mesh are available now."
+        )
+        XCTAssertEqual(
+            AppModel.terminalInputFailureMessage(scopedToTerminal: false),
+            "Input is temporarily unavailable for this terminal. Kaisola retries automatically."
+        )
+        XCTAssertEqual(
+            AppModel.terminalInputFailureMessage(scopedToTerminal: true),
+            "Input paused for this terminal because the last write could not be confirmed. Kaisola retries this terminal automatically."
+        )
+        XCTAssertEqual(
+            AppModel.terminalAttachRefusalMessage(count: 1),
+            "Another window or Companion controls input for 1 terminal. Kaisola retries automatically."
+        )
+        XCTAssertEqual(
+            AppModel.terminalAttachRefusalMessage(count: 2),
+            "Another window or Companion controls input for 2 terminals. Kaisola retries automatically."
+        )
+        XCTAssertEqual(
+            AppModel.terminalObserverFallbackMessage,
+            "The terminal engine could not complete the operation. Existing terminals were left unchanged."
+        )
+        XCTAssertEqual(
+            AppModel.terminalInputDiscardNoticeSuffix,
+            ": unsent input was discarded. Try again when input is available."
+        )
+        XCTAssertEqual(
+            AppModel.terminalInputDiscardAggregateNotice,
+            "Unsent input was discarded after terminal control changed. Try again when input is available."
+        )
+    }
+
     func testInventoryCompletionRaceRaisesOnlyWorkingToRespondedTransitions() {
         let working = terminal("terminal-working", activity: .working)
         let idle = terminal("terminal-idle", activity: .idle)
@@ -1509,7 +1544,7 @@ final class AppModelReconnectTests: XCTestCase {
         fixture.model.sendInput("x", to: ReconnectBrokerClient.firstTerminalID)
         XCTAssertEqual(
             ToastCenter.shared.toasts.last?.message,
-            "Terminal connection is recovering; input was not sent"
+            "Input is temporarily unavailable for this terminal. Kaisola retries automatically."
         )
         await fixture.model.disconnect()
     }

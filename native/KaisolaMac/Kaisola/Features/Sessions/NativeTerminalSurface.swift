@@ -10,13 +10,12 @@ extension Notification.Name {
     static let kaisolaOpenFileLink = Notification.Name("kaisolaOpenFileLink")
 }
 
-/// Separates the durable AppKit surface class from the controller connection's
-/// live write authority.
+/// Separates the durable AppKit surface class from current write authority.
 ///
-/// A terminal Kaisola created remains controller-capable while its control
-/// socket reconnects, so a brief ownership publication must not replace its
+/// A terminal Kaisola created remains controller-capable while ownership is
+/// temporarily unavailable, so a brief ownership change must not replace its
 /// parsed SwiftTerm view. The `active` bit is still revoked immediately and is
-/// the only state that enables outbound bytes. A genuinely foreign terminal
+/// the only state that enables outbound bytes. A terminal controlled elsewhere
 /// stays on `ReadOnlyTerminalView` by construction.
 enum TerminalSurfaceAuthority: Equatable {
     case observerOnly
@@ -75,8 +74,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
     /// by agent CLIs. OSC 7 updates replace it as the shell changes directory.
     var workingDirectory: URL? = nil
     /// Durable class eligibility and independently revocable live authority.
-    /// See `TerminalSurfaceAuthority` for why controller reconnects must not
-    /// change the concrete AppKit view.
+    /// See `TerminalSurfaceAuthority` for why a temporary ownership change must
+    /// not change the concrete AppKit view.
     let authority: TerminalSurfaceAuthority
     /// Terminal font size (⌘+/⌘−/⌘0 via NativePreviewSettings).
     var fontSize: Double = NativePreviewSettings.terminalFontDefault
@@ -453,8 +452,8 @@ class ReadOnlyTerminalView: TerminalView {
     /// word — during the 2026-08-07 phantom-owner incident that silence WAS
     /// the user-visible bug ("can't type"). The bytes still go nowhere (this
     /// surface has no input authority by construction), but the user hears
-    /// why, throttled so held keys don't stack toasts. Input restores
-    /// automatically once the ownership self-heal reattaches;
+    /// why, throttled so held keys don't stack toasts. Local input retries
+    /// automatically once ownership is temporarily unavailable;
     /// OwnedTerminalView overrides this with the real forwarding path.
     private static var lastReadOnlyNoticeAt: Date?
 
@@ -468,11 +467,19 @@ class ReadOnlyTerminalView: TerminalView {
             Self.lastReadOnlyNoticeAt = now
             Task { @MainActor in
                 ToastCenter.shared.show(
-                    "This terminal is read-only right now — input reconnects automatically.",
+                    Self.inputUnavailableMessage(
+                        controllerCapable: self is OwnedTerminalView
+                    ),
                     style: .info
                 )
             }
         }
+    }
+
+    static func inputUnavailableMessage(controllerCapable: Bool) -> String {
+        controllerCapable
+            ? "Input is temporarily paused. Kaisola retries this terminal automatically."
+            : "Another window or Companion controls input for this terminal."
     }
 
     /// SwiftTerm checks registered OSC handlers before its built-ins, so OSC

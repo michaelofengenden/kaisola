@@ -574,23 +574,23 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConnected: "The terminal observer is not connected."
-        case .connectionClosed: "The terminal connection closed; running sessions were left untouched."
-        case .frameRejected: "The session service sent an invalid or oversized message."
-        case .malformedResponse: "The session service returned invalid read-only data."
-        case .authenticationRejected: "Kaisola could not verify the private terminal connection."
-        case .protocolMismatch: "The running session service is incompatible and was left untouched."
-        case .securityEpochMismatch: "The running session service lacks project-scoped isolation."
-        case .implementationMismatch: "The running session service is outside this Kaisola version's compatibility window."
-        case .identityChanged: "The session service changed during the connection check."
-        case .observeFeatureMissing: "The running session service cannot provide terminal observation."
-        case .connectionTimedOut: "The private terminal connection did not become ready in time."
-        case .requestTimedOut: "The session service did not answer a read-only request in time."
+        case .notConnected: "The terminal engine is not ready."
+        case .connectionClosed: "The terminal engine stopped responding. Existing terminals were left unchanged."
+        case .frameRejected: "The terminal engine rejected an invalid or oversized operation."
+        case .malformedResponse: "The terminal engine returned invalid terminal data."
+        case .authenticationRejected: "Kaisola could not verify terminal access."
+        case .protocolMismatch: "The terminal engine is incompatible with this Kaisola version."
+        case .securityEpochMismatch: "The terminal engine cannot enforce project isolation."
+        case .implementationMismatch: "The terminal engine is outside this Kaisola version's compatibility window."
+        case .identityChanged: "The terminal engine changed while the operation was running."
+        case .observeFeatureMissing: "The terminal engine cannot observe terminal output."
+        case .connectionTimedOut: "The terminal engine did not become ready in time."
+        case .requestTimedOut: "The terminal operation did not finish in time."
         case let .terminalCapacityExceeded(maximum):
-            "The session service is already running its limit of \(maximum) terminals. Close one and try again."
-        case .requestFailed: "The session service rejected a read-only request."
-        case let .socketFailure(code): "The private terminal connection failed (\(code)); running sessions were not changed."
-        case .socketPathTooLong: "The private terminal connection path is too long for macOS."
+            "Kaisola already has its limit of \(maximum) terminals open. Close one and try again."
+        case let .requestFailed(operation): "The terminal engine rejected \(operation)."
+        case let .socketFailure(code): "The terminal engine failed (\(code)). Existing terminals were left unchanged."
+        case .socketPathTooLong: "Kaisola could not prepare the terminal engine because its local path is too long."
         }
     }
 }
@@ -601,7 +601,7 @@ enum BrokerInventoryError: Error, Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .invalidDiagnosticRow(index):
-            "The session service returned an invalid terminal inventory row at index \(index); running sessions were left untouched."
+            "The terminal engine returned an invalid inventory row at index \(index). Existing terminals were left unchanged."
         }
     }
 }

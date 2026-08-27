@@ -149,6 +149,44 @@ final class AcpAttachmentsTests: XCTestCase {
         XCTAssertEqual(AcpConversation.userText("plain", attachments: []), "plain")
     }
 
+    /// The bubble shows attachments as chips above the prompt, parsed back out
+    /// of the pinned suffix. The parse must be the exact inverse of `userText`
+    /// for every shape `userText` can produce, and must leave text without a
+    /// suffix untouched.
+    func testUserTextPartsInvertsTheSuffix() {
+        let attachments: [AcpAttachment] = [
+            .image(data: Data(), mimeType: "image/png", name: "one.png"),
+            .textFile(path: "/tmp/two.txt", contents: "", name: "two.txt"),
+        ]
+        let both = AcpConversation.userTextParts(
+            AcpConversation.userText("hi\nthere", attachments: attachments)
+        )
+        XCTAssertEqual(both.body, "hi\nthere")
+        XCTAssertEqual(both.attachments, ["one.png", "two.txt"])
+
+        let bare = AcpConversation.userTextParts(
+            AcpConversation.userText("", attachments: attachments)
+        )
+        XCTAssertEqual(bare.body, "")
+        XCTAssertEqual(bare.attachments, ["one.png", "two.txt"])
+
+        let plain = AcpConversation.userTextParts("no files here")
+        XCTAssertEqual(plain.body, "no files here")
+        XCTAssertEqual(plain.attachments, [])
+
+        // A paperclip line mid-message is content, not a suffix.
+        let middle = AcpConversation.userTextParts("📎 quoted line\nactual ask")
+        XCTAssertEqual(middle.body, "📎 quoted line\nactual ask")
+        XCTAssertEqual(middle.attachments, [])
+    }
+
+    func testAttachmentChipGlyphJudgesByExtension() {
+        XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "Dropped image.png"), "photo")
+        XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "photo.HEIC"), "photo")
+        XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "notes.txt"), "doc.text")
+        XCTAssertEqual(AcpUserAttachmentChips.glyph(for: "no-extension"), "doc.text")
+    }
+
     // MARK: - Classification / size limits
 
     func testClassifyAcceptsSmallTextFile() throws {

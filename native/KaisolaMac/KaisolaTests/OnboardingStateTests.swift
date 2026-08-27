@@ -226,6 +226,11 @@ final class OnboardingStateTests: XCTestCase {
         XCTAssertEqual(OnboardingReadiness.updateAction(for: pending), "Update Settings")
     }
 
+    func testOnboardingSettingsDestinationsKeepUpdatesOutOfGeneral() {
+        XCTAssertEqual(OnboardingSettingsDestination.accounts.sectionID, "accounts")
+        XCTAssertEqual(OnboardingSettingsDestination.updates.sectionID, "updates")
+    }
+
     /// The decision is only worth having while the checklist actually asks it.
     /// The row used to offer the button for every non-ready status, which is
     /// how the unsigned build got a dead end in the first place.

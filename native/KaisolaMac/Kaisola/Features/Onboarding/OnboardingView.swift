@@ -124,6 +124,22 @@ enum OnboardingReadiness {
     }
 }
 
+/// Settings destinations the readiness checklist is allowed to open.
+///
+/// Keeping this narrower than `SettingsSection` prevents an Updates action
+/// from silently falling back to General through an untyped string.
+enum OnboardingSettingsDestination {
+    case accounts
+    case updates
+
+    var sectionID: String {
+        switch self {
+        case .accounts: SettingsSection.accounts.rawValue
+        case .updates: SettingsSection.updates.rawValue
+        }
+    }
+}
+
 /// First-run setup is an operational checklist rather than a feature tour. It
 /// reflects the active project's real session-control and provider-account
 /// state, keeps failed checks actionable, and can launch the first session only

@@ -440,8 +440,8 @@ struct RootShellView: View {
                     model: model,
                     settings: settings,
                     dismiss: { finishOnboarding() },
-                    openAccounts: { finishOnboarding(openingSettings: "accounts") },
-                    openUpdateSettings: { finishOnboarding(openingSettings: "general") }
+                    openAccounts: { finishOnboarding(openingSettings: .accounts) },
+                    openUpdateSettings: { finishOnboarding(openingSettings: .updates) }
                 )
             }
     }
@@ -700,9 +700,11 @@ struct RootShellView: View {
         }
     }
 
-    private func finishOnboarding(openingSettings sectionID: String? = nil) {
+    private func finishOnboarding(
+        openingSettings destination: OnboardingSettingsDestination? = nil
+    ) {
         OnboardingState.markSeen()
-        onboardingSettingsSectionID = sectionID
+        onboardingSettingsSectionID = destination?.sectionID
         showOnboarding = false
     }
 

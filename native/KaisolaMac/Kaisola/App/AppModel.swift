@@ -399,7 +399,7 @@ final class AppModel: ObservableObject {
         "Terminals are preparing. Try again in a moment. Chats and Mesh are available now."
     static func terminalInputFailureMessage(scopedToTerminal: Bool) -> String {
         scopedToTerminal
-            ? "Input paused for this terminal because the last write could not be confirmed. Kaisola retries this terminal automatically."
+            ? "Input paused for this terminal because the last write could not be confirmed. Choose Resume input to revalidate this terminal."
             : "Input is temporarily unavailable for this terminal. Kaisola retries automatically."
     }
     static func terminalAttachRefusalMessage(count: Int) -> String {

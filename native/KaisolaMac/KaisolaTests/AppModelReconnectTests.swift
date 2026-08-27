@@ -18,7 +18,7 @@ final class AppModelReconnectTests: XCTestCase {
         )
         XCTAssertEqual(
             AppModel.terminalInputFailureMessage(scopedToTerminal: true),
-            "Input paused for this terminal because the last write could not be confirmed. Kaisola retries this terminal automatically."
+            "Input paused for this terminal because the last write could not be confirmed. Choose Resume input to revalidate this terminal."
         )
         XCTAssertEqual(
             AppModel.terminalAttachRefusalMessage(count: 1),

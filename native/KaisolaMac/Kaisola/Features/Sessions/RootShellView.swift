@@ -2508,7 +2508,7 @@ struct RootShellView: View {
         } description: {
             Text(model.controlAvailable
                 ? "Start a terminal, agent, chat, or Mesh run for this project."
-                : "Chats and Mesh are ready. Saved terminals are view-only right now, so new terminals are temporarily unavailable.")
+                : "Chats and Mesh are ready. \(NewSessionChooserPresentation.terminalUnavailableReason)")
         } actions: {
             HStack(spacing: 10) {
                 Button {
@@ -2517,7 +2517,7 @@ struct RootShellView: View {
                     Label("New Terminal", systemImage: "terminal")
                 }
                 .disabled(!model.controlAvailable)
-                .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while saved sessions are view-only")
+                .help(model.controlAvailable ? "Open a shell in the active project" : NewSessionChooserPresentation.terminalUnavailableReason)
                 if let chatAgent {
                     Button {
                         runCommand(.newChat(chatAgent.id))
@@ -3240,10 +3240,9 @@ struct RootShellView: View {
                         onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
-                // Live controller ownership may flap while the control socket
-                // reconnects. Keep the exact parsed view for durable local
-                // sessions and revoke its input capability in place; only a
-                // genuine observer/controller class change may remount.
+                // Local ownership can be temporarily unavailable. Keep the
+                // exact parsed view and revoke its input capability in place;
+                // only a genuine observer/controller class change may remount.
                 .id("unified-\(id)-\(authority.controllerCapable)")
                 .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
                 .onChange(of: model.keyboardFocusRequest) { _, _ in
@@ -3912,8 +3911,8 @@ enum SidebarScrollPin {
     /// How long after the sidebar appears the list is held at its top.
     ///
     /// Long enough to cover the row-diff batches a restored workspace produces
-    /// (measured: the first compensation lands between 0.5s and 1.0s, and a
-    /// broker reconnect can add more), short enough that it can never be
+    /// (measured: the first compensation lands between 0.5s and 1.0s, and
+    /// restored terminal state can add more), short enough that it can never be
     /// confused with owning the scroll position. Any deliberate scroll ends it
     /// early — see `SidebarScrollTopPin`.
     static let pinDuration: TimeInterval = 3.0

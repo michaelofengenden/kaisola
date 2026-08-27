@@ -671,12 +671,11 @@ final class AppModel: ObservableObject {
 
     /// Turns a relaunch would abort, across every project in this window.
     ///
-    /// Terminals are deliberately excluded: native-created terminals live in the
-    /// detached broker and survive app quit, relaunch, and update, resuming from
-    /// their exact byte cursor. ACP chats and Mesh columns are in-process child
-    /// processes that `teardown()` stops, so those are the only turns a restart
-    /// actually interrupts. Kept cheap and separate from `projects`, which
-    /// regroups and sorts everything.
+    /// Terminals are deliberately excluded: Kaisola records each session, then
+    /// reopens active records as fresh shells after relaunch. ACP chats and Mesh
+    /// columns can have in-progress turns that `teardown()` stops, so those are
+    /// the turns a restart actually interrupts. Kept cheap and separate from
+    /// `projects`, which regroups and sorts everything.
     var interruptibleTurnCount: Int {
         chats.filter(\.conversation.isRunning).count
             + meshes.reduce(into: 0) { count, mesh in
@@ -6335,10 +6334,10 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// Registers a durable owned session and selects it. The PTY lives on the
-    /// broker, so it survives this app quitting, updating, or crashing exactly
-    /// like Electron's do. An agent session boots its CLI via a login shell so
-    /// the user's PATH and CLI config apply.
+    /// Registers an owned session and selects it. The terminal runs in Kaisola;
+    /// its saved record keeps the working folder, title, and agent choice so a
+    /// fresh shell can reopen after relaunch. An agent session boots its CLI via
+    /// a login shell so the user's PATH and CLI config apply.
     /// Returns the created terminal's id on success, nil on failure — so a
     /// caller (e.g. a Quick Action) can target exactly the shell it spawned
     /// rather than racing the shared `selectedSessionID`.

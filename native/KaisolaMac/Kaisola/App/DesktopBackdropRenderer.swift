@@ -713,6 +713,11 @@ enum DesktopBackdropRenderer {
     /// the way to make the pane white without spending wallpaper transmission.
     /// `LightGlassFrost` is shared with the live and panel paths so this is one
     /// material decision rather than a wallpaper-only correction.
+    ///
+    /// In light this is a **floor**, not a destination: `solveToneMap` lifts a
+    /// dimmer still onto it and passes a brighter one through at its own
+    /// lightness, so a white desktop reads white instead of the floor's grey.
+    /// Dark stays a true normalization in both directions.
     static func targetLuminance(isDark: Bool) -> Double {
         isDark ? 0.12 : LightGlassFrost.backdropLuminance
     }
@@ -1383,7 +1388,7 @@ extension DesktopBackdropRenderer {
         // quarter-million lookup fast path.
         let linearTable = Oklab.makeLinearTable()
 
-        let target = targetLightness(isDark: isDark)
+        let staticTarget = targetLightness(isDark: isDark)
         let headroom = tailHeadroomLightness(isDark: isDark)
         let band = max(1, Int(Double(pixels.count) * tailFraction))
         // The wallpaper's own colourfulness, measured once and **exactly**
@@ -1456,6 +1461,20 @@ extension DesktopBackdropRenderer {
             let tail = extremes.reduce(0, +) / Double(max(extremes.count, 1))
             return (mean / Double(pixels.count), tail, saturation / Double(pixels.count))
         }
+
+        // The light target lifts, never drags. Normalizing exists so a dim
+        // desktop cannot put dark ink on a dark surface — but the same map
+        // applied downward turned a white desktop into an 0.85 grey pane,
+        // which is the "grey when the background is white" report. A still
+        // already at or above the receipted grey keeps its own lightness:
+        // ink contrast only improves as a light surface brightens, the tail
+        // headroom still bounds the worst patch the same distance below
+        // whatever the target is, and a map whose offset settles at zero
+        // cannot clip what the picture did not already clip. Dark keeps the
+        // symmetric normalization — a white desktop must still arrive dark.
+        let target = isDark
+            ? staticTarget
+            : max(staticTarget, measure(map).mean)
 
         // The offset is re-solved **to convergence** for whatever gain and
         // saturation are current, rather than nudged once per outer pass. That

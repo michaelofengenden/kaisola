@@ -5041,6 +5041,75 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// The light normalization is a floor, not a destination. A dim desktop is
+    /// still lifted onto the receipted grey so ink never lands on a dark
+    /// surface, but a white desktop passes through at its own lightness —
+    /// dragging it down to the floor is exactly the "glass is grey when the
+    /// background is white" report. Dark keeps the symmetric map: a white
+    /// desktop must still arrive dark, or light ink dies.
+    func testAWhiteDesktopReadsWhiteInLightAndStillArrivesDarkInDark() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-white-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func stillMean(_ url: URL, isDark: Bool) throws -> Double {
+            let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+            guard case let .wallpaper(image, _, _)? = DesktopBackdropRenderer.render(key: key) else {
+                throw XCTSkip("no painting")
+            }
+            var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+            pixels.withUnsafeMutableBytes { bytes in
+                let context = CGContext(
+                    data: bytes.baseAddress, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                )!
+                context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            }
+            var total = 0.0
+            var count = 0.0
+            var index = 0
+            while index + 3 < pixels.count {
+                total += Double(pixels[index]) / 255 * 0.2126
+                    + Double(pixels[index + 1]) / 255 * 0.7152
+                    + Double(pixels[index + 2]) / 255 * 0.0722
+                count += 1
+                index += 4
+            }
+            return total / max(count, 1)
+        }
+
+        // Near-white with a whisper of ramp, like a plain light workspace.
+        let white = try writeRampWallpaper(
+            base: (0.96, 0.96, 0.96), range: 0.04, into: directory, named: "white"
+        )
+        let lightMean = try stillMean(white, isDark: false)
+        XCTAssertGreaterThan(
+            lightMean,
+            DesktopBackdropRenderer.targetLuminance(isDark: false) + 0.05,
+            "a white desktop was dragged down to the grey floor instead of passing through"
+        )
+        XCTAssertGreaterThan(lightMean, 0.90, "the pane should read white, not pale grey")
+
+        let darkMean = try stillMean(white, isDark: true)
+        XCTAssertEqual(
+            darkMean, DesktopBackdropRenderer.targetLuminance(isDark: true), accuracy: 0.06,
+            "dark must keep normalizing a white desktop down"
+        )
+
+        // A dim desktop still gets the lift the floor exists for.
+        let dim = try writeRampWallpaper(
+            base: (0.30, 0.30, 0.30), range: 0.3, into: directory, named: "dim"
+        )
+        let dimMean = try stillMean(dim, isDark: false)
+        XCTAssertEqual(
+            dimMean, DesktopBackdropRenderer.targetLuminance(isDark: false), accuracy: 0.06,
+            "the floor stopped lifting dim desktops"
+        )
+    }
+
     /// The light bake's highlights, which are the mirror of the dark bake's
     /// shadows and were wrong in the same way for the same reason.
     ///

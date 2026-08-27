@@ -2,9 +2,14 @@
 'use strict'
 
 const fs = require('node:fs')
+const path = require('node:path')
 
 const maximumReceiptBytes = 64 * 1024
-const expectedNodeVersion = '22.23.1'
+const packagePolicy = require(path.join(
+  __dirname,
+  '../native/KaisolaMac/BrokerHelper/package-policy.json'
+))
+const expectedNodeVersion = packagePolicy.node.version
 const booleanEvidence = Object.freeze([
   'adaptersStoppedAfterSuspend',
   'adaptersStoppedAfterDestroy',

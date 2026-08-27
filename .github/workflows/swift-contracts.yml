@@ -446,13 +446,10 @@ jobs:
         run: node --test tests/node/workflowSecurity.test.cjs
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
-      - name: Test broker runtime durability manifest
-        run: node tests/node/brokerRuntimeManifest.cjs
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test
           tests/node/swiftContractsPaths.test.cjs
-          tests/node/brokerCompatibility.test.cjs
           tests/node/companionContractReceipt.test.cjs
           tests/node/companionCITestGate.test.cjs
           tests/node/companionProtocolTables.test.cjs

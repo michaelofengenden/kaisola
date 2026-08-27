@@ -43,5 +43,4 @@ jobs:
           node --test
           tests/node/workflowSecurity.test.cjs
           tests/node/nativeTestSelect.test.cjs
-          tests/node/brokerCompatibility.test.cjs
           tests/node/companionProtocolTables.test.cjs

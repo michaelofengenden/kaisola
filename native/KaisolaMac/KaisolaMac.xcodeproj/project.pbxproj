@@ -93,6 +93,7 @@
 		3DF59BE4339CBB2D9339AB60 /* AuthModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95607C26D9D00EAA7955A72D /* AuthModel.swift */; };
 		3DF637B8B4F213C7FACFBF9E /* CompanionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40508869DD92A10AE3EF0352 /* CompanionHost.swift */; };
 		405642754B45AED95E4283BA /* CommandRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = F415566C0592DEBE80C0A642 /* CommandRegistry.swift */; };
+		409175ECDFD0BF3EA674B47D /* InProcessTerminalServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */; };
 		41C16D5DE1E0A270FBCB9BBE /* SessionPinStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B2E1FD28106BD28EB2758AE /* SessionPinStoreTests.swift */; };
 		41FC00FDC2261CDFEE5EA5D3 /* CompanionPairingCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C12BBC20CE649CC674E0BF6 /* CompanionPairingCoordinator.swift */; };
 		4335877BBB53DF40796FDB4D /* MarkdownReadingTypeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A87FB43ED1B4D822CDFD726 /* MarkdownReadingTypeTests.swift */; };
@@ -513,6 +514,7 @@
 		715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyCenter.swift; sourceTree = "<group>"; };
 		715C7A32E47628665B42A2F0 /* DarwinPTYProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DarwinPTYProcess.swift; sourceTree = "<group>"; };
 		723801032158344A02236DFE /* UnifiedSessionCardStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedSessionCardStateTests.swift; sourceTree = "<group>"; };
+		72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InProcessTerminalServiceTests.swift; sourceTree = "<group>"; };
 		732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionOrderStoreTests.swift; sourceTree = "<group>"; };
 		7372202EE0749274E875CC59 /* NewSessionChooserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionChooserView.swift; sourceTree = "<group>"; };
 		73B1D9B33957C20761D198F9 /* libKaisolaSessionBrokerCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libKaisolaSessionBrokerCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -1101,6 +1103,7 @@
 				143732221EC63F82B5874931 /* GitPRTests.swift */,
 				73C156565BA4025A74960AD9 /* GitServiceTests.swift */,
 				E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */,
+				72C372D70446E576230B7E84 /* InProcessTerminalServiceTests.swift */,
 				EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */,
 				BBC39D51D190999C81FEFA9D /* LocalhostDetectorTests.swift */,
 				5C7A4F2FAC61FD9BED492FAD /* MarkdownIncrementalStyleTests.swift */,
@@ -1684,6 +1687,7 @@
 				AC549E4FFE8A21A0057E7980 /* GitProcessDeadlineTests.swift in Sources */,
 				D1DF7C334CB6E3B1B0D12BBF /* GitServiceTests.swift in Sources */,
 				BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */,
+				409175ECDFD0BF3EA674B47D /* InProcessTerminalServiceTests.swift in Sources */,
 				F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */,
 				1780D63195E079FEFBD762C0 /* LocalhostDetectorTests.swift in Sources */,
 				5B9D83461433539D662A2E0E /* MarkdownIncrementalStyleTests.swift in Sources */,

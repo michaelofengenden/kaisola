@@ -26,9 +26,53 @@ final class InProcessTerminalCore: @unchecked Sendable {
     /// lease changes must move the inventory fence exactly like the broker's
     /// did, or reconcile would not notice them.
     private var activityBoost: Int64 = 0
+    /// Where each observer subscription lives. Activity broadcasts go to these
+    /// identities, exactly as the broker delivered its observer-activity frames
+    /// per subscription — the app authenticates events against its observer
+    /// owner, so a copy addressed with the control owner would be dropped.
+    private var observers: [String: [ObserverIdentity]] = [:]
+    /// The spawn request carries no terminal identity, so the output tap keys
+    /// chunks by pid; the facade registers the pairing when `create` returns.
+    private var terminalsByPid: [Int32: String] = [:]
+    private var openTurns: [String: OpenAgentTurn] = [:]
+    /// Monotonic across all turns, so a quiet task armed for a settled turn
+    /// can never mistake a successor turn on the same terminal for its own.
+    private var quietGenerationCounter = 0
+    /// The broker's AGENT_QUIET_MS. Injectable so tests need not wait 4.5s.
+    private let agentQuietInterval: TimeInterval
 
-    init(factory: any FreshTerminalProcessFactory = DarwinPTYProcessFactory()) {
-        store = FreshTerminalStore(factory: factory)
+    struct ObserverIdentity: Equatable, Sendable {
+        let facadeID: String
+        let ownerID: String
+        let projectID: String
+    }
+
+    /// Mirror of the broker's per-record turn fields. `completedAt` is set by
+    /// the quiet fallback; a later command-end mark confirms the turn without
+    /// moving the timestamp the UI already shows.
+    private struct OpenAgentTurn {
+        var busy = true
+        var completedAt: Int64?
+        /// Straddle buffer so an OSC 133;D mark split across pty reads still
+        /// matches. Maintained only while the turn is open.
+        var markCarry: [UInt8] = []
+        var lastOutputAt = Date()
+        var quietGeneration = 0
+    }
+
+    /// The shell's end-of-command mark (OSC 133;D). The only sequence trusted
+    /// beyond quietness to close an agent turn: the foreground command the
+    /// turn was opened for has returned to the prompt.
+    private static let commandEndMark: [UInt8] = Array("\u{1B}]133;D".utf8)
+
+    init(
+        factory: any FreshTerminalProcessFactory = DarwinPTYProcessFactory(),
+        agentQuietInterval: TimeInterval = 4.5
+    ) {
+        self.agentQuietInterval = agentQuietInterval
+        let relay = OutputTapRelay()
+        store = FreshTerminalStore(factory: AgentMarkTappingFactory(base: factory, relay: relay))
+        relay.core = self
         store.setEventSink { [weak self] owner, channel, payload, _, _ in
             guard let self else { return false }
             self.route(owner: owner, channel: channel, payload: payload)
@@ -52,6 +96,44 @@ final class InProcessTerminalCore: @unchecked Sendable {
         handlers.removeValue(forKey: facadeID)
     }
 
+    // MARK: - Observer & spawn registries
+
+    func noteObserver(facadeID: String, ownerID: String, projectID: String, terminalID: String) {
+        let identity = ObserverIdentity(facadeID: facadeID, ownerID: ownerID, projectID: projectID)
+        lock.lock()
+        defer { lock.unlock() }
+        var list = observers[terminalID] ?? []
+        guard !list.contains(identity) else { return }
+        list.append(identity)
+        observers[terminalID] = list
+    }
+
+    func removeObserver(facadeID: String, ownerID: String, terminalID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        observers[terminalID]?.removeAll { $0.facadeID == facadeID && $0.ownerID == ownerID }
+        if observers[terminalID]?.isEmpty == true { observers.removeValue(forKey: terminalID) }
+    }
+
+    func removeObservers(facadeID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        for (terminalID, list) in observers {
+            let kept = list.filter { $0.facadeID != facadeID }
+            if kept.isEmpty {
+                observers.removeValue(forKey: terminalID)
+            } else {
+                observers[terminalID] = kept
+            }
+        }
+    }
+
+    func registerSpawn(pid: Int32, terminalID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        terminalsByPid[pid] = terminalID
+    }
+
     // MARK: - Agent activity & leases
 
     func activity(for terminalID: String) -> AgentActivity {
@@ -61,27 +143,145 @@ final class InProcessTerminalCore: @unchecked Sendable {
     }
 
     func setAgentTurn(ownerID: String, projectID: String, terminalID: String, busy: Bool) {
-        let recipients: [@Sendable (BrokerEvent) -> Void]
-        let completedAt: Int64?
-        lock.lock()
-        if busy {
-            agentActivity[terminalID] = .working
-            completedAt = nil
-        } else {
-            let at = Int64(Date().timeIntervalSince1970 * 1_000)
-            agentActivity[terminalID] = .responded(at: at)
-            completedAt = at
+        guard busy else {
+            settleAgentTurn(terminalID: terminalID)
+            return
         }
+        lock.lock()
+        quietGenerationCounter += 1
+        var turn = OpenAgentTurn()
+        turn.quietGeneration = quietGenerationCounter
+        openTurns[terminalID] = turn
+        agentActivity[terminalID] = .working
         activityBoost += 1
-        recipients = Array(handlers.values)
+        let recipients = activityRecipients(terminalID: terminalID)
+        armAgentQuiet(terminalID: terminalID, generation: turn.quietGeneration, after: agentQuietInterval)
         lock.unlock()
-        let event = BrokerEvent(
-            ownerID: ownerID,
-            projectID: projectID,
-            terminalID: terminalID,
-            kind: .activity(busy: busy, completedAt: completedAt)
-        )
-        for handler in recipients { handler(event) }
+        broadcast(recipients, terminalID: terminalID, busy: true, completedAt: nil)
+    }
+
+    /// The authoritative end of a turn: the controller's `busy: false`, the
+    /// pty exiting, or the shell's own command-end mark. Quietness never
+    /// gets here — it only relaxes the spinner while the turn stays open.
+    private func settleAgentTurn(terminalID: String) {
+        lock.lock()
+        let turn = openTurns.removeValue(forKey: terminalID)
+        let working = { if case .working = agentActivity[terminalID] { return true }; return false }()
+        guard turn != nil || working else {
+            lock.unlock()
+            return
+        }
+        let at = turn?.completedAt ?? Int64(Date().timeIntervalSince1970 * 1_000)
+        agentActivity[terminalID] = .responded(at: at)
+        activityBoost += 1
+        let recipients = activityRecipients(terminalID: terminalID)
+        lock.unlock()
+        broadcast(recipients, terminalID: terminalID, busy: false, completedAt: at)
+    }
+
+    /// Degraded fallback for agents that never emit an end-of-turn signal:
+    /// after the quiet interval the busy indicator relaxes so the UI stops
+    /// claiming live work, but the turn stays open and a later mark confirms
+    /// it without moving this timestamp.
+    private func relaxQuietAgentTurn(terminalID: String, generation: Int) {
+        lock.lock()
+        guard var turn = openTurns[terminalID], turn.busy, turn.quietGeneration == generation else {
+            lock.unlock()
+            return
+        }
+        let elapsed = Date().timeIntervalSince(turn.lastOutputAt)
+        guard elapsed >= agentQuietInterval else {
+            armAgentQuiet(
+                terminalID: terminalID,
+                generation: generation,
+                after: agentQuietInterval - elapsed
+            )
+            lock.unlock()
+            return
+        }
+        let at = Int64(Date().timeIntervalSince1970 * 1_000)
+        turn.busy = false
+        turn.completedAt = at
+        openTurns[terminalID] = turn
+        agentActivity[terminalID] = .responded(at: at)
+        activityBoost += 1
+        let recipients = activityRecipients(terminalID: terminalID)
+        lock.unlock()
+        broadcast(recipients, terminalID: terminalID, busy: false, completedAt: at)
+    }
+
+    /// Caller holds the lock.
+    private func armAgentQuiet(terminalID: String, generation: Int, after interval: TimeInterval) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+            self?.relaxQuietAgentTurn(terminalID: terminalID, generation: generation)
+        }
+    }
+
+    /// Caller holds the lock. Activity frames go per observer subscription
+    /// with that observer's own identity; a terminal nobody watches settles
+    /// silently and reconcile paints it from inventory.
+    private func activityRecipients(
+        terminalID: String
+    ) -> [(handler: @Sendable (BrokerEvent) -> Void, identity: ObserverIdentity)] {
+        (observers[terminalID] ?? []).compactMap { identity in
+            handlers[identity.facadeID].map { ($0, identity) }
+        }
+    }
+
+    private func broadcast(
+        _ recipients: [(handler: @Sendable (BrokerEvent) -> Void, identity: ObserverIdentity)],
+        terminalID: String,
+        busy: Bool,
+        completedAt: Int64?
+    ) {
+        for (handler, identity) in recipients {
+            handler(BrokerEvent(
+                ownerID: identity.ownerID,
+                projectID: identity.projectID,
+                terminalID: terminalID,
+                kind: .activity(busy: busy, completedAt: completedAt)
+            ))
+        }
+    }
+
+    /// Every pty read passes here once, keyed by pid. Only open turns pay for
+    /// the scan; bytes outside a turn (including the spawn banner racing the
+    /// pid registration) carry no mark worth finding.
+    fileprivate func observeChunk(pid: Int32, data: Data) {
+        lock.lock()
+        guard let terminalID = terminalsByPid[pid], var turn = openTurns[terminalID] else {
+            lock.unlock()
+            return
+        }
+        turn.lastOutputAt = Date()
+        var window = turn.markCarry
+        window.append(contentsOf: data)
+        let ended = Self.containsCommandEndMark(window)
+        turn.markCarry = Array(window.suffix(Self.commandEndMark.count - 1))
+        openTurns[terminalID] = turn
+        lock.unlock()
+        if ended { settleAgentTurn(terminalID: terminalID) }
+    }
+
+    private static func containsCommandEndMark(_ window: [UInt8]) -> Bool {
+        let mark = commandEndMark
+        guard window.count >= mark.count else { return false }
+        for start in 0...(window.count - mark.count) {
+            var offset = 0
+            while offset < mark.count, window[start + offset] == mark[offset] { offset += 1 }
+            if offset == mark.count { return true }
+        }
+        return false
+    }
+
+    private func noteTerminalExit(terminalID: String) {
+        lock.lock()
+        for (pid, id) in terminalsByPid where id == terminalID {
+            terminalsByPid.removeValue(forKey: pid)
+        }
+        lock.unlock()
+        settleAgentTurn(terminalID: terminalID)
     }
 
     func setControlLease(terminalID: String, active: Bool) {
@@ -96,6 +296,11 @@ final class InProcessTerminalCore: @unchecked Sendable {
         defer { lock.unlock() }
         agentActivity.removeValue(forKey: terminalID)
         controlLeases.remove(terminalID)
+        openTurns.removeValue(forKey: terminalID)
+        observers.removeValue(forKey: terminalID)
+        for (pid, id) in terminalsByPid where id == terminalID {
+            terminalsByPid.removeValue(forKey: pid)
+        }
     }
 
     // MARK: - Inventory
@@ -159,6 +364,12 @@ final class InProcessTerminalCore: @unchecked Sendable {
     /// owner strings are `facadeID|ownerID|projectID`. Primary copies are
     /// dropped: the native app consumes only the observer stream.
     private func route(owner: String, channel: String, payload: BrokerJSONValue) {
+        // The primary exit copy fires exactly once per terminal even with the
+        // primary data stream disarmed, which makes it the engine's own settle
+        // signal: a dying pty ends whatever agent turn it was running.
+        if channel.hasPrefix("terminal:exit:") {
+            noteTerminalExit(terminalID: String(channel.dropFirst("terminal:exit:".count)))
+        }
         let pieces = owner.split(separator: "|", omittingEmptySubsequences: false)
         guard pieces.count >= 3 else { return }
         let facadeID = String(pieces[0])
@@ -200,6 +411,71 @@ final class InProcessTerminalCore: @unchecked Sendable {
     }
 }
 
+/// The factory decorator closes over this before the core exists, and pty
+/// read threads call through it afterwards; the lock covers that handoff.
+private final class OutputTapRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var target: InProcessTerminalCore?
+
+    var core: InProcessTerminalCore? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return target
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            target = newValue
+        }
+    }
+
+    func deliver(pid: Int32, data: Data) {
+        core?.observeChunk(pid: pid, data: data)
+    }
+}
+
+/// Wraps the real PTY factory so every output chunk passes the engine once.
+/// Chunks are keyed by pid because the spawn request carries no terminal
+/// identity; bytes read before the pid lands in the box precede any agent
+/// turn and are deliberately not scanned.
+private struct AgentMarkTappingFactory: FreshTerminalProcessFactory {
+    let base: any FreshTerminalProcessFactory
+    let relay: OutputTapRelay
+
+    func spawn(
+        request: FreshTerminalSpawnRequest,
+        onOutput: @escaping @Sendable (Data) -> Void
+    ) async throws -> any FreshTerminalProcess {
+        let box = PidBox()
+        let relay = relay
+        let process = try await base.spawn(request: request) { data in
+            if let pid = box.value { relay.deliver(pid: pid, data: data) }
+            onOutput(data)
+        }
+        box.value = process.pid
+        return process
+    }
+}
+
+private final class PidBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pid: Int32?
+
+    var value: Int32? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return pid
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            pid = newValue
+        }
+    }
+}
+
 /// One window's (or the Companion hub's) connection-equivalent onto the shared
 /// in-process terminal core. Each facade keeps its own controller identity so
 /// cross-window ownership, adoption, and takeover behave exactly as they did
@@ -214,12 +490,21 @@ final class InProcessTerminalService: @unchecked Sendable {
     private let lock = NSLock()
     private var controlOwnerID = "native"
 
+    /// Everything the in-process engine actually implements. Observer
+    /// coalescing is deliberately absent: the store publishes each pty read as
+    /// it lands, and a client that sees the coalescing capability switches off
+    /// its own frame window — advertising it here would put every raw chunk
+    /// straight on the main thread.
+    static let engineFeatures: [String] = BrokerWire.advertisedFeatures.filter {
+        $0 != BrokerWire.terminalObserverCoalescingFeature
+    }
+
     init(core: InProcessTerminalCore = .shared) {
         self.core = core
         client = BrokerAuthenticatedClient(
             instanceID: facadeID,
             role: .controller,
-            negotiatedFeatures: BrokerWire.advertisedFeatures
+            negotiatedFeatures: Self.engineFeatures
         )
     }
 
@@ -230,7 +515,7 @@ final class InProcessTerminalService: @unchecked Sendable {
             implementationVersion: BrokerWire.implementationVersion,
             packageSchema: nil,
             packageVersion: nil,
-            features: Set(BrokerWire.advertisedFeatures),
+            features: Set(Self.engineFeatures),
             pid: ProcessInfo.processInfo.processIdentifier,
             startedAt: core.startedAt,
             version: "in-process",
@@ -363,6 +648,12 @@ extension InProcessTerminalService: ObserveOnlyBrokerServing {
         case .none, .unavailable:
             throw TerminalWriteError.missing
         case let .snapshot(snapshot, resetReason):
+            core.noteObserver(
+                facadeID: facadeID,
+                ownerID: ownerID,
+                projectID: terminal.projectID,
+                terminalID: terminal.id
+            )
             let bounded = Self.bounded(snapshot, to: maximumSnapshotBytes)
             return .snapshot(
                 TerminalSnapshot(
@@ -376,6 +667,12 @@ extension InProcessTerminalService: ObserveOnlyBrokerServing {
                 resetReason: resetReason
             )
         case let .current(streamEpoch, offset):
+            core.noteObserver(
+                facadeID: facadeID,
+                ownerID: ownerID,
+                projectID: terminal.projectID,
+                terminalID: terminal.id
+            )
             return .current(TerminalCursor(streamEpoch: streamEpoch, offset: offset))
         }
     }
@@ -412,6 +709,7 @@ extension InProcessTerminalService: ObserveOnlyBrokerServing {
     }
 
     func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws {
+        core.removeObserver(facadeID: facadeID, ownerID: ownerID, terminalID: terminal.id)
         _ = try? await core.store.unsubscribe(
             id: terminal.id,
             projectID: terminal.projectID,
@@ -422,6 +720,7 @@ extension InProcessTerminalService: ObserveOnlyBrokerServing {
 
     func disconnect() async {
         core.unregister(facadeID: facadeID)
+        core.removeObservers(facadeID: facadeID)
         await core.store.unsubscribeSubscriberPrefix("\(facadeID)|")
     }
 
@@ -497,6 +796,9 @@ extension InProcessTerminalService: BrokerControlServing {
             )
         } catch {
             throw Self.mapStoreError(error)
+        }
+        if !creation.exited {
+            core.registerSpawn(pid: creation.pid, terminalID: creation.id)
         }
         return TerminalCreation(
             terminalID: creation.id,

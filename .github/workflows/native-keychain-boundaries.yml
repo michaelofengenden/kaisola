@@ -227,7 +227,10 @@ jobs:
             --team-identifier "$APPLE_TEAM_ID")"
           test "$embedded_profile_uuid" = "$KAISOLA_KEYCHAIN_PROFILE_UUID"
 
-          xcodebuild \
+          /usr/bin/env \
+            TEST_RUNNER_KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1 \
+            TEST_RUNNER_KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm \
+            xcodebuild \
             -project native/KaisolaMac/KaisolaMac.xcodeproj \
             -scheme Kaisola \
             -configuration Debug \
@@ -243,8 +246,6 @@ jobs:
             KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS=Kaisola/App/KaisolaKeychainTests.entitlements \
             KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS="--keychain $KAISOLA_SIGNING_KEYCHAIN" \
             KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER="$KAISOLA_KEYCHAIN_PROFILE_UUID" \
-            TEST_RUNNER_KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1 \
-            TEST_RUNNER_KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm \
             test-without-building
 
           xcrun xcresulttool get test-results summary \

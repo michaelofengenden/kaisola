@@ -442,6 +442,20 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
   assert.match(workflow, /--provisioning-profile/u)
   assert.match(workflow, /KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1/u)
   assert.match(workflow, /KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm/u)
+  const boundaryRunStep = workflow.slice(
+    workflow.indexOf('      - name: Run and seal isolated entitled Keychain boundaries'),
+    workflow.indexOf('      - name: Upload redacted Keychain receipt'),
+  )
+  assert.match(
+    boundaryRunStep,
+    /\/usr\/bin\/env \\\n\s+TEST_RUNNER_KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1 \\\n\s+TEST_RUNNER_KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm \\\n\s+xcodebuild \\/u,
+    'the dedicated markers must be in xcodebuild environment so XCTest receives them',
+  )
+  assert.doesNotMatch(
+    boundaryRunStep.slice(boundaryRunStep.indexOf('xcodebuild \\')),
+    /^\s*TEST_RUNNER_KAISOLA_(?:REQUIRE_KEYCHAIN_BOUNDARIES|KEYCHAIN_BOUNDARY_ISOLATION)=/mu,
+    'TEST_RUNNER markers after xcodebuild are build settings, not test-process environment',
+  )
   assert.match(workflow, /--cleanup-verified true/u)
   assert.match(workflow, /--required-signature-kind developer-id/u)
   assert.match(workflow, /only-testing:KaisolaTests\/KeychainBoundaryTests/u)

@@ -882,11 +882,6 @@ function validateMacPreflight(value) {
     architectures: {
       app: exactArray(architectures.app, REQUIRED_ARCHITECTURES, 'Mac app architectures'),
       node: exactArray(architectures.node, REQUIRED_ARCHITECTURES, 'Mac Node runtime architectures'),
-      bootstrap: exactArray(
-        architectures.bootstrap,
-        REQUIRED_ARCHITECTURES,
-        'Mac broker bootstrap architectures',
-      ),
     },
     developerID: true,
     secureTimestamp: true,

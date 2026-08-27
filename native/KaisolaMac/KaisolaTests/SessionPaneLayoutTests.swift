@@ -364,4 +364,16 @@ final class SessionPaneLayoutTests: XCTestCase {
         }
     }
 
+    func testTerminalHeaderReportsPausedInputInsteadOfReadyOwnership() {
+        let presentation = TerminalHeaderPresentation.resolve(
+            exited: false,
+            authority: .localController(active: true),
+            inputDegraded: true
+        )
+
+        XCTAssertEqual(presentation.systemImage, "exclamationmark.triangle.fill")
+        XCTAssertEqual(presentation.accessibilityLabel, "Terminal input paused")
+        XCTAssertEqual(presentation.tone, .inactive)
+    }
+
 }

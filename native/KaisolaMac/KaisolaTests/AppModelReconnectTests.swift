@@ -170,6 +170,56 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testInterruptibleTurnCountIncludesWorkingTerminalSessions() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        let terminalID = ReconnectBrokerClient.firstTerminalID
+        let subscribedOwnerID = await fixture.client.subscribedOwnerID(for: terminalID)
+        let ownerID = try XCTUnwrap(subscribedOwnerID)
+        await fixture.client.emitActivity(for: terminalID, ownerID: ownerID, busy: true)
+        await waitUntil {
+            fixture.model.sessions.first(where: { $0.id == terminalID })?.agentActivity == .working
+        }
+
+        XCTAssertEqual(fixture.model.interruptibleTurnCount, 1)
+
+        await fixture.client.emitActivity(
+            for: terminalID,
+            ownerID: ownerID,
+            busy: false,
+            completedAt: 1_785_000_600_000
+        )
+        await waitUntil {
+            fixture.model.sessions.first(where: { $0.id == terminalID })?.agentActivity
+                == .responded(at: 1_785_000_600_000)
+        }
+        XCTAssertEqual(fixture.model.interruptibleTurnCount, 0)
+        await fixture.model.disconnect()
+    }
+
+    func testTerminalLaunchResultCarriesTheFailureFromItsOwnAttempt() async throws {
+        let control = RecordingBrokerControlClient(
+            createFailure: .terminalCapacityExceeded(maximum: 8)
+        )
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            controlClient: control
+        )
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        let result = await fixture.model.createTerminalLaunch(inDirectory: fixture.root)
+
+        XCTAssertNil(result.terminalID)
+        XCTAssertEqual(
+            result.failureMessage,
+            "Kaisola already has its limit of 8 terminals open. Close one and try again."
+        )
+        await fixture.model.disconnect()
+    }
+
     func testDisconnectRetriesAndResubscribesFromTheVisibleCursor() async throws {
         let fixture = try Fixture(failingConnectAttempts: [2])
         defer { fixture.cleanUp() }
@@ -1687,14 +1737,17 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     private var createCount = 0
     private var recordedAttaches: [String] = []
     private let agentTurnAccepted: Bool
+    private let createFailure: BrokerClientError?
     private let onConnect: (@Sendable () async -> Void)?
     private var recordedAgentTurns: [Bool] = []
 
     init(
         agentTurnAccepted: Bool = true,
+        createFailure: BrokerClientError? = nil,
         onConnect: (@Sendable () async -> Void)? = nil
     ) {
         self.agentTurnAccepted = agentTurnAccepted
+        self.createFailure = createFailure
         self.onConnect = onConnect
     }
 
@@ -1718,6 +1771,7 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         restore: Bool
     ) async throws -> TerminalCreation {
         createCount += 1
+        if let createFailure { throw createFailure }
         return TerminalCreation(
             terminalID: terminalID,
             projectID: projectID,

@@ -85,10 +85,20 @@ final class NewSessionChooserTests: XCTestCase {
         ))
     }
 
-    func testLaunchFailureCopyNamesTheRunOnFolderWithoutAConnectionCheck() {
+    func testLaunchFailureCopyDoesNotInventAFolderDiagnosis() {
         XCTAssertEqual(
             NewSessionChooserPresentation.launchFailureMessage,
-            "Session did not start. Check the Run On folder and try again."
+            "Session did not start. Review the error and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.launchFailureMessage(
+                detail: "Terminal limit reached. Close a terminal and try again."
+            ),
+            "Terminal limit reached. Close a terminal and try again."
+        )
+        XCTAssertEqual(
+            NewSessionChooserPresentation.launchFailureMessage(detail: "  "),
+            "Session did not start. Review the error and try again."
         )
     }
 

@@ -285,12 +285,17 @@ struct SettingsView: View {
     /// Names exactly what a relaunch costs. Terminal processes are the app's
     /// own children now, so a restart ends them; saying so is what makes the
     /// prompt answerable rather than alarming.
-    private var restartWarning: String {
-        let running = interruptibleTurnCount?() ?? 0
+    static func softwareUpdateRestartWarning(interruptibleTurnCount running: Int) -> String {
         let terminals = "Open terminal sessions will close. Chats reconnect automatically."
         guard running > 0 else { return terminals }
-        let subject = running == 1 ? "1 chat or Mesh column is" : "\(running) chats or Mesh columns are"
+        let subject = running == 1 ? "1 session is" : "\(running) sessions are"
         return "\(subject) mid-turn and will be interrupted. \(terminals)"
+    }
+
+    private var restartWarning: String {
+        Self.softwareUpdateRestartWarning(
+            interruptibleTurnCount: interruptibleTurnCount?() ?? 0
+        )
     }
 
     /// The row always answers "what am I running, and when did we last look?"

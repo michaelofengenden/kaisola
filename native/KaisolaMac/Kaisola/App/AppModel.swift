@@ -49,6 +49,21 @@ final class AppModel: ObservableObject {
         let message: String
     }
 
+    enum TerminalLaunchResult: Equatable, Sendable {
+        case launched(String)
+        case failed(String)
+
+        var terminalID: String? {
+            guard case let .launched(terminalID) = self else { return nil }
+            return terminalID
+        }
+
+        var failureMessage: String? {
+            guard case let .failed(message) = self else { return nil }
+            return message
+        }
+    }
+
     struct TerminalTranscriptContext: Identifiable, Equatable, Sendable {
         let id: String
         let title: String
@@ -671,13 +686,17 @@ final class AppModel: ObservableObject {
 
     /// Turns a relaunch would abort, across every project in this window.
     ///
-    /// Terminals are deliberately excluded: Kaisola records each session, then
-    /// reopens active records as fresh shells after relaunch. ACP chats and Mesh
-    /// columns can have in-progress turns that `teardown()` stops, so those are
-    /// the turns a restart actually interrupts. Kept cheap and separate from
-    /// `projects`, which regroups and sorts everything.
+    /// A working terminal is included because relaunch ends its in-process PTY;
+    /// restoring the pane as a fresh shell does not preserve the running command
+    /// or agent turn. Kept cheap and separate from `projects`, which regroups and
+    /// sorts everything.
     var interruptibleTurnCount: Int {
-        chats.filter(\.conversation.isRunning).count
+        sessions.filter { terminal in
+            guard !terminal.exited else { return false }
+            if case .working = terminal.agentActivity { return true }
+            return false
+        }.count
+            + chats.filter(\.conversation.isRunning).count
             + meshes.reduce(into: 0) { count, mesh in
                 count += mesh.columns.filter(\.conversation.isRunning).count
             }
@@ -6315,6 +6334,14 @@ final class AppModel: ObservableObject {
     /// Creates a plain shell the native app owns in the given directory.
     @discardableResult
     func createTerminal(inDirectory directory: URL) async -> String? {
+        (await createTerminalLaunch(inDirectory: directory)).terminalID
+    }
+
+    /// Request-scoped terminal creation result. Unlike `terminalDocument`, the
+    /// failure belongs to this exact launch even if another terminal publishes
+    /// output while the engine request is suspended.
+    @discardableResult
+    func createTerminalLaunch(inDirectory directory: URL) async -> TerminalLaunchResult {
         await createOwnedSession(inDirectory: directory, agent: nil)
     }
 
@@ -6327,6 +6354,19 @@ final class AppModel: ObservableObject {
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil
     ) async -> String? {
+        (await createAgentSessionLaunch(
+            agent,
+            inDirectory: directory,
+            accountProfile: accountProfile
+        )).terminalID
+    }
+
+    @discardableResult
+    func createAgentSessionLaunch(
+        _ agent: AgentProfile,
+        inDirectory directory: URL,
+        accountProfile: UsageAccountProfile? = nil
+    ) async -> TerminalLaunchResult {
         await createOwnedSession(
             inDirectory: directory,
             agent: agent,
@@ -6338,9 +6378,9 @@ final class AppModel: ObservableObject {
     /// its saved record keeps the working folder, title, and agent choice so a
     /// fresh shell can reopen after relaunch. An agent session boots its CLI via
     /// a login shell so the user's PATH and CLI config apply.
-    /// Returns the created terminal's id on success, nil on failure — so a
-    /// caller (e.g. a Quick Action) can target exactly the shell it spawned
-    /// rather than racing the shared `selectedSessionID`.
+    /// Returns a request-scoped result so a caller can target exactly the shell
+    /// it spawned, or present the matching failure, without racing shared
+    /// selection or terminal-document state.
     @discardableResult
     private func createOwnedSession(
         inDirectory directory: URL,
@@ -6354,14 +6394,14 @@ final class AppModel: ObservableObject {
         restore: Bool = false,
         select: Bool = true,
         environmentBinding: SessionAccountBinding? = nil
-    ) async -> String? {
+    ) async -> TerminalLaunchResult {
         guard controlAvailable, connectionState.isConnected else {
             // Never fail silently: say WHY sessions can't be created here.
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
                 message: Self.terminalCreationUnavailableMessage
             ))
-            return nil
+            return .failed(Self.terminalCreationUnavailableMessage)
         }
         let cwd = directory.path
         let projectID = NativeSessionStore.projectID(forDirectory: cwd)
@@ -6377,14 +6417,20 @@ final class AppModel: ObservableObject {
         // Account isolation (custom CLAUDE_CONFIG_DIR / CODEX_HOME) rides in
         // as exported variables ahead of the CLI. Per-project overrides win
         // over the app-wide setting, key by key.
-        guard var overlay = projectAccountOverlay(forProject: projectID) else { return nil }
+        guard var overlay = projectAccountOverlay(forProject: projectID) else {
+            return .failed(
+                projectAccountRecoveryCenter.issue?.summary
+                    ?? "Kaisola could not read this project's account settings."
+            )
+        }
         let accountBinding: SessionAccountBinding?
         if let agent, SessionAccountBinding.provider(forAgentID: agent.id) != nil {
             if let lockedAccountBinding {
                 guard lockedAccountBinding.normalized?.provider
                     == SessionAccountBinding.provider(forAgentID: agent.id) else {
-                    ToastCenter.shared.show("The saved account does not match \(agent.name).", style: .error)
-                    return nil
+                    let message = "The saved account does not match \(agent.name)."
+                    ToastCenter.shared.show(message, style: .error)
+                    return .failed(message)
                 }
                 accountBinding = lockedAccountBinding.normalized
             } else {
@@ -6394,8 +6440,9 @@ final class AppModel: ObservableObject {
                     fallbackEnvironment: ProcessInfo.processInfo.environment
                         .merging(overlay) { _, configured in configured }
                 ) else {
-                    ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
-                    return nil
+                    let message = "That account does not match \(agent.name)."
+                    ToastCenter.shared.show(message, style: .error)
+                    return .failed(message)
                 }
                 accountBinding = resolved
             }
@@ -6498,7 +6545,7 @@ final class AppModel: ObservableObject {
                 )
                 refreshPersistedNavigationState(publish: false)
                 Task { [weak self] in await self?.refreshInventory() }
-                return terminalID
+                return .launched(terminalID)
             }
             // Ensure the session's folder is a persistent project tab — but
             // never on the resurrection path: a respawn must not re-open a
@@ -6537,10 +6584,11 @@ final class AppModel: ObservableObject {
                 armTerminalDraftRestore(draftRestoreSeed, terminalID: terminalID)
             }
             Task { [weak self] in await self?.refreshInventory() }
-            return terminalID
+            return .launched(terminalID)
         } catch {
-            publishPrimaryDocument(.failure(sessionID: terminalID, message: error.kaisolaSafeDescription))
-            return nil
+            let message = error.kaisolaSafeDescription
+            publishPrimaryDocument(.failure(sessionID: terminalID, message: message))
+            return .failed(message)
         }
     }
 
@@ -7602,14 +7650,14 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        return await createOwnedSession(
+        return (await createOwnedSession(
             inDirectory: directory,
             agent: agent,
             lockedAccountBinding: closed.accountBinding,
             resumeAgent: agent?.resumeCommand != nil,
             titleOverride: closed.title,
             draftRestoreSeed: draftSeed
-        )
+        )).terminalID
     }
 
     var hasClosedSessions: Bool { !sessionStore.closedSessions().isEmpty }
@@ -7951,7 +7999,7 @@ final class AppModel: ObservableObject {
                 dormantTerminalIDs.remove(stored.id)
                 continue
             }
-            guard created == stored.id else { continue }
+            guard created.terminalID == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)
             // A restore can resolve to a COLD record (the terminal had ended
             // before the reboot): the fresh store record carries endedAt, and

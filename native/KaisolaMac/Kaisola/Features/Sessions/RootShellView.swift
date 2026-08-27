@@ -67,12 +67,21 @@ struct TerminalHeaderPresentation: Equatable {
 
     static func resolve(
         exited: Bool,
-        authority: TerminalSurfaceAuthority
+        authority: TerminalSurfaceAuthority,
+        inputDegraded: Bool = false
     ) -> Self {
         if exited {
             return Self(
                 systemImage: "stop.circle.fill",
                 accessibilityLabel: "Session ended",
+                tone: .inactive
+            )
+        }
+
+        if inputDegraded {
+            return Self(
+                systemImage: "exclamationmark.triangle.fill",
+                accessibilityLabel: "Terminal input paused",
                 tone: .inactive
             )
         }
@@ -1499,15 +1508,17 @@ struct RootShellView: View {
                 return
             }
             Task { @MainActor in
-                let terminalID = await model.createTerminal(inDirectory: directory)
+                let result = await model.createTerminalLaunch(inDirectory: directory)
                 let accepted = newSessionDrafts.finishLaunch(
                     projectID: draft.projectID,
                     launchID: launchID,
-                    succeeded: terminalID != nil
+                    succeeded: result.terminalID != nil
                 )
-                if accepted, terminalID == nil {
+                if accepted, result.terminalID == nil {
                     ToastCenter.shared.show(
-                        NewSessionChooserPresentation.launchFailureMessage,
+                        NewSessionChooserPresentation.launchFailureMessage(
+                            detail: result.failureMessage
+                        ),
                         style: .info
                     )
                 }
@@ -1530,15 +1541,17 @@ struct RootShellView: View {
                         launchID: launchID
                     )
                 },
-                completed: { terminalID in
+                completed: { result in
                     let accepted = newSessionDrafts.finishLaunch(
                         projectID: draft.projectID,
                         launchID: launchID,
-                        succeeded: terminalID != nil
+                        succeeded: result.terminalID != nil
                     )
-                    if accepted, terminalID == nil {
+                    if accepted, result.terminalID == nil {
                         ToastCenter.shared.show(
-                            NewSessionChooserPresentation.launchFailureMessage,
+                            NewSessionChooserPresentation.launchFailureMessage(
+                                detail: result.failureMessage
+                            ),
                             style: .info
                         )
                     }
@@ -2011,7 +2024,7 @@ struct RootShellView: View {
         model: AppModel,
         preferredDirectory: URL?,
         cancelled: @escaping @MainActor () -> Void,
-        completed: @escaping @MainActor (String?) -> Void
+        completed: @escaping @MainActor (AppModel.TerminalLaunchResult) -> Void
     ) {
         promptForRunOn(
             agent,
@@ -2020,12 +2033,12 @@ struct RootShellView: View {
             cancelled: cancelled
         ) { directory, profile in
             Task { @MainActor in
-                let terminalID = await model.createAgentSession(
+                let result = await model.createAgentSessionLaunch(
                     agent,
                     inDirectory: directory,
                     accountProfile: profile
                 )
-                completed(terminalID)
+                completed(result)
             }
         }
     }
@@ -3417,7 +3430,8 @@ struct RootShellView: View {
             authority: TerminalSurfaceAuthority(
                 isOwned: model.isOwned(id),
                 hasDurableOwnership: model.canClose(id)
-            )
+            ),
+            inputDegraded: model.isTerminalInputDegraded(id)
         )
     }
 

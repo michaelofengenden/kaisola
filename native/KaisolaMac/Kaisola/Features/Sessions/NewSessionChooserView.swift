@@ -20,7 +20,13 @@ struct NewSessionPrimaryOption: Identifiable, Equatable, Sendable {
 enum NewSessionChooserPresentation {
     static let terminalUnavailableReason = "Terminals are preparing. Try again in a moment."
     static let launchFailureMessage =
-        "Session did not start. Check the Run On folder and try again."
+        "Session did not start. Review the error and try again."
+
+    static func launchFailureMessage(detail: String?) -> String {
+        guard let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty else { return launchFailureMessage }
+        return detail
+    }
 
     static func terminalRowsEnabled(
         terminalControlAvailable: Bool,

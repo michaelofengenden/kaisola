@@ -4,12 +4,13 @@
 
 The product direction is approved. This written specification awaits Michael's review.
 
-The design starts from `origin/main` at `11bf5ddff784c1f6da89b850de7f56b6f800161b`. Work belongs on `ui/minimal-canonical-shell` in `/Users/michaelofengenden/Developer/kaisola-worktrees/minimal-canonical-shell`.
+The design branch starts from `e6cc84b9892dc4e4e10eaa3c8573ffdb4c8464c1`. Implementation begins only after approval and after rebasing onto the then-current `origin/main`. Work belongs on `ui/minimal-canonical-shell` in `/Users/michaelofengenden/Developer/kaisola-worktrees/minimal-canonical-shell`.
 
 The baseline is clean:
 
 - 288 Node contract tests passed.
 - 207 focused native tests passed with no failures or skips. The selected suites were `RootShellLayoutsTests`, `SessionPaneLayoutTests`, and `NativePreviewSettingsTests`.
+- A direct read-only Claude Code design critique checked the measurements and current control homes against source, returned `APPROVE WITH AMENDMENTS`, and the accepted amendments are incorporated here.
 - The installed app remains Kaisola 0.1.141 build 1161001. This worktree has not launched, stopped, or replaced it.
 
 ## Campaign boundary
@@ -18,8 +19,8 @@ This is the first design in the current Kaisola modernization campaign. It cover
 
 The following work remains separate because each item has its own state, failure modes, and verification:
 
-- updater dismissal and a signed older-to-newer installation test;
-- selected-chat-first restoration and background hydration;
+- the already-merged updater dismissal fix and its remaining signed older-to-newer installation test;
+- the separately implemented and verified selected-chat-first restoration and background hydration slice, whose integration remains independent;
 - neutral terminal model names after the retired broker runtime;
 - the remaining Settings consolidation;
 - issue review, local installation, and release promotion.
@@ -44,9 +45,9 @@ The shell should:
 
 - keep projects and the complete session hierarchy in a native left source list;
 - put immediate chat, terminal, Mesh, document, or browser content in the center;
-- expose Files, Preview, and Details through one optional right inspector;
-- show no tab when one session is open;
-- place compact session tabs inside the same top bar when several sessions are open;
+- expose Files, Quick Look, and Details through one optional right inspector;
+- show no tab when one surface is visible;
+- place compact working-set tabs inside the same top bar when several surfaces are visible;
 - retain every current action through the bar, a contextual menu, the menu bar, or an inline error state;
 - remove ordinary broker and Reconnect wording from the shell;
 - preserve the existing New Session draft rules;
@@ -87,27 +88,31 @@ Saved `.topBar` preferences migrate to the canonical shell. Migration is one way
 
 The native toolbar is the only persistent horizontal band above the main workspace. The left rail material may continue behind the traffic lights, as it does in Apple's full-height sidebars. The main content and inspector begin directly below the same toolbar lane.
 
+Every persistent control in that lane is a genuine native toolbar item installed through SwiftUI `ToolbarItem` or the equivalent `NSToolbarItem`. Kaisola does not draw clickable views into the sidebar's titlebar material, because the current AppKit lane can render and expose such a view to accessibility while refusing its pointer events. Toolbar acceptance uses synthesized pointer clicks as well as `AXPress`.
+
 The bar has three areas:
 
 - Leading: the sidebar toggle.
-- Principal: the selected surface title or the compact session switcher.
+- Principal: the selected surface title or the compact working-set switcher.
 - Trailing: New Session, an optional Documents menu, the inspector control, and one contextual More menu.
 
 The sidebar and inspector toggles remain visible at every supported width. Other items can reduce or move into overflow.
 
-### No open session
+### No visible surface
 
 The principal area shows the active project name. New Session remains available. The central workspace shows the existing new-session chooser without creating a process before a concrete choice.
 
-### One open session
+### One visible surface
 
 The principal area shows a small status mark, the session title, and a short activity label only when the activity needs explanation. It is text, not a tab or pill.
 
 The bar configures its trailing actions for the focused surface. For example, a chat can expose Stop and Transcript in More, while a document can expose page or editor actions. The bar does not reserve empty slots for controls that do not apply.
 
-### Several open sessions
+### Several visible surfaces
 
-The principal area becomes a compact session switcher inside the toolbar. It lists the active project's open terminal, chat, and Mesh surfaces, plus a New Session draft when one exists. An open surface is a terminal that has not ended or a chat or Mesh run that has not moved to Recently Closed. Recently Closed items stay in their menu and do not become tabs.
+The principal area becomes a compact working-set switcher inside the toolbar. Its items are the terminal, chat, and Mesh surfaces already present in the active project's pane layout, plus a New Session draft when one exists. A running surface that the user has hidden is not in this window working set. It remains available in the complete left source list and the top-bar More menu without forcing a tab to appear. Recently Closed items stay in their menu and do not become tabs.
+
+The bar renders a title when the working set contains zero or one item and compact tabs only when it contains two or more items. Hiding a surface therefore removes its tab without stopping its work. Restoring a hidden surface through the source list uses the source-list navigation command; the tab switcher itself never represents a hidden surface.
 
 The active item has enough width for its title. Inactive items compress first. The left rail remains the complete, readable session list, so the toolbar never needs to display every title at full length.
 
@@ -119,13 +124,15 @@ The switcher uses three fitting variants in order:
 
 The layout chooses the first variant that fits. It does not depend on a single hard-coded window width. The count menu contains full titles, status text, and selection state.
 
-Selecting a tab uses the existing surface-selection commands. Tab context menus preserve Stop, rename, close to Recently Closed, permanent delete, and End Session where each action applies. Recently Closed moves to the File menu and the top-bar More menu. A toolbar tab never creates a second lifetime model.
+Selecting a tab focuses the surface that already owns a pane. It does not add, replace, reorder, or remove a pane, and it can never evict the first pane as a side effect. Tab context menus preserve Stop, rename, close to Recently Closed, permanent delete, and End Session where each action applies. Recently Closed moves to the File menu and the top-bar More menu. A toolbar tab never creates a second lifetime model.
 
 ### Surface lifetime commands
 
 The compact bar has no generic close button. Each command keeps one exact meaning:
 
 - `Hide Session` removes a surface from the pane layout and keeps its terminal, chat, or Mesh process and saved state running.
+- The current pane-menu label `Hide Pane` is renamed to `Hide Session` everywhere. It is not a second command or an alias with different process semantics.
+- `Move to Project` and `Return to <project>` keep the existing terminal-adoption behavior. They live in the pane marker More menu and the source-list row menu, and neither action ends, recreates, or silently hides the session.
 - `Stop Chat` stops the active chat turn. It does not hide, archive, or delete the chat.
 - `Stop All Columns` stops active Mesh work. It does not hide, archive, or delete the Mesh.
 - `Close to Recently Closed` applies only to chats and Mesh runs. It removes the surface from the open list and writes the existing durable Recently Closed entry. If work is active, the confirmation says that closing will stop it.
@@ -141,8 +148,8 @@ Menus show only commands that apply to that surface. Labels stay complete in com
 
 - Repeated New Session actions reuse one draft per project.
 - Creating a draft starts no terminal, chat, agent, or Mesh process.
-- With no other open surface, the toolbar title becomes `New Session` without drawing a tab.
-- With other open surfaces, the draft appears as one item in the compact switcher.
+- With no other visible surface, the toolbar title becomes `New Session` without drawing a tab.
+- With other visible surfaces, the draft appears as one item in the compact switcher.
 - Selecting a real surface keeps the unfinished draft available.
 - Cancel and completion remove the draft exactly as they do today.
 
@@ -169,11 +176,12 @@ The persistent `ConnectionFooter` is removed. Its actions move as follows:
 - The Firebase application account menu moves to an Account submenu in the application menu and the existing Accounts settings pane. Sign in and sign out remain one command away, but the rail no longer spends permanent space on the account name.
 - New terminal, agent, chat, and Mesh actions go to New Session, project context menus, and the File menu.
 - Saved Quick Actions move to a project submenu in the top-bar More menu and remain in the command palette.
-- Files and Preview go to the inspector control.
+- Files goes to the inspector control.
+- The existing Show or Hide File Preview command keeps its meaning as the central editable document or browser column. It moves to the top-bar More menu and the View menu. Inspector Quick Look is a separate read-only surface and never substitutes for that command.
 - Check for Updates remains in the application menu and Updates settings pane.
 - Copy Diagnostics moves to Help and the command palette.
 - Uncommon recovery actions appear only in the affected content's More menu or inline error state.
-- Attention appears on the affected project or session row. When the all-project attention inbox is not empty, a temporary bell button appears in the top bar and opens the existing inbox. The button disappears when the inbox and storage notices are empty.
+- Attention appears on the affected project or session row. The always-present top-bar More control gains a quiet count or dot when the all-project inbox or storage notices need attention, and its menu opens the existing inbox. No toolbar item appears or disappears when attention changes, so neighbouring controls never move under the pointer.
 
 The rail can show a short inline failure message for a project when action is required. It does not keep a permanent connection bar for the healthy case.
 
@@ -190,19 +198,23 @@ The current 32 point `unifiedSessionHeader` is split into state and presentation
 - pane-specific actions become a compact overlay on the pane that owns them;
 - controls that do not need constant visibility move into a named More menu.
 
-The existing header inventory is explicit. Companion control, Mesh prompt queue and configuration, chat account selection, chat overflow, maximize and restore, terminal transcript, terminal pop-out, minimize, rename, pane drag, Files, and Preview each receive a tested toolbar, pane-marker, inspector, contextual-menu, or menu-bar home before the header is removed.
+The existing header inventory is explicit. Companion control, chat account selection and overflow, maximize and restore, terminal transcript and pop-out, minimize, rename, pane drag, Move to Project, Return to Project, Files, and central File Preview each receive a tested toolbar, pane-marker, inspector, contextual-menu, or menu-bar home before the header is removed.
+
+The Mesh inventory is equally explicit: purpose and title, running state, isolation note, hook notice, staged prompt queue, Stop All, and configuration. Structural status and notices stay inside Mesh content; commands move to the focused toolbar contribution or its More menu. The document inventory includes selected file, switching, dirty and save state, loading and conflict state, outline, editing or rendered mode, options, Keep Open, close, reopen, and Hide Document. The browser inventory includes address, loading or failure state, Reload or Retry, Open in Browser, and Close Browser Card. Tests assign every item a visible, inline, or menu home before deleting a header.
 
 A single pane has no internal header.
 
 Split panes do not receive repeated full-width toolbars. Each pane gets one identity marker inside its content boundary. The marker is at most 22 points high and 180 points wide. It contains the title, acts as the pane drag target, and may place one 28 by 28 point More control beside the title. It cannot grow into a row across the pane. A single pane renders neither the marker nor the More control.
 
+When a split surface is represented both by a working-set tab and a pane marker, the pane marker is the local authority for its full identity. Redundant inactive tab titles compress before pane markers do. The selected tab communicates focus; it does not need to repeat every local title at full width.
+
 The split-pane marker and More control remain visible when split panes exist. They do not rely on hover for discovery or accessibility. Full Keyboard Access visits the marker, then More, then content. VoiceOver exposes one marker and one More action per pane, with no hidden duplicate menus. A one-pixel focus treatment identifies the active pane without adding another blue selection block.
 
 When focus moves between panes, the native toolbar updates its title and contextual actions. Pane layout, maximization, transcript, pop-out, and close behavior keep their current model semantics.
 
-Mesh agent names remain structural labels inside the Mesh surface. They are not window toolbars. The same rule applies to a document page label or an inline browser location field when the content cannot be understood without it.
+Mesh agent names, purpose, isolation, and hook notices remain structural labels inside the Mesh surface. They are not window toolbars. The same rule applies to a document page label or an inline browser location field when the content cannot be understood without it.
 
-Document and browser headers lose their separate toolbar backgrounds. Actions that belong to the focused document or browser move through the focused-surface command bridge into the native toolbar. Small labels that are part of the content may remain.
+Document and browser headers lose their separate toolbar backgrounds. Actions that belong to the focused document or browser move through the focused-surface command bridge into the native toolbar. Small labels that are part of the content may remain. When the working-set switcher occupies the principal toolbar area, an editable document column keeps one bounded identity marker under the same 22 by 180 point budget as a split-pane marker. It carries the file name and modified state, not a second action row. A browser may keep a selectable inline location label because the content cannot be understood or navigated safely without it. That label is embedded at the content boundary, is at most 22 points high and 360 points wide, and never restores a full-width 42 point header or its background. Its tooltip and accessibility value expose the untruncated address.
 
 ## Focused surface command bridge
 
@@ -222,14 +234,14 @@ The command bridge carries the current child-owned inventory:
 - Documents: selected document, document switching, pin or Keep Open, close and reopen, dirty state, loading and saving state, outline, edit or rendered mode, conflict state, Save, options, and Hide Document.
 - Browser: current address, loading or failure state, Reload or Retry, Open in Browser, and Close Browser Card.
 
-Document tabs do not become a second tab strip. The principal title includes the focused document name when one session is open. Whenever two or more documents are open, regardless of session count, a trailing `Documents` menu shows the selected document, modified state, the complete document list, Keep Open, close, and reopen commands. One document needs no separate switching control. At narrow widths, Documents moves into More before the principal session control compresses and before the sidebar or inspector toggles can overflow. Command-S and the existing edit commands remain active. Browser address and status use the title's accessibility value and tooltip; Reload, Open in Browser, and Close live in More.
+Document tabs do not become a second tab strip. The principal title includes the focused document name when one surface is visible. Whenever two or more documents are open, regardless of session count, a trailing `Documents` menu shows the selected document, modified state, the complete document list, Keep Open, close, and reopen commands. Zero or one document needs no separate switching control. The always-present More menu still contains Open Document and Show or Hide Document Column, and the File and View menus retain their equivalents, so hiding or closing the column never creates a pointer-only dead end. At narrow widths, Documents moves into More before the principal session control compresses and before the sidebar or inspector toggles can overflow. Command-S and the existing edit commands remain active. Browser address and status use the title's accessibility value and tooltip; Reload, Open in Browser, and Close live in More.
 
 ## Right inspector
 
 The current Files rail becomes one optional inspector with three modes:
 
 - Files;
-- Preview;
+- Quick Look;
 - Details.
 
 Inspector visibility, mode, and width use one application preference, matching the scope of today's Files rail settings. Each window keeps a live copy while it is open and writes changes back to that preference. New windows use the latest saved values.
@@ -239,7 +251,7 @@ The inspector control in the native toolbar opens, closes, and switches the insp
 Each mode begins with content:
 
 - Files can show its search field and file tree.
-- Preview shows the selected read-only preview.
+- Quick Look shows the selected read-only preview.
 - Details shows session identity, activity, account, and other secondary facts.
 
 The Files action map is complete:
@@ -249,14 +261,14 @@ The Files action map is complete:
 | Search | Search field inside Files content, without a full-width toolbar background |
 | New File, New Folder, New AGENTS.md | Inspector control menu and Files background context menu |
 | Refresh, Follow Selected Agent | Inspector control menu |
-| Open | Read-only inspector Preview |
+| Open | Read-only inspector Quick Look |
 | Keep Open | Editable document in the central workspace |
 | Copy Contents, Reveal in Finder | File-row More menu |
 | Rename, Move, Move to Trash | File-row More menu with the existing sheets and confirmations |
 | Mutation progress, failure, and retry | Inline in Files content |
 | Hide Files | Window inspector control |
 
-The file-row More menu stays mounted and labelled for VoiceOver even when its resting visual treatment is quiet. File clicks have one stable rule: Open or a transient single click uses inspector Preview, while Keep Open or the existing pin gesture opens an editable central document. Hiding the inspector never changes the selected session or closes an editable document.
+The file-row More menu stays mounted and labelled for VoiceOver even when its resting visual treatment is quiet. File clicks have one stable rule: Open or a transient single click uses inspector Quick Look, while Keep Open or the existing pin gesture opens an editable central document. Hiding the inspector never changes the selected session or closes an editable document.
 
 Recently Closed also keeps a complete map:
 
@@ -294,7 +306,7 @@ The shell's distinctive quality is spatial continuity. Selecting a session chang
 
 Removing visible chrome must not remove actions.
 
-Every action that leaves a persistent row needs at least one stable replacement. The old footer's complete inventory is account sign in and sign out, Usage, Settings, the all-project attention inbox, Files, Preview, three Mesh variants, Copy Diagnostics, connection status, and Reconnect. Tests must account for each item before `ConnectionFooter` is deleted.
+Every action that leaves a persistent row needs at least one stable replacement. The old footer's complete inventory is account sign in and sign out, Usage, Settings, the all-project attention inbox, Files, central File Preview, three Mesh variants, Copy Diagnostics, connection status, and Reconnect. Tests must account for each item before `ConnectionFooter` is deleted.
 
 Each replacement uses at least one of these paths:
 
@@ -307,7 +319,7 @@ The implementation preserves existing shortcuts. New shortcuts require menu item
 
 VoiceOver order follows the visible structure: sidebar toggle, principal session control, New Session, inspector, More, workspace, then inspector content. Session status is not communicated by color alone. Compact tabs expose full titles and selected state even when their visual variant is icon-only.
 
-The sidebar divider keeps its adjustable accessibility action. Any removed Files or Preview "door" receives an always-mounted toolbar or menu equivalent before the old control disappears.
+The sidebar divider keeps its adjustable accessibility action. Any removed Files or central File Preview "door" receives an always-mounted toolbar or menu equivalent before the old control disappears.
 
 ## State and component boundaries
 
@@ -316,7 +328,7 @@ The design adds focused types rather than expanding `RootShellView.swift` furthe
 `WorkspaceTopBarState` is a pure value that describes:
 
 - active project;
-- open surfaces in the active project;
+- visible working-set surfaces in the active project;
 - selected surface or draft;
 - focused pane;
 - activity and attention state;
@@ -328,7 +340,7 @@ The design adds focused types rather than expanding `RootShellView.swift` furthe
 
 `WorkspaceTopBarLayoutPolicy` selects the full, compressed, or overflow presentation. It is pure and receives measured available space plus item widths, which makes narrow-window behavior testable without launching an app.
 
-`WorkspaceInspectorState` owns inspector visibility, mode, and width for the open window. It reads and writes `workspaceInspectorVisible`, `workspaceInspectorMode`, and `workspaceInspectorWidth` in `NativePreviewSettings`. The width range is 240 through 420 points and the default is 280. It does not own files, documents, or session data.
+`WorkspaceInspectorState` owns inspector visibility, mode, and width for the open window. It reads and writes `workspaceInspectorVisible`, `workspaceInspectorMode`, and `workspaceInspectorWidth` in `NativePreviewSettings`. The width range is 164 through 420 points and the default for a new unsized inspector is 280. The lower bound preserves every valid width from the current 164 through 300 point Files rail instead of silently taking canvas space on migration. Inspector content adapts at the narrow end. The state does not own files, documents, or session data.
 
 `SessionPaneChromePolicy` decides whether a pane needs an identity marker and which contextual actions belong to the focused pane. `SessionPaneLayout` remains the source of pane structure.
 
@@ -348,8 +360,8 @@ On first launch after the change:
 Inspector migration is exact:
 
 - If `workspaceInspectorVisible` is absent and the legacy `workspaceRailVisible` key exists, copy its value. If neither key exists, use `false` for the minimalist new-window default.
-- If `workspaceInspectorWidth` is absent and `workspaceRailWidth` exists, clamp the legacy width into the new 240 through 420 point range. Otherwise use 280.
-- If `workspaceInspectorMode` is absent, use Files. A restored transient read-only file selection may select Preview after the window finishes restoring.
+- If `workspaceInspectorWidth` is absent and the valid legacy `workspaceRailWidth` exists, copy it exactly. Clamp only corrupt or out-of-range values into 164 through 420 points. If neither value exists, use 280.
+- If `workspaceInspectorMode` is absent, use Files. A restored transient read-only file selection may select Quick Look after the window finishes restoring.
 - `filePreviewWidth` remains the central editable-document width during this slice. It never becomes the inspector width.
 - Remove the two legacy Files-rail keys only after all new values have been written successfully.
 
@@ -379,24 +391,25 @@ Implementation starts with failing tests for the new contracts.
 
 ### Pure and migration tests
 
-- `RootShellLayoutsTests` proves the canonical region contract contains one top bar and one workspace.
-- New `WorkspaceTopBarLayoutPolicyTests` cover one session, several sessions, icon compression, overflow, draft selection, and narrow widths.
+- `RootShellLayoutsTests` proves the alternate project, quick-action, session-strip, and pane-header regions are gone. It does not count native toolbars.
+- New `WorkspaceTopBarLayoutPolicyTests` cover zero or one visible surface, several visible surfaces, hidden surfaces excluded from the working set, icon compression, overflow, draft selection, and narrow widths. Selection tests prove tab focus cannot mutate or reduce the pane layout.
 - `SessionPaneLayoutTests` and a new chrome-policy suite cover one pane, split panes, focus changes, and maximization.
 - `KaisolaProductMigrationTests` prove both saved layout values reach the canonical shell without changing project or pane state.
-- Inspector migration tests cover absent keys, legacy visibility and width, clamping, default mode, transient Preview restoration, and removal of the old keys only after a successful write.
+- Inspector migration tests cover absent keys, exact legacy visibility and width preservation, corrupt-value clamping, default mode, transient Quick Look restoration, and removal of the old keys only after a successful write.
 - `NativePreviewSettingsTests`, `CommandRegistryTests`, and Settings tests prove the old choice is gone.
 - Focused-surface coordinator tests cover registration, update, unregister, focus changes, stale owner tokens, stale revisions, child replacement, disabled actions, and document-menu placement for one or several sessions at wide and narrow widths.
 
 ### Behavior tests
 
 - `NewSessionDraftTests` and `NewSessionChooserTests` keep their no-process and reuse guarantees.
-- `DetailShowDoorsTests` proves Files and Preview remain reachable after their pane-header buttons move.
+- `DetailShowDoorsTests` proves Files and the central editable File Preview remain reachable after their pane-header buttons move, including the zero-document state.
 - Workspace Files tests cover Search, New File, New Folder, New AGENTS.md, Refresh, Follow, Open, Keep Open, Copy Contents, Reveal, Rename, Move, Move to Trash, mutation feedback, retry, and Hide through their canonical homes.
 - Quick Action tests prove every saved action remains available through the new menu presentation.
 - Account tests prove sign in and sign out remain reachable through the application menu and Settings.
-- Attention tests prove the temporary bell opens the same all-project inbox, includes storage notices, and disappears only when no attention remains.
+- Attention tests prove the fixed More control opens the same all-project inbox, includes storage notices, changes state without changing its frame, and clears its count or dot only when no attention remains.
 - Command tests prove Copy Diagnostics and Check for Updates remain reachable after the footer is removed.
-- Session close, delete, Recently Closed, rename, Stop, maximize, pop-out, and transcript tests keep their current semantics.
+- Session close, delete, Recently Closed, rename, Stop, maximize, pop-out, transcript, Move to Project, and Return to Project tests keep their current semantics and canonical menu homes.
+- Pane-menu tests prove the old `Hide Pane` label is gone and `Hide Session` keeps the same non-destructive minimize behavior in every menu.
 - Surface-lifetime tests prove Hide never stops work, Stop never hides or deletes, active Close to Recently Closed confirms process stopping, End Session confirms and commits locally first, and Delete Permanently never substitutes for another action.
 - Recently Closed tests cover Undo Last Close, named restore, permanent delete, capacity failure, and retry through both menu locations.
 - Document and browser tests prove every child-owned command registers, follows local enabled state, becomes unavailable after unregister, and never runs for a stale focused surface.
@@ -413,12 +426,12 @@ Fixtures cover:
 - the same sessions at a narrow width with overflow;
 - a New Session draft beside real sessions;
 - two and four split panes;
-- Files, Preview, and Details inspector modes;
+- Files, Quick Look, and Details inspector modes;
 - light, dark, Increased Contrast, and Reduced Motion settings.
 
-The accessibility tree must contain exactly one window-level toolbar. One open session must not expose a tab list. Several sessions must expose one selected tab and full accessible names for compressed tabs. Removed footer actions must remain reachable by their new controls or menus.
+The accessibility tree must contain exactly one `AXToolbar`. One visible surface must not expose a tab list. Several visible surfaces must expose one selected tab and full accessible names for compressed tabs. Every persistent toolbar control must also pass a synthesized pointer click at its visual center, not only `AXPress`. Removed footer actions must remain reachable by their new controls or menus.
 
-A single pane exposes no pane marker. Each split pane exposes exactly one always-visible identity marker and one More control, in that order, before its content. Tests reject a full-width pane overlay, hover-only accessibility, and duplicate hidden actions.
+A single pane exposes no pane marker. Each split pane exposes exactly one always-visible identity marker and one More control, in that order, before its content. Tests reject a full-width pane overlay, hover-only accessibility, duplicate hidden actions, and a browser location label that grows back into a full-width header.
 
 Visual inspection checks spacing, traffic-light clearance, full-height rail material, title truncation, inspector continuity, focus, and the absence of stacked header backgrounds.
 
@@ -445,10 +458,10 @@ Publishing needs a meaningful release milestone and an exact candidate receipt. 
 The shell is ready to ship when all of the following are true:
 
 1. A normal window renders one persistent native top bar and no stacked project, quick-action, session, pane, Files, document, or browser toolbar rows.
-2. One open session renders as a title, not a tab.
-3. Several open sessions switch through compact controls inside the same top bar and collapse into an accessible overflow menu at narrow widths.
+2. One visible surface renders as a title, not a tab; hidden running sessions remain in the left source list without forcing tabs to appear.
+3. Several visible surfaces switch through compact controls inside the same top bar and collapse into an accessible overflow menu at narrow widths. Switching tabs cannot replace or remove a pane.
 4. The left rail remains the complete project and session navigator with one strong selection treatment.
-5. The right side is one optional inspector with Files, Preview, and Details modes and no separate toolbar band.
+5. The right side is one optional inspector with Files, Quick Look, and Details modes and no separate toolbar band. Central editable File Preview remains a distinct workspace column.
 6. Split panes use one bounded identity marker and one More control per pane, while a single pane has no pane chrome.
 7. Every action removed from the old strips, footer, Files header, pane header, document header, and browser header has a tested canonical home.
 8. The navigation-layout setting and alternate shell are removed, and saved Top Bar users migrate without losing workspace state.

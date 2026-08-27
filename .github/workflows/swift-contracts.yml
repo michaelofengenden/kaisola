@@ -531,12 +531,6 @@ jobs:
         run: >-
           npm run native:preflight --
           --app "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app"
-      - name: Prove packaged broker and PTY continuity
-        if: ${{ !inputs.skip-macos-release-build }}
-        run: >-
-          npm run native:helper:probe --
-          "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app/Contents/Resources/BrokerHelper"
-          --require-signed-host
       - name: Gate installed optimized PDF previews
         if: ${{ !inputs.skip-macos-release-build }}
         run: |

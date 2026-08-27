@@ -6,10 +6,6 @@
 #   ./scripts/native-dev.sh
 #   ./scripts/native-dev.sh --launch-only
 #   ./scripts/native-dev.sh --clean-legacy
-#
-# The development app uses the native-only "Kaisola Native" broker by default,
-# preserving its durable PTYs while remaining separate from production. Set
-# KAISOLA_NATIVE_BROKER_PROFILE=development for a clean-room Dev broker.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -21,16 +17,6 @@ APP="${KAISOLA_NATIVE_APP:-$HOME/Applications/Kaisola Dev.app}"
 BUNDLE_ID="${KAISOLA_NATIVE_BUNDLE_ID:-com.kaisola.mac.dev}"
 DISPLAY_NAME="${KAISOLA_NATIVE_DISPLAY_NAME:-Kaisola Dev}"
 SOURCE_APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/Kaisola.app"
-PROFILE_ROUTE="${KAISOLA_NATIVE_BROKER_PROFILE:-native}"
-case "$PROFILE_ROUTE" in
-  native) PROFILE_NAME="Kaisola Native" ;;
-  development) PROFILE_NAME="Kaisola Dev" ;;
-  *)
-    /bin/echo "KAISOLA_NATIVE_BROKER_PROFILE must be native or development." >&2
-    exit 2
-    ;;
-esac
-BROKER_INFO="$HOME/Library/Application Support/$PROFILE_NAME/session-broker/broker.json"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
 BUILD_CURRENT=1
 CLEAN_LEGACY=0
@@ -133,8 +119,8 @@ build_current_source() {
     /bin/echo "Build completed without the expected app: $SOURCE_APP" >&2
     exit 1
   fi
-  if [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/kaisola-broker-bootstrap" ]]; then
-    /bin/echo "Build completed without the packaged broker helper." >&2
+  if [[ ! -x "$SOURCE_APP/Contents/Resources/BrokerHelper/bin/node" ]]; then
+    /bin/echo "Build completed without the packaged Node helper." >&2
     exit 1
   fi
 
@@ -335,45 +321,6 @@ clean_legacy_copies() {
   shopt -u nullglob
 }
 
-broker_alive() {
-  [[ -f "$BROKER_INFO" ]] || return 1
-  local pid
-  pid="$(/usr/bin/plutil -extract pid raw "$BROKER_INFO" 2>/dev/null || true)"
-  [[ -n "$pid" ]] && /bin/kill -0 "$pid" 2>/dev/null
-}
-
-start_broker_if_needed() {
-  local helper="$APP/Contents/Resources/BrokerHelper"
-  if broker_alive; then
-    /bin/echo "Using the running $PROFILE_NAME broker."
-    return 0
-  fi
-
-  if [[ ! -d "$helper" ]]; then
-    /bin/echo "The development app has no broker helper: $helper" >&2
-    /bin/echo "Run without --launch-only to rebuild it from current source." >&2
-    exit 1
-  fi
-
-  /bin/echo "Starting the isolated $PROFILE_NAME broker…"
-  /usr/bin/env node -e '
-    const fs=require("fs"),os=require("os"),path=require("path"),crypto=require("crypto"),{spawnSync}=require("child_process");
-    const helper=process.argv[1],profileName=process.argv[2];
-    const manifest=JSON.parse(fs.readFileSync(path.join(helper,"manifest.json"),"utf8"));
-    const profileRoot=path.join(os.homedir(),"Library","Application Support",profileName);
-    const brokerRoot=path.join(profileRoot,"session-broker");
-    fs.mkdirSync(brokerRoot,{recursive:true,mode:0o700});
-    const socketDir=path.join(os.homedir(),".kaisola-session");
-    fs.mkdirSync(socketDir,{recursive:true,mode:0o700});
-    const launchFile=path.join(brokerRoot,"launch-native-"+crypto.randomUUID()+".json");
-    const launch={protocol:2,securityEpoch:1,implementationVersion:manifest.brokerImplementationVersion,packageSchema:manifest.schemaVersion,packageVersion:manifest.packageVersion,contentDigest:manifest.contentDigest,token:crypto.randomBytes(32).toString("hex"),socketPath:path.join(socketDir,crypto.randomBytes(9).toString("hex")+".sock"),infoFile:path.join(brokerRoot,"broker.json"),lockFile:path.join(brokerRoot,"broker.lock"),storageDir:path.join(profileRoot,"terminal-cache"),logFile:path.join(brokerRoot,"broker.log"),startedAt:Date.now(),version:"kaisola-native-dev",smoke:false};
-    fs.writeFileSync(launchFile,JSON.stringify(launch),{mode:0o600});
-    const r=spawnSync(path.join(helper,"bin","kaisola-broker-bootstrap"),["--launch",launchFile],{encoding:"utf8",env:{...process.env,KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER:"1"}});
-    if(r.status!==0){console.error(String(r.stderr||r.stdout).trim());process.exit(1);}
-    console.log("  "+String(r.stdout).trim());
-  ' "$helper" "$PROFILE_NAME"
-}
-
 if [[ "$BUILD_CURRENT" -eq 1 ]]; then
   build_current_source
 elif [[ ! -x "$APP/Contents/MacOS/Kaisola" ]]; then
@@ -397,12 +344,11 @@ if [[ "$LAUNCH_APP" -eq 0 ]]; then
   exit 0
 fi
 
-start_broker_if_needed
-/bin/echo "Launching $DISPLAY_NAME ($PROFILE_NAME profile)…"
+/bin/echo "Launching $DISPLAY_NAME…"
 stop_development_app
 # Launch Services detaches the app from the calling shell, so the app stays
 # open when this script returns (including from npm and non-interactive shells).
 # `-n` is safe because stop_development_app has closed the prior instance.
-/usr/bin/open -n --env KAISOLA_NATIVE_BROKER_PROFILE="$PROFILE_ROUTE" "$APP"
+/usr/bin/open -n "$APP"
 /bin/echo
 /bin/echo "Ready: open a project with ⌘O, a terminal with ⌘T, or files with ⌘B."

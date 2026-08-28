@@ -1027,6 +1027,14 @@ private struct AcpTranscriptCodeBlock: View {
                     .lineSpacing(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
+                    // Stated here rather than inherited. The enclosing
+                    // `AssistantMarkdownText` enables selection for the block
+                    // stack, but a code fence is the single thing in a reply
+                    // people most often drag across, and it is the one block
+                    // that lives inside its own nested scroll view — so it
+                    // says so itself instead of depending on an ancestor that
+                    // a later refactor could move.
+                    .textSelection(.enabled)
             }
             .frame(maxHeight: 420)
         }

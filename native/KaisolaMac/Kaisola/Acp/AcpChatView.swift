@@ -1547,6 +1547,30 @@ struct TranscriptRowView: View {
     var conversationIsRunning = true
 
     var body: some View {
+        // Every prose row can be copied whole.
+        //
+        // Highlighting reaches one paragraph and stops: SwiftUI selection
+        // cannot cross two `Text` views, and a rendered answer is one per
+        // block. Selection is still enabled and still worth having for
+        // grabbing a phrase; this is the affordance for when what you wanted
+        // was the message. Rows that are evidence rather than prose (tool
+        // calls, plans, audits) return nil and keep their own affordances.
+        if let copyable = row.copyableText {
+            content.contextMenu {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(copyable, forType: .string)
+                } label: {
+                    Label("Copy Message", systemImage: "doc.on.doc")
+                }
+            }
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         switch row {
         case let .runProfileAudit(_, profile):
             HStack(spacing: 6) {

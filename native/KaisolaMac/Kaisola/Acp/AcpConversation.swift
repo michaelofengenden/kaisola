@@ -34,6 +34,37 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
         }
     }
 
+    /// The row's own prose, for "Copy message".
+    ///
+    /// Highlighting inside the transcript only ever reaches one paragraph:
+    /// SwiftUI's text selection cannot span two `Text` views, and a rendered
+    /// answer is one per block plus separate views for code and tables. So
+    /// dragging across a reply selects a fragment of it, which is what
+    /// "users should be able to highlight and copy text from agent chat
+    /// sessions" (2026-08-28) runs into. Selection stays where it is; this is
+    /// the whole-message path beside it, and it returns the ORIGINAL markdown
+    /// rather than the rendered attributed text so a pasted code fence is
+    /// still a code fence.
+    ///
+    /// `nil` for rows that are evidence rather than prose — tool calls, plans,
+    /// and run-profile audits carry their own copy affordances and their own
+    /// structure, and flattening them to a string would paste something that
+    /// was never on screen.
+    var copyableText: String? {
+        switch self {
+        case let .user(_, text, _):
+            // The stored prompt keeps its pinned trailing "📎 names" line,
+            // which the bubble parses back out; copy what was shown.
+            let parts = AcpConversation.userTextParts(text)
+            return parts.body.isEmpty ? nil : parts.body
+        case let .message(_, text), let .thought(_, text),
+             let .permissionDecision(_, text):
+            return text.isEmpty ? nil : text
+        case .tool, .plan, .runProfileAudit:
+            return nil
+        }
+    }
+
     /// Permission decisions are live timeline evidence only. Persisting an
     /// event per hostile overflow would move the same exhaustion risk to disk
     /// across relaunches, where a tail-only restore cannot prune older pages.

@@ -1548,6 +1548,19 @@ struct DesktopTintComponents: Equatable, Sendable {
     let red: Double
     let green: Double
     let blue: Double
+
+    /// Rec. 709 luma of the sampled tint — the live path's only brightness
+    /// signal about the desktop. `DesktopTintSampler.ceilings` clamps every
+    /// channel at 0.91, so this saturates there for genuinely white desktops;
+    /// `LightGlassFrost.liveLiftRamp` is solved against that clamp.
+    var luminance: Double { red * 0.2126 + green * 0.7152 + blue * 0.0722 }
+
+    /// Max minus min channel: zero for any grey (including the fallback and a
+    /// ceiling-clamped white), and the sampler's 0.70 chroma retention already
+    /// applied — `LightGlassFrost.liveLiftChromaGate` is stated post-retention.
+    var chromaSpread: Double {
+        max(red, max(green, blue)) - min(red, min(green, blue))
+    }
 }
 
 enum DesktopTintSampler {

@@ -70,6 +70,40 @@ enum AcpSubagentPhase: Equatable, Sendable {
         case .failed: "failed"
         }
     }
+
+    /// The word to show given whether the turn that spawned this subagent is
+    /// still alive.
+    ///
+    /// `.working` means the spawning tool call is still open — which is only
+    /// meaningful while the turn is. Once the turn ends, a call still marked
+    /// in-progress is one whose outcome the adapter never sent, and a chip
+    /// still saying "working…" is claiming live work inside a finished
+    /// conversation. That is the "it says working a bunch of times when the
+    /// agent has finished" report (2026-08-28): one stale chip for every
+    /// subagent whose completion went unrecorded, all of them still animating
+    /// under an answer that already landed.
+    ///
+    /// The honest word is that nothing came back. It is deliberately not
+    /// "finished" — we do not know that it finished, only that this
+    /// transcript was never told — and not "failed", which asserts an
+    /// outcome just as invented.
+    func statusWord(turnIsLive: Bool) -> String {
+        guard !turnIsLive else { return statusWord }
+        switch self {
+        case .working: return "no report"
+        // A detached agent outliving its turn is expected rather than
+        // anomalous, so it keeps its own past-tense word.
+        case .backgrounded: return "delegated"
+        case .finished, .failed: return statusWord
+        }
+    }
+
+    /// Whether the chip may animate. Nothing in a finished turn is live, so a
+    /// stale chip must go still as well as change its word — an unreported
+    /// subagent that kept shimmering would still read as running.
+    func animates(turnIsLive: Bool) -> Bool {
+        turnIsLive && self == .working
+    }
 }
 
 /// The current turn's subagent headcount, for the live status row: while the

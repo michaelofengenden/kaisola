@@ -1925,7 +1925,7 @@ struct SubagentChipRow: View {
     @State private var showsActivity = false
 
     private var statusText: String {
-        phase == .backgrounded && !turnIsLive ? "delegated" : phase.statusWord
+        phase.statusWord(turnIsLive: turnIsLive)
     }
 
     /// The launch acknowledgement on a backgrounded spawn is adapter
@@ -1991,7 +1991,7 @@ struct SubagentChipRow: View {
                 .symbolEffect(
                     .pulse,
                     options: .repeating,
-                    isActive: !reduceMotion && phase == .working
+                    isActive: !reduceMotion && phase.animates(turnIsLive: turnIsLive)
                 )
                 .accessibilityHidden(true)
             Text(call.title)
@@ -2027,7 +2027,7 @@ struct SubagentChipRow: View {
                     .fill(.red.opacity(0.08))
             }
         }
-        .kaisolaControlSurface(active: phase == .working)
+        .kaisolaControlSurface(active: phase.animates(turnIsLive: turnIsLive))
         .contentShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous))
     }
 

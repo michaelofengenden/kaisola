@@ -5565,7 +5565,12 @@ private struct TopBarProjectSwitcher: View {
             }
             .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
+        // `.button` + `.plain`, the footer account chip's recipe: the
+        // borderless bridge flattens a custom HStack label to its text and
+        // draws its own leading indicator, which is exactly what the compact
+        // switcher must not look like.
+        .menuStyle(.button)
+        .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
         .onHover { inside in

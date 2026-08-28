@@ -224,17 +224,33 @@ struct ShellTabCardBackground: View {
             } else {
                 ZStack {
                     shape.fill(.ultraThinMaterial)
-                    // The `KaisolaBarSurfaceModifier` plate, verbatim: the tab
-                    // card is the bar surface lifted into a shape.
-                    shape.fill(Color.white.opacity(colorScheme == .dark ? 0.055 : 0.55))
+                    // A white-led plate over the shared thin material. The bar
+                    // surface's resting coverages (0.55/0.055) vanish at tab
+                    // scale — the light bar ground is already near-white and
+                    // the dark ground swallows a five-percent lift — so the
+                    // active card takes the composer card's posture instead:
+                    // decisively white in light, a clear luminance step in
+                    // dark, while the material keeps a breath of the desktop
+                    // in its edges.
+                    shape.fill(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.92))
+                    // Light needs the chrome card's containment hairline: a
+                    // white card over a near-white ground has no edge of its
+                    // own. Dark's luminance step is the edge, same rule as
+                    // `ChromeCardElevation.containmentOpacity`.
+                    if colorScheme == .light {
+                        shape.stroke(
+                            Color.black.opacity(0.07),
+                            lineWidth: KaisolaVisualSystem.hairline
+                        )
+                    }
                 }
             }
         }
         // The composer's soft shadow language at control scale.
         .shadow(
-            color: .black.opacity(colorScheme == .dark ? 0.18 : 0.07),
-            radius: 6,
-            y: 2
+            color: .black.opacity(colorScheme == .dark ? 0.18 : 0.10),
+            radius: 5,
+            y: 1.5
         )
     }
 }

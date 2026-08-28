@@ -11,9 +11,12 @@ test('account recovery visual QA covers both appearances and accessibility text'
     'utf8'
   )
 
+  // Membership in the dark loop, not position within it: the trailing `; do`
+  // anchor made this fail the moment any surface was appended after account
+  // recovery, which says nothing about the coverage being asserted.
   assert.match(
     workflow,
-    /for surface in [^\n]*settings-account-recovery; do\n\s*capture="\$output\/dark-\$surface\.png"/
+    /for surface in [^\n]*\bsettings-account-recovery\b[^\n]*; do\n\s*capture="\$output\/dark-\$surface\.png"/
   )
   assert.match(workflow, /large-text-settings-account-recovery\.png/)
   assert.match(workflow, /KAISOLA_NATIVE_VISUAL_LARGE_TEXT=1/)

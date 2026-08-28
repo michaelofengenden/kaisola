@@ -1270,7 +1270,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = ["topbar", "topbar-attention", "new-session-topbar"].contains(visualSurface)
+            settings.navigationLayout = [
+                "topbar", "topbar-attention", "new-session-topbar",
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface)
                 ? .topBar
                 : .leftTree
             settings.appearance = visualAppearance == "dark" ? .dark : .light
@@ -1313,6 +1316,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
                 && visualSurface != "empty-workspace" && visualSurface != "new-session"
                 && visualSurface != "new-session-topbar"
+                && visualSurface != "topbar-mixed" && visualSurface != "topbar-mixed-narrow"
             settings.workspaceRailWidth = 196
             // Pin both ordinary and failure-boundary document widths. The
             // fixture settings object is non-persistent, so these values can
@@ -1453,7 +1457,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 model.setCompanionControlFixtureActive(true, for: terminal)
             } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
-            } else if ["mixed", "mixed-search", "mixed-density", "permission", "chat-thinking"].contains(visualSurface) {
+            } else if [
+                "mixed", "mixed-search", "mixed-density", "permission", "chat-thinking",
+                // The 2026-08-28 shell-revision previews: the same three mixed
+                // sessions (terminal, agent terminal, chat) under the merged
+                // session-tab bar, at the ordinary width and at a narrow one.
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface) {
                 model.loadVisualMixedSessionFixture(
                     workspace: workspace,
                     includePermission: visualSurface == "permission"
@@ -1744,11 +1754,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // resized to: the minimum, or the ideal for `settings-ideal`.
         let visualSettingsSize = SettingsWindowChrome.visualContentSize(surface: visualSurface)
 
+        // The shell-revision compression preview: the same merged-bar window,
+        // narrow enough that the inactive tabs visibly give up title width.
+        let visualWorkspaceWidth: CGFloat = visualSurface == "topbar-mixed-narrow" ? 820 : 1_360
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? 1_360 : 1_080)))),
+                width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? visualWorkspaceWidth : 1_080)))),
                 height: visualSettings ? visualSettingsSize.height : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -1789,7 +1802,25 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if visualSettings || visualOnboarding {
             window.contentView = NSHostingView(rootView: content)
         } else {
-            window.contentView = FullHeightWorkspaceHostingView(rootView: content)
+            // 2026-08-28 decision 4: `shellRadius` becomes a real custom
+            // window shape. The window already runs a transparent titlebar
+            // over a full-size, clear-backed content view, so clipping the
+            // root container at the shell's 30pt continuous corner is what
+            // makes the corner the window's own — the pixels outside the
+            // curve are genuinely transparent, not painted over the system
+            // corner. Settings and onboarding keep their system chrome.
+            // Known preview limits, named honestly: full screen and split
+            // view still need their own fixture pass before this ships.
+            window.contentView = FullHeightWorkspaceHostingView(
+                rootView: AnyView(
+                    content.clipShape(
+                        RoundedRectangle(
+                            cornerRadius: KaisolaVisualSystem.shellRadius,
+                            style: .continuous
+                        )
+                    )
+                )
+            )
         }
         window.delegate = self
         window.makeKeyAndOrderFront(nil)

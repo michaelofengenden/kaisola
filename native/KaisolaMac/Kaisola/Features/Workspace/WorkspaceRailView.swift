@@ -297,9 +297,8 @@ struct WorkspaceRailView: View {
                                             WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                                         )
                                         : .clear,
-                                    in: RoundedRectangle(
-                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                                        style: .continuous
+                                    in: ShellTabShape.shape(
+                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                                     )
                                 )
                                 .contentShape(Rectangle())
@@ -325,15 +324,12 @@ struct WorkspaceRailView: View {
         // The persisted preference stays at least 164 pt, but the responsive
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
-        // One layer, flush to the window edges, exactly like the left project
-        // rail (see the "no chrome panel here" comment in `leftTreeLayout`).
-        // The rounded card, its stroke, and the 4pt float were the box overlay
-        // Michael asked to remove; the seam to the content is the resize
-        // divider's own hairline.
-        .background {
-            SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
-                .ignoresSafeArea()
-        }
+        // No backdrop of its own since the 2026-08-28 revision (decision 6):
+        // the rail mounts inside the shared floating chrome card
+        // (`kaisolaChromePanel` in `RootShellView.detailArea`), which supplies
+        // the surface, the soft shadow, and the gutter of window glass around
+        // it. Painting the full-bleed rail glass here again would fill that
+        // gutter and turn the card back into a column.
         .task {
             tree.load(root)
             tree.search(searchText)
@@ -1020,9 +1016,8 @@ struct WorkspaceRailView: View {
                         WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                     )
                     : .clear,
-                in: RoundedRectangle(
-                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                    style: .continuous
+                in: ShellTabShape.shape(
+                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                 )
             )
             .contentShape(Rectangle())

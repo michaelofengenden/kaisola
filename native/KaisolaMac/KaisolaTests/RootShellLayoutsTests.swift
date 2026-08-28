@@ -26,19 +26,17 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertGreaterThan(image.tiffRepresentation?.count ?? 0, 1_000)
     }
 
-    func testTopBarShellRendersAllFiveRegions() throws {
+    func testTopBarShellRendersOneMergedBarOverWorkspaceAndFooter() throws {
+        // 2026-08-28 revision, decision 2: the project strip and session strip
+        // are one 40pt bar, and the persistent Quick Actions row is gone.
         XCTAssertEqual(
             RootShellRenderContract.regions(for: .topBar),
-            [.projects, .quickActions, .sessions, .workspace, .footer]
+            [.projects, .sessions, .workspace, .footer]
         )
 
         let image = try renderRootShell(
             RootTopBarShell(actions: inertRootShellActions()) { _ in
-                Text("Projects")
-            } quickActions: { _ in
-                Text("Quick Actions")
-            } sessions: { _ in
-                Text("Sessions")
+                Text("Bar")
             } detail: { _ in
                 Text("Workspace")
             } footer: { _ in

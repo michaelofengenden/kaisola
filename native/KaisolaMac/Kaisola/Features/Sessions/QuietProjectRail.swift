@@ -1587,6 +1587,12 @@ enum QuietSelectionPill {
     /// Inset from the row's own edges, so the pill floats inside the column
     /// rather than reaching the sidebar's border.
     static let horizontalInset: CGFloat = 6
+    /// The faint neutral wash a resting row gains under the pointer — the
+    /// session tabs' hover language carried onto the source list (2026-08-28
+    /// decision 3). Quieter than the tabs' 0.06: the rail rows sit shoulder to
+    /// shoulder, so the wash only has to say "this row", not lift a control
+    /// off open glass.
+    static let hoverWashOpacity: Double = 0.05
     /// How much of the pill a split's *other* pane wears.
     ///
     /// Both panes are genuinely on screen, so both are marked — but only one
@@ -1632,8 +1638,25 @@ private struct QuietSelectionPillView: View {
     var leadingInset: CGFloat = QuietSelectionPill.horizontalInset
 
     var body: some View {
-        RoundedRectangle(cornerRadius: QuietSelectionPill.cornerRadius, style: .continuous)
+        // The tab silhouette at row scale: `paneRadius`-family pills by
+        // default, capsules when the preview variant asks for them, so the
+        // rail's selection and the session tabs speak one shape language.
+        ShellTabShape.shape(cornerRadius: QuietSelectionPill.cornerRadius)
             .fill(Color.accentColor.opacity(QuietSelectionPill.fillOpacity(dark: colorScheme == .dark)))
+            .padding(.leading, leadingInset)
+            .padding(.trailing, QuietSelectionPill.horizontalInset)
+            .accessibilityHidden(true)
+    }
+}
+
+/// The rows' pointer answer: the same shape as the selection pill, in a faint
+/// neutral wash — the session tabs' hover fill at row scale.
+private struct QuietHoverWashView: View {
+    var leadingInset: CGFloat = QuietSelectionPill.horizontalInset
+
+    var body: some View {
+        ShellTabShape.shape(cornerRadius: QuietSelectionPill.cornerRadius)
+            .fill(Color.primary.opacity(QuietSelectionPill.hoverWashOpacity))
             .padding(.leading, leadingInset)
             .padding(.trailing, QuietSelectionPill.horizontalInset)
             .accessibilityHidden(true)
@@ -1704,6 +1727,10 @@ private struct QuietRowBody: View {
             } else if isOnScreen {
                 QuietSelectionPillView(leadingInset: pillLeadingInset)
                     .opacity(QuietSelectionPill.companionOpacity)
+            } else if showsReveal {
+                // `showsReveal` is the row's hover flag; a resting row answers
+                // the pointer with the tabs' faint wash (2026-08-28 revision).
+                QuietHoverWashView(leadingInset: pillLeadingInset)
             }
         }
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:

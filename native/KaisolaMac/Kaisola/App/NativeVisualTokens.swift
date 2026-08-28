@@ -175,6 +175,70 @@ enum SurfaceTabChrome {
     static let inactiveStrokeOpacity = 0.11
 }
 
+/// The 2026-08-28 session-tab revision's one still-open visual call: whether
+/// the session tabs (and the rail selection fills that borrow their language)
+/// are `paneRadius` pills that rhyme with the pane cards, or full capsules
+/// like Safari's tab groups. Everything else about the tab design is
+/// confirmed; the silhouette renders in both variants for Michael's review,
+/// switched per-process by `KAISOLA_SHELL_PREVIEW_TABS=pills|capsules`.
+/// Pills are the default so an ordinary launch needs no environment at all.
+enum ShellTabShape {
+    enum Variant: String {
+        case pills
+        case capsules
+    }
+
+    static let variant: Variant = ProcessInfo.processInfo
+        .environment["KAISOLA_SHELL_PREVIEW_TABS"]
+        .flatMap(Variant.init) ?? .pills
+
+    /// The silhouette at the requested scale. Tabs pass `paneRadius`; the
+    /// rail rows pass their own row-scale radius so a pill stays a row and
+    /// never becomes a lozenge.
+    static func shape(cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius) -> AnyShape {
+        switch variant {
+        case .pills:
+            AnyShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        case .capsules:
+            AnyShape(Capsule(style: .continuous))
+        }
+    }
+}
+
+/// The active session tab's card: the shared bar-surface voice (a white-led
+/// plate over thin material) in the chosen tab silhouette, floated with the
+/// composer's existing soft shadow. Inactive tabs draw nothing at rest and a
+/// faint wash on hover, so this view is only ever mounted under the one
+/// selected tab.
+struct ShellTabCardBackground: View {
+    var cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let shape = ShellTabShape.shape(cornerRadius: cornerRadius)
+        Group {
+            if reduceTransparency {
+                shape.fill(Color(nsColor: .controlBackgroundColor))
+            } else {
+                ZStack {
+                    shape.fill(.ultraThinMaterial)
+                    // The `KaisolaBarSurfaceModifier` plate, verbatim: the tab
+                    // card is the bar surface lifted into a shape.
+                    shape.fill(Color.white.opacity(colorScheme == .dark ? 0.055 : 0.55))
+                }
+            }
+        }
+        // The composer's soft shadow language at control scale.
+        .shadow(
+            color: .black.opacity(colorScheme == .dark ? 0.18 : 0.07),
+            radius: 6,
+            y: 2
+        )
+    }
+}
+
 /// The light-appearance recipe shared by the two navigation rails, the
 /// workspace canvas, and the inset detail panel.
 ///

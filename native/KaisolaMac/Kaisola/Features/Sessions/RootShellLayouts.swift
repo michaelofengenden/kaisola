@@ -34,13 +34,19 @@ enum RootShellRenderRegion: String, Equatable {
 /// A small, explicit contract for the regions each navigation shell renders.
 /// The view tests exercise these alongside an actual SwiftUI render, which
 /// keeps a future extraction from silently dropping a layout-only surface.
+///
+/// 2026-08-28 revision: the top-bar layout's project strip and session strip
+/// merged into one 40pt bar, so `.projects` and `.sessions` are now the two
+/// halves of a single band, and the persistent Quick Actions row is gone
+/// (saved Quick Actions keep their project context menus and the command
+/// palette).
 enum RootShellRenderContract {
     static func regions(for layout: NavigationLayout) -> [RootShellRenderRegion] {
         switch layout {
         case .leftTree:
             [.projects, .workspace, .footer]
         case .topBar:
-            [.projects, .quickActions, .sessions, .workspace, .footer]
+            [.projects, .sessions, .workspace, .footer]
         }
     }
 }
@@ -77,40 +83,42 @@ struct RootLeftTreeShell<Sidebar: View, Detail: View>: View {
     }
 }
 
-/// The project-tab presentation. Its five regions are injected independently
-/// so workspace content remains in RootShellView while the layout can be
+/// The session-tab presentation. Its regions are injected independently so
+/// workspace content remains in RootShellView while the layout can be
 /// rendered and regression-tested in isolation.
-struct RootTopBarShell<Projects: View, QuickActions: View, Sessions: View, Detail: View, Footer: View>: View {
+///
+/// 2026-08-28 revision, decision 2: the stacked project strip and session
+/// strip merged into ONE bar. `bar` receives the whole band — compact project
+/// switcher leading, the active project's session tabs inline, New Session
+/// and the trailing controls at the end — and the shell no longer draws
+/// hairline dividers around it: the tabs sit directly on the window glass and
+/// the detail chrome card's own gutter separates the content below.
+struct RootTopBarShell<Bar: View, Detail: View, Footer: View>: View {
+    /// The single bar's height. The old 36pt session strip moves to 40 so the
+    /// tabs breathe (revision decision 3).
+    static var barHeight: CGFloat { 40 }
+
     let actions: RootShellActionModel
-    private let projects: (RootShellActionModel) -> Projects
-    private let quickActions: (RootShellActionModel) -> QuickActions
-    private let sessions: (RootShellActionModel) -> Sessions
+    private let bar: (RootShellActionModel) -> Bar
     private let detail: (RootShellActionModel) -> Detail
     private let footer: (RootShellActionModel) -> Footer
 
     init(
         actions: RootShellActionModel,
-        @ViewBuilder projects: @escaping (RootShellActionModel) -> Projects,
-        @ViewBuilder quickActions: @escaping (RootShellActionModel) -> QuickActions,
-        @ViewBuilder sessions: @escaping (RootShellActionModel) -> Sessions,
+        @ViewBuilder bar: @escaping (RootShellActionModel) -> Bar,
         @ViewBuilder detail: @escaping (RootShellActionModel) -> Detail,
         @ViewBuilder footer: @escaping (RootShellActionModel) -> Footer
     ) {
         self.actions = actions
-        self.projects = projects
-        self.quickActions = quickActions
-        self.sessions = sessions
+        self.bar = bar
         self.detail = detail
         self.footer = footer
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            projects(actions)
-            Divider()
-            quickActions(actions)
-            sessions(actions)
-            Divider()
+            bar(actions)
+                .frame(height: Self.barHeight)
             detail(actions)
             HStack(spacing: 0) {
                 footer(actions).frame(width: 235)

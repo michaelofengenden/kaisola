@@ -983,22 +983,15 @@ struct RootShellView: View {
                 // the List and the header band; the footer keeps its controls.
                 footer
             }
-            // Safari's inset sidebar card: the tinted backdrop runs edge to
-            // edge behind the column and the navigation content floats on a
-            // rounded material panel inside it. The top inset clears the
-            // traffic lights, which the header used to pad around itself.
-            // No chrome panel here — the sidebar is ONE layer.
-            //
-            // It used to be four stacked over the desktop: behind-window
-            // vibrancy, a white veil, a `.thinMaterial` card, and that card's
-            // lit edge. The material is opaque enough on its own that the
-            // column rendered as a flat gray box inside the window no matter
-            // what was behind it, so every layer under it was paying rendering
-            // cost to be invisible. A panel isolates content from its backdrop;
-            // the sidebar's backdrop is the thing it is meant to show. All that
-            // survives is the traffic-light clearance the panel used to carry
-            // as its top inset.
-            .padding(.top, NativeWorkspaceChrome.chromePanelTopInset)
+            // Safari's inset sidebar card, for real this time (2026-08-28
+            // decision 1): the rail's glass backdrop runs edge to edge behind
+            // the column, and the navigation content floats on the same
+            // `chromeRadius`/`chromeInset` chrome card the detail column
+            // already rides — one card, its frost, its soft shadow, and a
+            // gutter of ground on every side. The top inset still clears the
+            // traffic lights and the AppKit toolbar lane, exactly as the old
+            // bare padding did.
+            .kaisolaChromePanel(topInset: NativeWorkspaceChrome.chromePanelTopInset)
             // The traffic-light clearance band the padding above just created is
             // the third and last piece of the boundary. It carries nothing at
             // all, so this segment can be a plain overlay — and it has to be
@@ -1091,12 +1084,19 @@ struct RootShellView: View {
                         )
                 }
                 if detailRailPanelVisible, let root = model.currentProjectDirectory {
-                    // Files live on the right, matching the editor/reference rail in
-                    // the Electron workspace and leaving the project hierarchy as the
-                    // sole navigation surface on the left.
+                    // Files live on the right, and since the 2026-08-28
+                    // revision (decision 6) they ride the same floating inset
+                    // chrome card as the detail column — a `chromeRadius`
+                    // panel over the window glass with the standard
+                    // `chromeInset` gutter — instead of a full-bleed column.
                     workspaceRailDivider
                     workspaceRail(root: root)
                         .id(root)
+                        .kaisolaChromePanel(
+                            topInset: NativeWorkspaceChrome.detailPanelTopInset(
+                                layout: settings.navigationLayout
+                            )
+                        )
                         .frame(width: widths.rail)
                 }
             }
@@ -1508,43 +1508,44 @@ struct RootShellView: View {
         }
     }
 
-    /// A project tab strip over a session row, then the detail pane (Electron's
-    /// "Top bar" mode).
+    /// One 40pt session-tab bar over the detail pane (the revised "Top bar"
+    /// mode, 2026-08-28 decision 2): compact project switcher leading, the
+    /// active project's session tabs inline, New Session and the existing
+    /// trailing controls at the end. The old stacked project strip and Quick
+    /// Actions row are gone; project switching lives in the switcher's menu
+    /// and saved Quick Actions keep their context-menu and palette homes.
     private var topBarLayout: some View {
         let actions = shellActions
         return RootTopBarShell(actions: actions) { actions in
-            ProjectTabStripView(
-                projects: model.projects,
-                selected: activeProjectBinding,
-                menu: actions.projectContextMenu,
-                newSession: actions.beginNewSession,
-                useSidebar: actions.useLeftTreeNavigation,
-                reorder: actions.moveProject
-            )
-            .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-        } quickActions: { actions in
-            if let active = model.projects.first(where: { $0.id == activeProjectID }),
-               let activeDir = active.directory {
-                QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    actions.runQuickAction(action, activeDir)
-                }
+            HStack(spacing: 8) {
+                TopBarProjectSwitcher(
+                    projects: model.projects,
+                    selected: activeProjectBinding,
+                    contextMenu: actions.projectContextMenu
+                )
+                .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
+                SessionStrip(
+                    model: model,
+                    projectID: activeProjectID,
+                    draft: activeProjectID.flatMap { newSessionDrafts.draft(for: $0) },
+                    selectedDraftID: newSessionDrafts.selectedDraftID,
+                    selectDraft: selectNewSessionDraft,
+                    selectRealSurface: actions.selectRealSurface,
+                    cancelDraft: cancelNewSession,
+                    rename: actions.renameSurface,
+                    closeChat: actions.closeChat,
+                    deleteChat: actions.deleteChat,
+                    closeMesh: actions.closeMesh,
+                    deleteMesh: actions.deleteMesh,
+                    deleteRecentlyClosed: actions.deleteRecentlyClosed
+                )
+                TopBarTrailingControls(
+                    activeProject: model.projects.first { $0.id == activeProjectID },
+                    newSession: actions.beginNewSession,
+                    useSidebar: actions.useLeftTreeNavigation
+                )
+                .padding(.trailing, 10)
             }
-        } sessions: { actions in
-            SessionStrip(
-                model: model,
-                projectID: activeProjectID,
-                draft: activeProjectID.flatMap { newSessionDrafts.draft(for: $0) },
-                selectedDraftID: newSessionDrafts.selectedDraftID,
-                selectDraft: selectNewSessionDraft,
-                selectRealSurface: actions.selectRealSurface,
-                cancelDraft: cancelNewSession,
-                rename: actions.renameSurface,
-                closeChat: actions.closeChat,
-                deleteChat: actions.deleteChat,
-                closeMesh: actions.closeMesh,
-                deleteMesh: actions.deleteMesh,
-                deleteRecentlyClosed: actions.deleteRecentlyClosed
-            )
         } detail: { _ in
             detailArea
         } footer: { _ in
@@ -5512,6 +5513,141 @@ enum TerminalPaneMinimizeAction: Equatable {
 /// Every live surface for the active project, in the top-bar layout. Chats and
 /// Mesh runs intentionally share this row with terminals so project tabs are a
 /// real workspace boundary rather than decoration.
+/// The merged bar's leading control (2026-08-28 decision 2): the current
+/// project's name and a chevron, opening a menu of every open project. It
+/// replaces the full project tab strip; reordering and per-project actions
+/// stay on the context menu the strip's chips carried.
+private struct TopBarProjectSwitcher: View {
+    let projects: [AppModel.ProjectGroup]
+    @Binding var selected: String?
+    let contextMenu: (AppModel.ProjectGroup) -> AnyView
+
+    @State private var hovering = false
+
+    var body: some View {
+        let current = projects.first { $0.id == selected }
+        Menu {
+            ForEach(projects) { project in
+                Button {
+                    selected = project.id
+                } label: {
+                    if project.id == selected {
+                        Label(project.name, systemImage: "checkmark")
+                    } else {
+                        Text(project.name)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if let tint = ProjectTint.color(current?.colorHex) {
+                    Circle().fill(tint).frame(width: 7, height: 7)
+                }
+                Text(current?.name ?? "No Project")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                if let current, current.attentionCount > 0 {
+                    KaisolaStatusBadge(
+                        text: "\(current.attentionCount)",
+                        systemImage: "exclamationmark",
+                        tone: .needsYou
+                    )
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.kaisolaSecondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background {
+                ShellTabShape.shape()
+                    .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { inside in
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) {
+                hovering = inside
+            }
+        }
+        .help("Switch project")
+        .accessibilityLabel(
+            current.map { "Project: \($0.name)" } ?? "Project switcher"
+        )
+        .accessibilityIdentifier("topbar.project-switcher")
+        .contextMenu {
+            if let current { contextMenu(current) }
+        }
+    }
+}
+
+/// The merged bar's trailing cluster: New Session in the active project, and
+/// the existing switch-to-sidebar control, unchanged from the old project
+/// strip's trailing pair.
+private struct TopBarTrailingControls: View {
+    let activeProject: AppModel.ProjectGroup?
+    let newSession: (AppModel.ProjectGroup) -> Void
+    let useSidebar: () -> Void
+
+    @State private var hoveredKey: String?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button {
+                guard let activeProject, activeProject.directory != nil else { return }
+                newSession(activeProject)
+            } label: {
+                iconCircle("plus", enabled: activeProject?.directory != nil)
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveredKey = $0 ? "plus" : (hoveredKey == "plus" ? nil : hoveredKey) }
+            .disabled(activeProject?.directory == nil)
+            .help(
+                activeProject.map { project in
+                    project.directory == nil
+                        ? "Locate this project before starting a session"
+                        : "New session in \(project.name)"
+                } ?? "Open a project before starting a session"
+            )
+            .accessibilityLabel(
+                activeProject.map { "New session in \($0.name)" } ?? "New session"
+            )
+            Button(action: useSidebar) {
+                iconCircle("sidebar.left", enabled: true, hoverKey: "sidebar")
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveredKey = $0 ? "sidebar" : (hoveredKey == "sidebar" ? nil : hoveredKey) }
+            .help("Move projects and sessions to the sidebar")
+            .accessibilityLabel("Use sidebar navigation")
+        }
+    }
+
+    private func iconCircle(
+        _ symbol: String,
+        enabled: Bool,
+        hoverKey: String? = nil
+    ) -> some View {
+        let key = hoverKey ?? symbol
+        let hovering = hoveredKey == key && enabled
+        let presence = enabled ? 1.0 : 0.45
+        return Image(systemName: symbol)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled))
+            .frame(width: 26, height: 26)
+            .background(Color.primary.opacity((hovering ? 0.09 : 0.04) * presence), in: Circle())
+            .overlay {
+                Circle().stroke(
+                    Color.primary.opacity((hovering ? 0.16 : 0.08) * presence),
+                    lineWidth: 0.8
+                )
+            }
+            .animation(.easeOut(duration: KaisolaVisualSystem.hoverDuration), value: hovering)
+    }
+}
+
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
@@ -5559,9 +5695,12 @@ private struct SessionStrip: View {
         let meshes = project.map { model.meshes(in: $0.id) } ?? []
         let recentlyClosed = project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
         let draftSelected = draft?.id == selectedDraftID
-        return ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
+        // A plain HStack, not the old horizontal ScrollView: at narrow widths
+        // the tabs compress in place — inactive titles truncate first, the
+        // active tab keeps its title longest via `layoutPriority` — which is
+        // the revision's compression posture. The full overflow policy (count
+        // menu) is future work.
+        return HStack(spacing: 8) {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty, draft == nil {
                     Text("No activity in this project")
                         .font(.caption)
@@ -5586,6 +5725,7 @@ private struct SessionStrip: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .layoutPriority(draftSelected ? 1 : 0)
                     .onHover { hovering in
                         hoveredTabID = hovering ? draft.id : (hoveredTabID == draft.id ? nil : hoveredTabID)
                     }
@@ -5640,6 +5780,7 @@ private struct SessionStrip: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .layoutPriority(!draftSelected && model.selectedChatID == chat.id ? 1 : 0)
                     .onHover { hovering in
                         hoveredTabID = hovering ? chat.id : (hoveredTabID == chat.id ? nil : hoveredTabID)
                     }
@@ -5681,6 +5822,7 @@ private struct SessionStrip: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .layoutPriority(!draftSelected && model.selectedMeshID == mesh.id ? 1 : 0)
                     .onHover { hovering in
                         hoveredTabID = hovering ? mesh.id : (hoveredTabID == mesh.id ? nil : hoveredTabID)
                     }
@@ -5757,6 +5899,7 @@ private struct SessionStrip: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    .layoutPriority(!draftSelected && model.selectedSessionID == session.id ? 1 : 0)
                     .onHover { hovering in
                         hoveredTabID = hovering ? session.id : (hoveredTabID == session.id ? nil : hoveredTabID)
                     }
@@ -5772,19 +5915,9 @@ private struct SessionStrip: View {
                     .id(session.id)
                 }
                 Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-            }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-            .onChange(of: selectedSurfaceID) { _, id in
-                guard let id else { return }
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    proxy.scrollTo(id, anchor: .center)
-                }
-            }
         }
-        .frame(height: 36)
+        .padding(.horizontal, 4)
+        .frame(maxHeight: .infinity)
     }
 
     private func restoreRecentlyClosed(_ id: String) {
@@ -5798,30 +5931,25 @@ private struct SessionStrip: View {
         }
     }
 
+    /// 2026-08-28 decision 3: the active tab is a white-led card on the shared
+    /// bar surface with the existing soft shadow language; inactive tabs are
+    /// quiet text on the glass with NO resting fill, gaining a faint wash on
+    /// hover. The tinted plates and hairline strokes of the old strip are
+    /// gone; status still speaks through the small mark before each title.
+    /// `tint` stays in the signature for the callers' status vocabulary but no
+    /// longer colours the tab plate.
+    @ViewBuilder
     private func surfaceTabBackground(
         selected: Bool,
         tint: Color,
         hovered: Bool = false
     ) -> some View {
-        // Selection follows `QuietSelectionPill.fillOpacity`'s dark step-up:
-        // a mid-dark tint at 0.10 over a dark panel was a 0.007 luminance
-        // delta — selection the eye could not find. Hover lifts an unselected
-        // tab the same way the rail's controls answer the pointer.
-        RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-            .fill(
-                selected
-                    ? tint.opacity(colorScheme == .dark ? 0.22 : 0.13)
-                    : Color.primary.opacity(hovered ? 0.07 : 0.035)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-                    .stroke(
-                        selected
-                            ? tint.opacity(SurfaceTabChrome.sessionSelectedStrokeOpacity)
-                            : Color.primary.opacity(SurfaceTabChrome.inactiveStrokeOpacity),
-                        lineWidth: KaisolaVisualSystem.hairline
-                    )
-            }
+        if selected {
+            ShellTabCardBackground()
+        } else if hovered {
+            ShellTabShape.shape()
+                .fill(Color.primary.opacity(0.06))
+        }
     }
 }
 
@@ -6418,11 +6546,15 @@ private struct ConnectionFooter: View {
     /// The account chip is the only flexible child: everything else is
     /// `fixedSize`, so the name gets the whole remainder and truncates only
     /// when the sidebar is genuinely at its minimum.
+    /// The slim resting footer of the 2026-08-28 revision (decision 5):
+    /// account chip, usage percent, attention bell, ellipsis — and nothing
+    /// else. The gear moved into the account and overflow menus (Settings
+    /// stays one ⌘, away and one menu item away), and the footer never shows
+    /// a resting status text line.
     var body: some View {
         HStack(spacing: FooterAccountBudget.gap) {
             accountMenu
             usageChip
-            settingsButton
             attentionButton
             overflowMenu
         }
@@ -6431,23 +6563,6 @@ private struct ConnectionFooter: View {
         .padding(.leading, FooterAccountBudget.leadingPadding)
         .padding(.trailing, FooterAccountBudget.trailingPadding)
         .frame(height: 40)
-    }
-
-    /// One click to Settings — the ⌘, destination, which until now existed
-    /// only inside two menus. Monochrome on purpose: it is a door, not a state.
-    private var settingsButton: some View {
-        Button(action: showSettings) {
-            Image(systemName: "gearshape")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.kaisolaPrimary)
-                .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
-                .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-        .help("Settings (⌘,)")
-        .accessibilityLabel("Settings")
-        .accessibilityIdentifier("footer.settings")
     }
 
     /// The primary account's tightest plan window, as one percentage that opens

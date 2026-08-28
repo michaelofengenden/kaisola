@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.144 — 2026-08-28
+
+- Chats come back before terminals do. Opening a project now restores the chat workspace first and lets terminal setup follow, so the conversation you left is on screen without waiting for the slower half of the window; a large new reconnect test bed pins the ordering.
+- The one-bar shell direction is written down. The minimal canonical shell contract lives in the docs for the next UI round.
+- Releases finish themselves again. The release script survived its tag and assets but died silently before landing the version bump on three consecutive releases; it now retries transient reads and says what failed instead of exiting mute.
+
 ## 0.1.143 — 2026-08-28
 
 - Onboarding's update prompt now opens the Updates pane directly instead of leaving you to find it in Settings.

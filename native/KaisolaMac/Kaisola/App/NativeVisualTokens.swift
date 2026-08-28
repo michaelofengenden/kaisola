@@ -223,16 +223,25 @@ struct ShellTabCardBackground: View {
                 shape.fill(Color(nsColor: .controlBackgroundColor))
             } else {
                 ZStack {
-                    shape.fill(.ultraThinMaterial)
-                    // A white-led plate over the shared thin material. The bar
-                    // surface's resting coverages (0.55/0.055) vanish at tab
-                    // scale — the light bar ground is already near-white and
-                    // the dark ground swallows a five-percent lift — so the
-                    // active card takes the composer card's posture instead:
-                    // decisively white in light, a clear luminance step in
-                    // dark, while the material keeps a breath of the desktop
-                    // in its edges.
-                    shape.fill(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.92))
+                    // The composer card's opaque plates, not a translucent
+                    // material: a see-through fill lets the card's own black
+                    // drop shadow show through from behind, which turned the
+                    // "white-led card" into a grey wash darker than the bar it
+                    // sits on (measured 231 against a 239 ground). Opaque
+                    // white in light; in dark the `AcpBubble` lift (#2C2C2E),
+                    // the one dark plate already solved to read over any
+                    // backdrop. Resolved by the drawing appearance, the
+                    // `KaisolaInk` idiom, same as `AcpBubble.userFill` above.
+                    shape.fill(Color(nsColor: NSColor(name: nil) { appearance in
+                        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                            ? NSColor(
+                                srgbRed: 0x2C / 255,
+                                green: 0x2C / 255,
+                                blue: 0x2E / 255,
+                                alpha: 1
+                            )
+                            : .white
+                    }))
                     // Light needs the chrome card's containment hairline: a
                     // white card over a near-white ground has no edge of its
                     // own. Dark's luminance step is the edge, same rule as

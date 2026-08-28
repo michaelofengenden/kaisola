@@ -5699,7 +5699,12 @@ private struct SessionStrip: View {
         let chats = project.map { model.chats(in: $0.id) } ?? []
         let meshes = project.map { model.meshes(in: $0.id) } ?? []
         let recentlyClosed = project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
-        let draftSelected = draft?.id == selectedDraftID
+        // `draft != nil` matters: with no draft at all, `draft?.id ==
+        // selectedDraftID` is `nil == nil` — true — and that phantom
+        // "selected draft" suppressed every real tab's selected state. The
+        // old strip's resting fills hid the bug; the revision's active-card
+        // design exposed it.
+        let draftSelected = draft != nil && draft?.id == selectedDraftID
         // A plain HStack, not the old horizontal ScrollView: at narrow widths
         // the tabs compress in place — inactive titles truncate first, the
         // active tab keeps its title longest via `layoutPriority` — which is

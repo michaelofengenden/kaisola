@@ -48,7 +48,14 @@ function command(program, args, { capture = false, allowFailure = false } = {}) 
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
   })
   if (result.error) throw result.error
-  if (!allowFailure && result.status !== 0) process.exit(result.status ?? 1)
+  if (!allowFailure && result.status !== 0) {
+    // In capture mode the child's stderr went to a pipe; surfacing it is the
+    // difference between a diagnosable failure and the silent exits that made
+    // three releases in a row look finished while the bump PR sat unarmed.
+    if (capture && result.stderr) process.stderr.write(result.stderr)
+    console.error(`release-fast: ${program} ${args.join(' ')} exited ${result.status}`)
+    process.exit(result.status ?? 1)
+  }
   return result
 }
 
@@ -174,8 +181,20 @@ function landOnMain(branch, title, body) {
   // to know which checks are required — the repo decides that.
   const deadline = Date.now() + 45 * 60 * 1000
   for (;;) {
-    const raw = output('gh', ['pr', 'view', number, '--json', 'mergeStateStatus,state'])
-    const { mergeStateStatus: state, state: prState } = JSON.parse(raw)
+    // A view moments after `gh pr create` can fail transiently (read-replica
+    // lag, a network blip); that is a reason to poll again, not to die. The
+    // deadline below still bounds how long transient can claim to be.
+    const view = command('gh', ['pr', 'view', number, '--json', 'mergeStateStatus,state'],
+      { capture: true, allowFailure: true })
+    if (view.status !== 0) {
+      if (Date.now() > deadline) {
+        fail(`could not read pull request #${number}: ${(view.stderr || '').trim()}`)
+      }
+      console.log(`release-fast: pull request #${number} read failed transiently, retrying…`)
+      sleep(20)
+      continue
+    }
+    const { mergeStateStatus: state, state: prState } = JSON.parse(view.stdout)
     if (prState === 'MERGED') break
     if (state === 'CLEAN' || state === 'UNSTABLE' || state === 'HAS_HOOKS') {
       // UNSTABLE means a non-required check is failing or still running. The

@@ -101,6 +101,224 @@ final class AuthModelTests: XCTestCase {
     }
 }
 
+/// The relaunch contract of the real `FirebaseAuthBackend`, proven against a
+/// fake secure store and a scripted Identity Toolkit: a saved refresh token is
+/// silently exchanged for a fresh session at launch, transient network trouble
+/// never destroys the saved session, terminal rejections and explicit
+/// sign-out do.
+final class FirebaseAuthRestoreTests: XCTestCase {
+    private static let configuration = FirebaseAuthConfiguration(
+        projectId: "kaisola-test",
+        apiKey: "test-api-key-0123456789",
+        serverURL: URL(string: "https://auth.kaisola.test/session")!
+    )
+
+    private static let savedAccount = AuthAccount(
+        uid: "uid-1",
+        email: "person@example.com",
+        displayName: "Kaisola Person",
+        avatarURL: nil
+    )
+
+    /// "header.{}.signature" — three JWT pieces whose claims decode to nil
+    /// fields, standing in for any fresh ID token.
+    private static let freshIDToken = "header.e30.signature"
+
+    private static func json(_ object: [String: Any]) -> Data {
+        try! JSONSerialization.data(withJSONObject: object)
+    }
+
+    private static func response(_ request: URLRequest, status: Int) -> HTTPURLResponse {
+        HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil
+        )!
+    }
+
+    private static func tokenExchange(rotatingTo refreshToken: String) -> Data {
+        json(["id_token": freshIDToken, "refresh_token": refreshToken])
+    }
+
+    private static func serverVerification() -> Data {
+        json([
+            "ok": true,
+            "user": ["uid": "uid-1", "email": "person@example.com", "name": "Kaisola Person"],
+        ])
+    }
+
+    private static func seededStore() async throws -> LockedAuthSecureStore {
+        let store = LockedAuthSecureStore()
+        try await AuthSessionVault(store: store).save(
+            refreshToken: "refresh-1", account: savedAccount
+        )
+        return store
+    }
+
+    @MainActor
+    func testRestoreAfterRelaunchSignsBackInFromTheSharedSecureStore() async throws {
+        let store = try await Self.seededStore()
+        let log = AuthRequestLog()
+        // A NEW backend on the same store is the relaunch: nothing survives
+        // in memory, only what the secure store carries.
+        let relaunched = FirebaseAuthBackend(
+            configuration: Self.configuration,
+            secureStore: store,
+            httpClient: ScriptedAuthHTTPClient { request in
+                log.append(request)
+                if request.url?.host == "securetoken.googleapis.com" {
+                    return (Self.tokenExchange(rotatingTo: "refresh-2"), Self.response(request, status: 200))
+                }
+                return (Self.serverVerification(), Self.response(request, status: 200))
+            }
+        )
+        let model = AuthModel(backend: relaunched)
+
+        await model.restore()
+
+        XCTAssertEqual(model.phase, .signedIn(Self.savedAccount))
+        XCTAssertNil(model.signedOutNotice)
+        let vault = AuthSessionVault(store: store)
+        let storedToken = try await vault.refreshToken()
+        XCTAssertEqual(
+            storedToken, "refresh-2",
+            "the silent refresh rotates the persisted refresh token"
+        )
+        XCTAssertTrue(log.requestedHosts.contains("securetoken.googleapis.com"))
+    }
+
+    /// The ID token is never persisted, so a relaunch always holds an
+    /// (effectively) expired one. Restore must silently exchange the refresh
+    /// token for a fresh ID token and authenticate the server check with THAT
+    /// token — never sign out, never reuse a stale credential.
+    @MainActor
+    func testRestoreSilentlyRefreshesTheExpiredIDTokenBeforeServerVerification() async throws {
+        let store = try await Self.seededStore()
+        let log = AuthRequestLog()
+        let backend = FirebaseAuthBackend(
+            configuration: Self.configuration,
+            secureStore: store,
+            httpClient: ScriptedAuthHTTPClient { request in
+                log.append(request)
+                if request.url?.host == "securetoken.googleapis.com" {
+                    return (Self.tokenExchange(rotatingTo: "refresh-2"), Self.response(request, status: 200))
+                }
+                return (Self.serverVerification(), Self.response(request, status: 200))
+            }
+        )
+
+        let restored = try await backend.restore()
+
+        XCTAssertEqual(restored, Self.savedAccount)
+        XCTAssertEqual(
+            log.requests(toHost: "securetoken.googleapis.com").count, 1,
+            "restore performs exactly one silent token refresh"
+        )
+        let verification = log.requests(toHost: "auth.kaisola.test")
+        XCTAssertEqual(
+            verification.first?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer \(Self.freshIDToken)",
+            "server verification runs on the freshly refreshed ID token"
+        )
+    }
+
+    @MainActor
+    func testTransientRefreshFailureAtLaunchKeepsTheSavedSession() async throws {
+        let store = try await Self.seededStore()
+        let backend = FirebaseAuthBackend(
+            configuration: Self.configuration,
+            secureStore: store,
+            httpClient: ScriptedAuthHTTPClient { _ in
+                throw URLError(.notConnectedToInternet)
+            }
+        )
+        let model = AuthModel(backend: backend)
+
+        await model.restore()
+
+        XCTAssertEqual(
+            model.phase, .signedIn(Self.savedAccount),
+            "an offline launch keeps the saved session instead of signing out"
+        )
+        let vault = AuthSessionVault(store: store)
+        let storedToken = try await vault.refreshToken()
+        XCTAssertEqual(
+            storedToken, "refresh-1",
+            "the untouched keychain lets the next launch retry cleanly"
+        )
+    }
+
+    @MainActor
+    func testTerminalRefreshRejectionSignsOutAndClearsTheStore() async throws {
+        let store = try await Self.seededStore()
+        let backend = FirebaseAuthBackend(
+            configuration: Self.configuration,
+            secureStore: store,
+            httpClient: ScriptedAuthHTTPClient { request in
+                (
+                    Self.json(["error": ["message": "INVALID_REFRESH_TOKEN"]]),
+                    Self.response(request, status: 400)
+                )
+            }
+        )
+        let model = AuthModel(backend: backend)
+
+        await model.restore()
+
+        XCTAssertEqual(model.phase, .signedOut)
+        let vault = AuthSessionVault(store: store)
+        let storedToken = try await vault.refreshToken()
+        let storedAccount = try await vault.account()
+        XCTAssertNil(storedToken)
+        XCTAssertNil(storedAccount)
+    }
+
+    @MainActor
+    func testExplicitSignOutClearsTheSecureStore() async throws {
+        let store = try await Self.seededStore()
+        let backend = FirebaseAuthBackend(
+            configuration: Self.configuration,
+            secureStore: store,
+            httpClient: ScriptedAuthHTTPClient { request in
+                (Self.serverVerification(), Self.response(request, status: 200))
+            }
+        )
+        let model = AuthModel(backend: backend)
+
+        await model.signOut()
+
+        XCTAssertEqual(model.phase, .signedOut)
+        let vault = AuthSessionVault(store: store)
+        let storedToken = try await vault.refreshToken()
+        let storedAccount = try await vault.account()
+        XCTAssertNil(storedToken)
+        XCTAssertNil(storedAccount)
+    }
+}
+
+private struct ScriptedAuthHTTPClient: AuthHTTPClient {
+    let handler: @Sendable (URLRequest) throws -> (Data, HTTPURLResponse)
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        try handler(request)
+    }
+}
+
+private final class AuthRequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [URLRequest] = []
+
+    func append(_ request: URLRequest) {
+        lock.withLock { recorded.append(request) }
+    }
+
+    var requestedHosts: Set<String> {
+        lock.withLock { Set(recorded.compactMap { $0.url?.host }) }
+    }
+
+    func requests(toHost host: String) -> [URLRequest] {
+        lock.withLock { recorded.filter { $0.url?.host == host } }
+    }
+}
+
 private struct RestoreFailure: LocalizedError {
     var errorDescription: String? { "Kaisola could not access the saved sign-in." }
 }
@@ -203,9 +421,13 @@ final class KeychainAuthMigrationTests: XCTestCase {
                 return errSecSuccess
             }
         )
+        // The protection refresh is exercised by its own tests below; disabled
+        // here so this test keeps pinning the 0.1.136 regression in isolation
+        // (an unconditional migration delete with no re-add).
         let store = KeychainAuthSecureStore(
             service: "test.firebase-auth",
-            securityOperations: operations
+            securityOperations: operations,
+            legacyRefreshMarker: .disabled
         )
 
         let data = try store.data(for: "firebase-refresh-token")
@@ -218,5 +440,163 @@ final class KeychainAuthMigrationTests: XCTestCase {
 
         // And the next launch still finds it.
         XCTAssertEqual(try store.data(for: "firebase-refresh-token"), Data("token".utf8))
+    }
+
+    /// The statuses measured on a real unentitled build (macOS 26): a
+    /// data-protection READ answers `errSecItemNotFound` while data-protection
+    /// WRITES answer `errSecMissingEntitlement`. A legacy item created by a
+    /// pre-Developer-ID binary keeps that binary's ACL/partition forever under
+    /// `SecItemUpdate` — the per-update keychain prompt. The one-time refresh
+    /// must re-CREATE the item (delete + fresh add, current app as creator)
+    /// exactly once, and later launches must not churn.
+    func testLegacyProtectionRefreshRecreatesTheItemOnceAcrossLaunches() throws {
+        final class World: @unchecked Sendable {
+            var legacy: [String: Data] = ["firebase-refresh-token": Data("token".utf8)]
+            var legacyDeletes = 0
+            var legacyAdds = 0
+        }
+        final class Marker: @unchecked Sendable {
+            var refreshed: Set<String> = []
+        }
+        let world = World()
+        let marker = Marker()
+        let markerFacade = KeychainAuthLegacyRefreshMarker(
+            needsRefresh: { !marker.refreshed.contains($0) },
+            markRefreshed: { marker.refreshed.insert($0) }
+        )
+        func isDataProtection(_ query: CFDictionary) -> Bool {
+            (query as NSDictionary)[kSecUseDataProtectionKeychain as String] as? Bool == true
+        }
+        func account(_ query: CFDictionary) -> String {
+            (query as NSDictionary)[kSecAttrAccount as String] as? String ?? ""
+        }
+        let operations = KeychainAuthSecurityOperations(
+            copyMatching: { query, result in
+                if isDataProtection(query) { return errSecItemNotFound }
+                guard let data = world.legacy[account(query)] else { return errSecItemNotFound }
+                result?.pointee = data as CFTypeRef
+                return errSecSuccess
+            },
+            update: { query, attributes in
+                if isDataProtection(query) { return errSecMissingEntitlement }
+                guard world.legacy[account(query)] != nil else { return errSecItemNotFound }
+                world.legacy[account(query)] =
+                    (attributes as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            add: { query, _ in
+                if isDataProtection(query) { return errSecMissingEntitlement }
+                world.legacyAdds += 1
+                world.legacy[account(query)] =
+                    (query as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            delete: { query in
+                if isDataProtection(query) { return errSecItemNotFound }
+                guard world.legacy[account(query)] != nil else { return errSecItemNotFound }
+                world.legacyDeletes += 1
+                world.legacy[account(query)] = nil
+                return errSecSuccess
+            }
+        )
+
+        // Launch one: the read succeeds AND re-creates the item once.
+        let store = KeychainAuthSecureStore(
+            service: "test.firebase-auth",
+            securityOperations: operations,
+            legacyRefreshMarker: markerFacade
+        )
+        XCTAssertEqual(try store.data(for: "firebase-refresh-token"), Data("token".utf8))
+        XCTAssertEqual(world.legacyDeletes, 1, "the stale item is deleted exactly once")
+        XCTAssertEqual(world.legacyAdds, 1, "and re-created exactly once, fresh creator ACL")
+        XCTAssertEqual(
+            world.legacy["firebase-refresh-token"], Data("token".utf8),
+            "the credential survives the re-creation byte for byte"
+        )
+        XCTAssertTrue(marker.refreshed.contains("firebase-refresh-token"))
+
+        // Launch two (fresh store, fresh process fallback state): reads keep
+        // working with zero further delete/add churn.
+        let relaunched = KeychainAuthSecureStore(
+            service: "test.firebase-auth",
+            securityOperations: operations,
+            legacyRefreshMarker: markerFacade
+        )
+        XCTAssertEqual(try relaunched.data(for: "firebase-refresh-token"), Data("token".utf8))
+        XCTAssertEqual(world.legacyDeletes, 1, "the refresh is one-time")
+        XCTAssertEqual(world.legacyAdds, 1)
+    }
+
+    /// A refresh whose re-add is refused must not cost the only copy: the
+    /// credential goes back through the ordinary write path, the caller still
+    /// gets its data, and the item stands afterwards.
+    func testFailedRefreshReaddRestoresTheCredentialThroughTheWritePath() throws {
+        final class World: @unchecked Sendable {
+            var legacy: [String: Data] = ["firebase-refresh-token": Data("token".utf8)]
+            var legacyAddAttempts = 0
+            var failFirstLegacyAdd = true
+        }
+        final class Marker: @unchecked Sendable {
+            var refreshed: Set<String> = []
+        }
+        let world = World()
+        let marker = Marker()
+        let markerFacade = KeychainAuthLegacyRefreshMarker(
+            needsRefresh: { !marker.refreshed.contains($0) },
+            markRefreshed: { marker.refreshed.insert($0) }
+        )
+        func isDataProtection(_ query: CFDictionary) -> Bool {
+            (query as NSDictionary)[kSecUseDataProtectionKeychain as String] as? Bool == true
+        }
+        func account(_ query: CFDictionary) -> String {
+            (query as NSDictionary)[kSecAttrAccount as String] as? String ?? ""
+        }
+        let operations = KeychainAuthSecurityOperations(
+            copyMatching: { query, result in
+                if isDataProtection(query) { return errSecItemNotFound }
+                guard let data = world.legacy[account(query)] else { return errSecItemNotFound }
+                result?.pointee = data as CFTypeRef
+                return errSecSuccess
+            },
+            update: { query, attributes in
+                if isDataProtection(query) { return errSecMissingEntitlement }
+                guard world.legacy[account(query)] != nil else { return errSecItemNotFound }
+                world.legacy[account(query)] =
+                    (attributes as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            add: { query, _ in
+                if isDataProtection(query) { return errSecMissingEntitlement }
+                world.legacyAddAttempts += 1
+                if world.failFirstLegacyAdd {
+                    world.failFirstLegacyAdd = false
+                    return errSecInteractionNotAllowed
+                }
+                world.legacy[account(query)] =
+                    (query as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            delete: { query in
+                if isDataProtection(query) { return errSecItemNotFound }
+                world.legacy[account(query)] = nil
+                return errSecSuccess
+            }
+        )
+
+        let store = KeychainAuthSecureStore(
+            service: "test.firebase-auth",
+            securityOperations: operations,
+            legacyRefreshMarker: markerFacade
+        )
+        XCTAssertEqual(try store.data(for: "firebase-refresh-token"), Data("token".utf8))
+        XCTAssertEqual(
+            world.legacy["firebase-refresh-token"], Data("token".utf8),
+            "the refused re-add fell back through the write path; the credential survives"
+        )
+        XCTAssertEqual(world.legacyAddAttempts, 2, "refresh add refused, write-path add landed")
+        XCTAssertTrue(
+            marker.refreshed.contains("firebase-refresh-token"),
+            "the write path's fresh add is itself the refreshed item"
+        )
     }
 }

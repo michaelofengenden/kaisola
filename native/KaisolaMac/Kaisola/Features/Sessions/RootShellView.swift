@@ -603,7 +603,13 @@ struct RootShellView: View {
                     browserMounted: model.browserCardURL != nil,
                     previewMounted: model.previewedFileURL != nil,
                     filesRailVisible: settings.workspaceRailVisible
-                        && model.currentProjectDirectory != nil
+                        && model.currentProjectDirectory != nil,
+                    // Exactly the condition `emptyWorkspaceState` renders the
+                    // chooser under, so "is the chooser up" is one answer
+                    // rather than two that can disagree.
+                    sessionChooserMounted: model.projects.contains {
+                        $0.id == activeProjectID && $0.directory != nil
+                    }
                 )
             )
             .ignoresSafeArea()
@@ -5349,16 +5355,28 @@ enum NativeWorkspaceChrome {
     /// text over the backdrop that the wash's contrast floors are solved for:
     /// session panes, the document preview, the browser card, and the Files
     /// rail all count, and so does the missing-session recovery state, which is
-    /// itself text on the canvas. The empty-state card does not — it carries
-    /// its own material.
+    /// itself text on the canvas.
+    ///
+    /// The "Start a session" chooser counts too, as of 2026-08-28 — "the start
+    /// a new session should share the same background canvas as the LHS and
+    /// RHS rails". It was excused on legibility grounds, which still holds
+    /// (the card brings its own material), but legibility was never the whole
+    /// question. The graduated rails mount the CANVAS recipe so the three
+    /// surfaces read as one; an idle canvas drops to the clear still and a
+    /// whisper of veil, so precisely when the chooser is up the middle went
+    /// flat while the rails either side stayed tinted. Idleness is now the
+    /// genuinely empty canvas — no project, nothing offered — which is what it
+    /// was always describing.
     nonisolated static func canvasIsIdle(
         layoutIsEmpty: Bool,
         hasRecovery: Bool,
         browserMounted: Bool,
         previewMounted: Bool,
-        filesRailVisible: Bool
+        filesRailVisible: Bool,
+        sessionChooserMounted: Bool = false
     ) -> Bool {
-        layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted && !filesRailVisible
+        layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted
+            && !filesRailVisible && !sessionChooserMounted
     }
 }
 

@@ -385,41 +385,26 @@ final class FullHeightWorkspaceHostingView<Content: View>: NSHostingView<Content
     }
 }
 
-/// The workspace window's SwiftUI root: resolves the 2026-08-28 shell preview
-/// once per render — `KAISOLA_SHELL_PREVIEW_TABS` over the persisted setting
-/// — injects it as `\.shellPreview` for every preview-gated view in the
-/// window, and applies decision 4's real window shape.
+/// The workspace window's SwiftUI root: the graduated shell's real window
+/// shape, unconditional.
 ///
-/// Observing the settings object here is what makes the Settings picker apply
-/// live: the window is created once, but this view re-renders on every
-/// settings publish, so flipping the preview re-clips and re-injects without
-/// a relaunch.
-///
-/// The corner itself: the window already runs a transparent titlebar over a
-/// full-size, clear-backed content view, so clipping the root container at
-/// the shell's 30pt continuous corner makes the corner the window's own — the
-/// pixels outside the curve are genuinely transparent, not painted over the
-/// system corner. With the preview off the radius is zero: a bounds-rect clip
-/// that changes nothing, leaving the shipped system corner. Known preview
-/// limits, named honestly: full screen and split view still need their own
-/// fixture pass before the corner ships by default.
-struct ShellPreviewWindowRoot: View {
-    @ObservedObject var settings: NativePreviewSettings
+/// The window runs a transparent titlebar over a full-size, clear-backed
+/// content view, so clipping the root container at the shell's 30pt
+/// continuous corner makes the corner the window's own — the pixels outside
+/// the curve are genuinely transparent, not painted over the system corner.
+/// In native full screen AppKit squares the window itself; the clip stays
+/// mounted and simply curves four corners nothing sits behind.
+struct ShellWindowRoot: View {
     let content: AnyView
 
     var body: some View {
-        let preview = ShellPreviewVariant.resolved(
-            environment: ProcessInfo.processInfo.environment,
-            setting: settings.shellPreviewVariant
-        )
         content
             .clipShape(
                 RoundedRectangle(
-                    cornerRadius: preview.windowCornerRadius,
+                    cornerRadius: ShellWindowChrome.cornerRadius,
                     style: .continuous
                 )
             )
-            .environment(\.shellPreview, preview)
     }
 }
 
@@ -1033,8 +1018,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var checkForUpdatesObserver: NSObjectProtocol?
     private var attentionJumpObserver: NSObjectProtocol?
     private var authPhaseObserver: AnyCancellable?
-    private var settingsWorkspaceObserver: AnyCancellable?
-    private var settingsWorkspaceModelID: ObjectIdentifier?
     private var settingsSelectedSectionID: String?
     private var rememberedSessionRefreshObserver: NSObjectProtocol?
     private var rememberedSessionSyncTask: Task<Void, Never>?
@@ -1308,21 +1291,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = [
+            // Launch-time bootstrap, before any window exists — the one
+            // place a synchronous layout write is allowed (the user-gesture
+            // path defers through `requestNavigationLayout`).
+            settings.bootstrapNavigationLayout([
                 "topbar", "topbar-attention", "new-session-topbar",
                 "topbar-mixed", "topbar-mixed-narrow",
             ].contains(visualSurface)
                 ? .topBar
-                : .leftTree
-            // The two shell-revision surfaces exist to preview the redesign,
-            // so they default the preview on (pill tabs); every other fixture
-            // keeps the shipped shell and its existing baselines. The
-            // KAISOLA_SHELL_PREVIEW_TABS override — resolved at the window
-            // root — still outranks this, exactly as on a live install, so a
-            // capture run can force any surface into either state.
-            settings.shellPreviewVariant = [
-                "topbar-mixed", "topbar-mixed-narrow",
-            ].contains(visualSurface) ? .pills : .off
+                : .leftTree)
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
@@ -1868,17 +1845,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if visualSettings || visualOnboarding {
             window.contentView = NSHostingView(rootView: content)
         } else {
-            // The workspace window's root rides `ShellPreviewWindowRoot`,
-            // which resolves the 2026-08-28 shell preview (env override over
-            // the persisted setting), injects it as `\.shellPreview` for
-            // every gated view below, and applies decision 4's real window
-            // shape while the preview is on. Settings and onboarding keep
-            // their system chrome.
+            // The workspace window's root rides `ShellWindowRoot`, which
+            // applies the graduated shell's 30pt window corner. Fixture
+            // settings and onboarding windows keep their system chrome.
             window.contentView = FullHeightWorkspaceHostingView(
                 rootView: AnyView(
-                    ShellPreviewWindowRoot(settings: settings, content: content)
+                    ShellWindowRoot(content: content)
                 )
             )
+            // Safari-style standard window buttons: same AppKit controls,
+            // moved inward off the corner. Workspace windows only — the
+            // fixture windows above keep the stock positions their gate
+            // tests measure.
+            WorkspaceTrafficLights.install(in: window)
         }
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
@@ -4562,25 +4541,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        if window === settingsWindow {
-            settingsWorkspaceObserver?.cancel()
-            settingsWorkspaceObserver = nil
-            settingsWorkspaceModelID = nil
-            settingsWindow = nil
-            return
-        }
         let id = ObjectIdentifier(window)
         lastWorkspaceFindTargets.removeValue(forKey: id)
         let model = windowModels.removeValue(forKey: id)
         if window === lastWorkspaceWindow { lastWorkspaceWindow = nil }
-        if settingsWorkspaceModelID == id {
-            settingsWorkspaceObserver?.cancel()
-            settingsWorkspaceObserver = nil
-            settingsWorkspaceModelID = nil
-            if let settingsWindow, settingsWindow.isVisible {
-                bindSettingsWindow(settingsWindow, to: activeSettingsModel())
-            }
-        }
         guard let model else { return }
         companionProjectionObservers.removeValue(forKey: id)
         publishCompanionProjection()
@@ -4600,9 +4564,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         guard let window = notification.object as? NSWindow,
               windowModels[ObjectIdentifier(window)] != nil else { return }
         lastWorkspaceWindow = window
-        if let settingsWindow, settingsWindow.isVisible {
-            bindSettingsWindow(settingsWindow, to: windowModels[ObjectIdentifier(window)])
-        }
     }
 
     /// Choose a folder first, then create an independent workspace window for
@@ -4867,12 +4828,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
 
-    private var settingsWindow: NSWindow?
-
     /// The composer's "Manage agents…" affordance lands on the exact registry
-    /// inside Extensions, rather than on the built-in Agents overview.
-    /// `openSettings` re-installs the content in both its branches, so setting
-    /// the remembered section first is all the deep link needs.
+    /// inside Extensions, rather than on the built-in Agents overview. Every
+    /// deep link sets the remembered section first; `openSettings` carries it
+    /// into the workspace takeover.
     @objc func openAgentSettings(_ sender: Any?) {
         settingsSelectedSectionID = ExtensionsSettingsRoute(
             category: .customAgents,
@@ -4921,45 +4880,37 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         openSettings(sender)
     }
 
+    /// Settings takes over the frontmost workspace window (2026-08-28
+    /// graduation): no separate ⌘, window anymore — the workspace content
+    /// region swaps to the full settings page and Back to app restores it,
+    /// sessions untouched. The delegate resolves WHICH workspace owns the
+    /// page, brings it forward, and posts the request; `RootShellView`
+    /// presents the takeover through its deferred structural-switch path.
+    /// With every workspace window closed the app is quitting
+    /// (`applicationShouldTerminateAfterLastWindowClosed`), so a missing
+    /// target only happens in teardown and the request is dropped.
     @objc func openSettings(_ sender: Any?) {
-        let model = activeSettingsModel()
-        if let settingsWindow, settingsWindow.isVisible {
-            bindSettingsWindow(settingsWindow, to: model)
-            settingsWindow.makeKeyAndOrderFront(nil)
-            return
+        guard let model = activeSettingsModel() else { return }
+        if let window = commandWindow(for: model) {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
         }
-        // Sized to the SettingsView's own contract (minWidth 820, ideal
-        // 1100×800) — the old 810×540/min-760 window sat BELOW the view's
-        // minimum, so first layout fought and the window opened cramped
-        // (2026-08-06 spec §3a). Both sizes and the style mask now come from
-        // `SettingsWindowChrome`, which is also what reserves the title-bar
-        // band the traffic lights sit in and what adds the `.miniaturizable`
-        // this window spent its whole life without (#306).
-        let window = NSWindow(
-            contentRect: NSRect(
-                origin: .zero,
-                size: SettingsWindowChrome.idealContentSize
-            ),
-            styleMask: SettingsWindowChrome.styleMask,
-            backing: .buffered,
-            defer: false
+        var userInfo: [AnyHashable: Any] = [:]
+        if let settingsSelectedSectionID {
+            userInfo[AcpProviderSettingsNotificationKey.sectionID] = settingsSelectedSectionID
+        }
+        NotificationCenter.default.post(
+            name: .kaisolaOpenSettingsSurface,
+            object: model,
+            userInfo: userInfo
         )
-        window.title = "Settings"
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.minSize = SettingsWindowChrome.minimumContentSize
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        bindSettingsWindow(window, to: model)
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        settingsWindow = window
+        // A deep link's remembered section is consumed by the open; plain ⌘,
+        // must not keep landing on the last deep link forever.
+        settingsSelectedSectionID = nil
     }
 
     /// Resolve Settings against the frontmost project window, never against
-    /// the Settings window or dictionary iteration order.
+    /// dictionary iteration order.
     private func activeSettingsModel() -> AppModel? {
         if let key = NSApp.keyWindow,
            let model = windowModels[ObjectIdentifier(key)] {
@@ -4972,45 +4923,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
         return NSApp.orderedWindows.compactMap { windowModels[ObjectIdentifier($0)] }.first
             ?? windowModels.values.first
-    }
-
-    /// Re-render workspace-scoped tabs whenever their owning AppModel switches
-    /// projects while Settings is open. This prevents MCP/account changes from
-    /// silently landing in the project that happened to be active at creation.
-    private func bindSettingsWindow(_ window: NSWindow, to model: AppModel?) {
-        settingsWorkspaceObserver?.cancel()
-        let capturedModel = model
-        installSettingsContent(in: window, model: capturedModel)
-        guard let capturedModel else {
-            settingsWorkspaceModelID = nil
-            settingsWorkspaceObserver = nil
-            return
-        }
-        settingsWorkspaceModelID = windowModels.first(where: { $0.value === capturedModel })?.key
-        settingsWorkspaceObserver = capturedModel.$selectedProjectID
-            .dropFirst()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self, weak window, weak capturedModel] _ in
-                guard let self, let window, window.isVisible else { return }
-                self.installSettingsContent(in: window, model: capturedModel)
-            }
-    }
-
-    private func installSettingsContent(in window: NSWindow, model: AppModel?) {
-        let capturedModel = model
-        let view = SettingsView(
-            settings: settings,
-            checkForUpdates: { [weak self] in self?.updateController.checkForUpdates(nil) },
-            installPendingUpdate: { UpdateCenter.shared.installAndRelaunch() },
-            updateDetail: updateController.availability.detail,
-            interruptibleTurnCount: { [weak capturedModel] in capturedModel?.interruptibleTurnCount ?? 0 },
-            workspace: capturedModel?.currentProjectDirectory,
-            initialSectionID: settingsSelectedSectionID,
-            sectionChanged: { [weak self] sectionID in
-                self?.settingsSelectedSectionID = sectionID
-            }
-        )
-        window.contentView = NSHostingView(rootView: view.environmentObject(auth))
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -5775,6 +5687,105 @@ enum NativeVisualTerminalAccessibilityGate {
             return true
         default:
             return false
+        }
+    }
+}
+
+/// Safari-style traffic lights for workspace windows (2026-08-28, "these red
+/// yellow green buttons slightly more interior, not too far on the edge …
+/// like in safari"): the standard AppKit close/minimize/zoom buttons —
+/// repositioned, never redrawn — sit inset from the corner the way Safari's
+/// do, inside the full-height sidebar surface that now owns the window's
+/// left edge. Only the leading inset moves; AppKit keeps vertical centering
+/// in whatever titlebar band the window carries (the NavigationSplitView
+/// toolbar band in the left-tree layout), and the inter-button gaps are
+/// preserved exactly.
+enum WorkspaceTrafficLights {
+    /// Where the close button's leading edge lands. Safari sits its buttons
+    /// around x ≈ 20 against the stock ~7, which also grows the corner's
+    /// dead zone into a comfortable click approach.
+    nonisolated static let leadingInset: CGFloat = 20
+
+    /// Pure shift: every button moves by the same delta that brings the
+    /// first one to `leadingInset`, so the standard gaps survive untouched.
+    nonisolated static func shiftedOrigins(
+        standardMinXs: [CGFloat],
+        leadingInset: CGFloat = WorkspaceTrafficLights.leadingInset
+    ) -> [CGFloat] {
+        guard let first = standardMinXs.first else { return [] }
+        let delta = leadingInset - first
+        return standardMinXs.map { $0 + delta }
+    }
+
+    @MainActor private static var controllers: [ObjectIdentifier: Controller] = [:]
+
+    @MainActor
+    static func install(in window: NSWindow) {
+        let key = ObjectIdentifier(window)
+        guard controllers[key] == nil else { return }
+        controllers[key] = Controller(window: window) {
+            controllers[key] = nil
+        }
+    }
+
+    /// Re-applies the inset whenever AppKit lays the buttons back at stock —
+    /// window resize, the SwiftUI toolbar arriving after first layout,
+    /// full-screen exit. Frame-change notifications on the buttons
+    /// themselves catch every one of those without polling.
+    @MainActor
+    private final class Controller {
+        private weak var window: NSWindow?
+        private var observers: [NSObjectProtocol] = []
+        private var reapplying = false
+        private let release: () -> Void
+
+        init(window: NSWindow, release: @escaping () -> Void) {
+            self.window = window
+            self.release = release
+            let center = NotificationCenter.default
+            for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                guard let button = window.standardWindowButton(kind) else { continue }
+                button.postsFrameChangedNotifications = true
+                observers.append(center.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: button,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.apply() }
+                })
+            }
+            observers.append(center.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.teardown() }
+            })
+            apply()
+        }
+
+        private func teardown() {
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            observers = []
+            release()
+        }
+
+        private func apply() {
+            guard !reapplying, let window, !window.styleMask.contains(.fullScreen) else { return }
+            let buttons: [NSButton] = [
+                window.standardWindowButton(.closeButton),
+                window.standardWindowButton(.miniaturizeButton),
+                window.standardWindowButton(.zoomButton),
+            ].compactMap { $0 }
+            guard buttons.count == 3 else { return }
+            let currentMinXs = buttons.map { $0.frame.minX }
+            let targets = WorkspaceTrafficLights.shiftedOrigins(standardMinXs: currentMinXs)
+            guard zip(currentMinXs, targets).contains(where: { abs($0 - $1) > 0.5 }) else { return }
+            reapplying = true
+            defer { reapplying = false }
+            for (button, targetX) in zip(buttons, targets) {
+                button.setFrameOrigin(NSPoint(x: targetX, y: button.frame.origin.y))
+            }
         }
     }
 }

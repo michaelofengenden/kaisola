@@ -633,7 +633,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.tintIntensity, .standard)
         XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
-        settings.navigationLayout = .topBar
+        settings.bootstrapNavigationLayout(.topBar)
         settings.appearance = .dark
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
@@ -854,7 +854,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let defaults = makeDefaults()
         let settings = NativePreviewSettings(defaults: defaults, persistsChanges: false)
 
-        settings.navigationLayout = .topBar
+        settings.bootstrapNavigationLayout(.topBar)
         settings.appearance = .dark
         settings.workspaceRailWidth = 284
 
@@ -1735,10 +1735,10 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
-        XCTAssertEqual(SurfaceTabChrome.projectSelectedStrokeOpacity, 0.38, accuracy: 0.0001)
-        XCTAssertEqual(SurfaceTabChrome.sessionSelectedStrokeOpacity, 0.30, accuracy: 0.0001)
-        XCTAssertEqual(SurfaceTabChrome.inactiveStrokeOpacity, 0.11, accuracy: 0.0001)
+    func testChromeHairlinesStayHairlines() {
+        // The graduated tabs draw plates and washes, not outline strokes —
+        // `SurfaceTabChrome` retired with the legacy strips — so the one
+        // surviving stroke contract is the shared hairline width itself.
         XCTAssertEqual(KaisolaVisualSystem.hairline, 0.5)
     }
 
@@ -6975,55 +6975,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(closed.collapsed, ["other"])
     }
 
-    /// The whole 40pt chrome band, finally.
-    ///
-    /// v1.1.9 deleted the band and gave the card its height, but only 12 of the
-    /// 40 points reached the pane: the two toggles were still anchored to the
-    /// card's top-right corner, and the Files rail opens a 30pt header bar 6pt
-    /// below that corner, so a card run to the window's top put the revealed
-    /// pair over the controls the user was aiming at. The card stopped 28pt
-    /// short to keep them apart.
-    ///
-    /// v1.1.10 moves the pair into the sidebar's traffic-light band instead, so
-    /// nothing is drawn over the card's corner and the card takes the rest.
-    func testTheDetailCardRunsToTheWindowTopInTheSidebarLayout() {
-        // Nothing above the card but the gutter every other side already has.
-        XCTAssertEqual(
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree),
-            KaisolaVisualSystem.chromeInset
-        )
-        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 6)
-
-        // The reclaim, stated as a number rather than as a memory. The band was
-        // `chromePanelTopInset - chromeInset` = 40pt tall with no card inset
-        // beneath it; v1.1.9 took it to 28, and this takes it to 6.
-        let oldBand = NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
-        XCTAssertEqual(oldBand, 40)
-        XCTAssertEqual(oldBand - NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 34)
-        XCTAssertEqual(
-            NativeWorkspaceChrome.detailToggleStripHeight
-                - NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree),
-            22,
-            "the 22pt v1.1.9 could not reach is what this release is for"
-        )
-    }
-
-    /// The top-bar toggles moved into the content overlay, so their retired
-    /// reveal strip must not survive as an empty band above the detail card.
-    func testTheTopBarLayoutUsesTheSharedGutterWithoutAnEmptyStrip() {
-        XCTAssertEqual(
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
-            KaisolaVisualSystem.chromeInset
-        )
-        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 6)
+    /// Edge to edge, the 2026-08-28 graduation: the workspace fills its
+    /// region completely — no chrome-card gutter above the content in either
+    /// layout. The window's own 30pt corner is the only clip left.
+    func testTheWorkspaceIsFlushInBothLayouts() {
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 0)
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 0)
         XCTAssertEqual(
             NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
             NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree)
-        )
-        XCTAssertLessThan(
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
-            NativeWorkspaceChrome.detailToggleStripHeight,
-            "the retired 28pt toggle strip is still reserving an empty band"
         )
     }
 
@@ -7240,7 +7200,15 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     func testFullHeightWorkspaceOnlyReservesTrafficLightClearanceInNavigation() {
         XCTAssertEqual(NativeWorkspaceChrome.sidebarTrafficLightClearance, 40)
-        XCTAssertEqual(NativeWorkspaceChrome.topBarTrafficLightClearance, 76)
+        // 76 → 88 with the Safari-inset traffic lights: the buttons moved
+        // ~13pt inward, so the merged bar's leading lane grows in step and
+        // must clear the shifted zoom button's trailing edge (~74) with room.
+        XCTAssertEqual(NativeWorkspaceChrome.topBarTrafficLightClearance, 88)
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.topBarTrafficLightClearance,
+            WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [7, 27, 47]).last! + 14,
+            "the switcher must start clear of the shifted zoom button"
+        )
     }
 
     /// v1.1.6 widened the resting rail (200 → 248) and its ceiling (260 → 340)

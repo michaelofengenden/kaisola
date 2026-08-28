@@ -651,8 +651,13 @@ enum AppCommandRegistry {
                       let model {
                 RootShellView.promptForNewChat(agent, model: model)
             } else if let layout = id.navigationLayout {
-                settings.navigationLayout = layout
-                NotificationCenter.default.post(name: .kaisolaCommandPresentationChanged, object: nil)
+                // Deferred, never same-stack: a layout switch tears down the
+                // whole shell hierarchy, and doing that inside an AppKit
+                // event-tracking pass is the v0.1.146 NSSplitView divider
+                // crash. The settings model applies it on the next
+                // default-mode run-loop turn and posts the presentation
+                // notification after the switch has actually landed.
+                settings.requestNavigationLayout(layout)
             } else if let appearance = id.appearance {
                 settings.appearance = appearance
                 NotificationCenter.default.post(name: .kaisolaCommandPresentationChanged, object: nil)

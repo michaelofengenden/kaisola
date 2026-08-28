@@ -2,6 +2,27 @@ import AppKit
 import Combine
 import SwiftUI
 
+/// Applies a whole-root structural swap strictly outside AppKit's
+/// event-tracking run-loop pass.
+///
+/// This is the fix for the v0.1.146 random-quit crash — see
+/// `NativePreviewSettings.requestNavigationLayout` for the full signature.
+/// The one mechanism that actually guarantees "not inside the tracking pass"
+/// is scheduling on the main run loop restricted to `.default` mode:
+/// `DispatchQueue.main` drains in the common modes, which include event
+/// tracking, so a plain main-queue hop can still land mid-`mouseDown`.
+@MainActor
+enum StructuralShellSwitch {
+    static func performOutsideEventTracking(_ apply: @escaping @MainActor () -> Void) {
+        RunLoop.main.perform(inModes: [.default]) {
+            // Blocks scheduled on `RunLoop.main` run on the main thread by
+            // construction; the compiler just cannot see that through the
+            // nonisolated `perform` signature.
+            MainActor.assumeIsolated(apply)
+        }
+    }
+}
+
 /// Navigation layout, mirroring Electron's two modes: a nested project→session
 /// tree in a left sidebar, or a top bar with a project tab strip over a session
 /// row.
@@ -805,17 +826,65 @@ final class NativePreviewSettings: ObservableObject {
         !isIsolatedFixture(environment: environment)
     }
 
-    @Published var navigationLayout: NavigationLayout {
+    /// Which navigation shell every workspace window renders. Reads are free;
+    /// writes go through `requestNavigationLayout` (deferred) or
+    /// `bootstrapNavigationLayout` (launch-time only) — see the crash note on
+    /// `requestNavigationLayout` for why a bare same-stack setter is gone.
+    @Published private(set) var navigationLayout: NavigationLayout {
         didSet { persist(navigationLayout.rawValue, forKey: Keys.layout) }
     }
 
-    /// The 2026-08-28 shell revision behind a runtime switch: Off ships
-    /// exactly the current shell; the on states render the merged session-tab
-    /// bar, the card rails, and the 30pt window corner with pill or capsule
-    /// tabs, live, no relaunch. `KAISOLA_SHELL_PREVIEW_TABS` still outranks
-    /// this for fixture processes — see `ShellPreviewVariant.resolved`.
-    @Published var shellPreviewVariant: ShellPreviewVariant {
-        didSet { persist(shellPreviewVariant.rawValue, forKey: Keys.shellPreview) }
+    /// The layout the deferred switch will land on, so a burst of requests
+    /// coalesces to the last one instead of replaying every intermediate
+    /// hierarchy.
+    private var pendingNavigationLayout: NavigationLayout?
+
+    /// Switch the navigation shell — applied on the next **default-mode**
+    /// main-run-loop turn, never on the requesting stack.
+    ///
+    /// Crash signature this deferral exists for (v0.1.146, "kaisola just quit
+    /// on me randomly"): EXC_BAD_ACCESS · SIGSEGV · KERN_INVALID_ADDRESS at
+    /// 0x50, faulting `objc_loadWeak` ←
+    /// `-[NSSplitView _beginInteractivePeekAtInitialLocation:]` ←
+    /// `-[NSSplitView mouseDown:]` ← ordinary event routing. A structural
+    /// shell swap (then the preview toggle, equally this layout switch)
+    /// published mid-event: AppKit was inside the NavigationSplitView
+    /// divider's mouse-tracking pass when SwiftUI tore the old split view out
+    /// from under it, and the divider peek loaded a dead weak.
+    ///
+    /// `DispatchQueue.main.async` is NOT sufficient here — the main queue
+    /// drains in the run loop's common modes, and AppKit's event-tracking
+    /// mode is a common mode, so an async hop can still land inside the same
+    /// tracking pass. `RunLoop.main.perform(inModes: [.default])` runs only
+    /// once the loop is back in default mode, which is by definition after
+    /// the tracking pass has unwound. Every whole-root structural swap (this
+    /// switch, the Settings workspace takeover) must ride this discipline.
+    func requestNavigationLayout(_ layout: NavigationLayout) {
+        let hadPendingRequest = pendingNavigationLayout != nil
+        pendingNavigationLayout = layout
+        guard !hadPendingRequest else { return }
+        StructuralShellSwitch.performOutsideEventTracking { [weak self] in
+            guard let self, let pending = self.pendingNavigationLayout else { return }
+            self.pendingNavigationLayout = nil
+            guard self.navigationLayout != pending else { return }
+            self.navigationLayout = pending
+            // Menu checkmarks and other presentation mirrors refresh AFTER
+            // the switch has actually applied, not when it was requested.
+            NotificationCenter.default.post(
+                name: .kaisolaCommandPresentationChanged,
+                object: nil
+            )
+        }
+    }
+
+    /// Launch-time synchronous application, for fixture bootstrap that runs
+    /// before any window exists. Never call this from user gestures or event
+    /// handlers — that is exactly the divider crash `requestNavigationLayout`
+    /// defers around.
+    func bootstrapNavigationLayout(_ layout: NavigationLayout) {
+        pendingNavigationLayout = nil
+        guard navigationLayout != layout else { return }
+        navigationLayout = layout
     }
 
     @Published var appearance: AppearanceMode {
@@ -1268,7 +1337,10 @@ final class NativePreviewSettings: ObservableObject {
 
     private enum Keys {
         static let layout = "navigationLayout"
-        static let shellPreview = "shellPreviewVariant"
+        // "shellPreviewVariant" was the 2026-08-28 shell revision's runtime
+        // switch. The pills variant graduated to THE shell, so the key is
+        // deliberately no longer read or written; a stored value from the
+        // preview builds is simply ignored.
         static let appearance = "appearanceMode"
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
@@ -1312,12 +1384,9 @@ final class NativePreviewSettings: ObservableObject {
     init(defaults: UserDefaults = .standard, persistsChanges: Bool = true) {
         self.defaults = defaults
         self.persistsChanges = persistsChanges
+        // Fresh installs open on the left-tree rail (the graduated shell's
+        // default); a layout the user explicitly chose persists and wins.
         navigationLayout = defaults.string(forKey: Keys.layout).flatMap(NavigationLayout.init) ?? .leftTree
-        // Off unless the user chose otherwise; an unknown stored value (a
-        // future variant this build does not know) falls back to the shipped
-        // shell rather than guessing.
-        shellPreviewVariant = defaults.string(forKey: Keys.shellPreview)
-            .flatMap(ShellPreviewVariant.init) ?? .off
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass

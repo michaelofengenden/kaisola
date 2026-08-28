@@ -23,32 +23,27 @@ enum RootShellLocalCommand: Equatable, Sendable {
     }
 }
 
-/// A Sparkle action requested from workspace Settings cannot run while that
-/// SwiftUI sheet is still attached. AppKit rejects the termination request
-/// before it reaches Kaisola's delegate, so remember the user's action and run
-/// it from the sheet's actual dismissal callback instead of guessing at the
-/// animation's duration.
-@MainActor
-final class SettingsSheetUpdateCoordinator: ObservableObject {
+/// What happens to the in-workspace Settings takeover for each way the user
+/// can act on it. Pure, so the toggle contract ("pressing the gear again
+/// restores the workspace", Esc and Back always restore, a deep link always
+/// opens) is a table the tests hold rather than four call sites agreeing.
+enum SettingsTakeoverPolicy {
     enum Action: Equatable {
-        case check
-        case install
+        /// The footer gear, the ⌘, command, the menu item — the doors toggle.
+        case pressSettingsDoor
+        /// The takeover's own "Back to app".
+        case backToApp
+        case escape
+        /// A deep link that names a section (provider settings, onboarding
+        /// hand-off, usage) always lands on the open page.
+        case openSection
     }
 
-    private(set) var pendingAction: Action?
-
-    func request(_ action: Action, dismiss: () -> Void) {
-        guard pendingAction == nil else { return }
-        pendingAction = action
-        dismiss()
-    }
-
-    func performAfterDismissal(check: () -> Void, install: () -> Void) {
-        guard let action = pendingAction else { return }
-        pendingAction = nil
+    static func isPresented(after action: Action, from isPresented: Bool) -> Bool {
         switch action {
-        case .check: check()
-        case .install: install()
+        case .pressSettingsDoor: !isPresented
+        case .backToApp, .escape: false
+        case .openSection: true
         }
     }
 }
@@ -255,11 +250,6 @@ struct RootShellView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.undoManager) private var undoManager
-    /// The resolved 2026-08-28 shell preview, injected at the window root.
-    /// Off renders the shipped shell exactly; the on states switch the
-    /// top-bar mode to the merged session-tab bar and float both rails on
-    /// chrome cards, live.
-    @Environment(\.shellPreview) private var shellPreview
     @State private var renameTarget: String?
     @State private var sidebarDropTargeted = false
     /// Chat id awaiting a typed model id (the menu's "Custom Model…").
@@ -275,8 +265,13 @@ struct RootShellView: View {
     @State private var showPalette = false
     @State private var showOmniBar = false
     @State private var showOnboarding = false
+    /// Whether the Settings takeover covers the workspace. Never write this
+    /// directly — `applySettingsTakeover(_:)` routes every change through the
+    /// deferred structural-switch discipline (see
+    /// `NativePreviewSettings.requestNavigationLayout` for the crash this
+    /// guards against). The workspace stays mounted underneath, so sessions
+    /// keep running and Back to app restores it exactly as it was.
     @State private var showSettings = false
-    @StateObject private var settingsUpdateCoordinator = SettingsSheetUpdateCoordinator()
     @State private var settingsSectionID: String?
     /// One unfinished chooser tab per project, owned by this window only. It
     /// never enters AppModel or any durable session and process state.
@@ -493,7 +488,14 @@ struct RootShellView: View {
                     return
                 }
                 settingsSectionID = sectionID
-                showSettings = true
+                applySettingsTakeover(.openSection)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenSettingsSurface)) { note in
+                guard let target = note.object as? AppModel, target === model else { return }
+                settingsSectionID = note.userInfo?[
+                    AcpProviderSettingsNotificationKey.sectionID
+                ] as? String ?? settingsSectionID
+                applySettingsTakeover(.openSection)
             }
     }
 
@@ -645,32 +647,6 @@ struct RootShellView: View {
                     .frame(width: 520, height: 460)
             }
         }
-        .sheet(isPresented: $showSettings, onDismiss: {
-            settingsUpdateCoordinator.performAfterDismissal(
-                check: {
-                    NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
-                },
-                install: {
-                    UpdateCenter.shared.installAndRelaunch()
-                }
-            )
-        }) {
-            InAppSettingsSheet(
-                settings: settings,
-                workspace: model.currentProjectDirectory,
-                initialSectionID: settingsSectionID,
-                dismiss: { showSettings = false },
-                requestCheckForUpdates: {
-                    settingsUpdateCoordinator.request(.check) { showSettings = false }
-                },
-                requestInstallPendingUpdate: {
-                    settingsUpdateCoordinator.request(.install) { showSettings = false }
-                },
-                updateDetail: KaisolaMacAppDelegate.sharedUpdateAvailabilityDetail(),
-                interruptibleTurnCount: { model.interruptibleTurnCount },
-                canCheckForUpdates: KaisolaMacAppDelegate.sharedCanCheckForUpdates()
-            )
-        }
         .sheet(item: $quickActionsTarget) { target in
             VStack(spacing: 0) {
                 HStack {
@@ -711,6 +687,23 @@ struct RootShellView: View {
                 registeredShortcut(.openExternalEditor)
             }
         )
+        // The ChatGPT-style Settings takeover: a full-window page presented
+        // OVER the workspace, which stays mounted (sessions keep running).
+        // Below the palette and toast overlays so a summoned palette and any
+        // toast still read above Settings.
+        .overlay {
+            if showSettings {
+                WorkspaceSettingsTakeover(
+                    settings: settings,
+                    workspace: model.currentProjectDirectory,
+                    initialSectionID: settingsSectionID,
+                    interruptibleTurnCount: { model.interruptibleTurnCount },
+                    close: { applySettingsTakeover(.backToApp) },
+                    closeOnEscape: { applySettingsTakeover(.escape) }
+                )
+                .transition(.opacity)
+            }
+        }
         .overlay {
             if showPalette {
                 ZStack(alignment: .top) {
@@ -828,7 +821,26 @@ struct RootShellView: View {
         guard let sectionID = onboardingSettingsSectionID else { return }
         onboardingSettingsSectionID = nil
         settingsSectionID = sectionID
-        showSettings = true
+        applySettingsTakeover(.openSection)
+    }
+
+    /// The ONE write path for the Settings takeover. The next state comes
+    /// from `SettingsTakeoverPolicy` and lands through
+    /// `StructuralShellSwitch.performOutsideEventTracking`, the same
+    /// discipline as a navigation-layout change: a whole-root presentation
+    /// swap must never apply inside an AppKit event-tracking pass (the
+    /// v0.1.146 NSSplitView divider crash).
+    private func applySettingsTakeover(_ action: SettingsTakeoverPolicy.Action) {
+        let next = SettingsTakeoverPolicy.isPresented(after: action, from: showSettings)
+        StructuralShellSwitch.performOutsideEventTracking {
+            guard showSettings != next else { return }
+            // The chrome-wide Reduce Motion fallback neutralizes this
+            // animation when asked; otherwise the page fades over the
+            // workspace instead of cutting.
+            withAnimation(.easeOut(duration: 0.18)) {
+                showSettings = next
+            }
+        }
     }
 
     // MARK: - Layouts
@@ -988,20 +1000,15 @@ struct RootShellView: View {
                 // the List and the header band; the footer keeps its controls.
                 footer
             }
-            // Preview OFF (shipped): the sidebar is ONE layer — the tinted
-            // backdrop runs edge to edge behind the column and the only
-            // chrome is the traffic-light clearance carried as top padding.
-            // Preview ON — Safari's inset sidebar card, for real (2026-08-28
-            // decision 1): the rail's glass backdrop runs edge to edge behind
-            // the column, and the navigation content floats on the same
-            // `chromeRadius`/`chromeInset` chrome card the detail column
-            // already rides — one card, its frost, its soft shadow, and a
-            // gutter of ground on every side. The top inset still clears the
-            // traffic lights and the AppKit toolbar lane in both states.
-            .modifier(ShellPreviewRailPanel(
-                topInset: NativeWorkspaceChrome.chromePanelTopInset,
-                padsTopWhenOff: true
-            ))
+            // The graduated rail is Safari's full-height sidebar, not an
+            // inset card: ONE surface that owns the entire left edge of the
+            // window — traffic lights inside its top band — with the content
+            // starting below the traffic-light/toolbar lane. The floating
+            // chrome card the preview wave tried (gutter, radius, shadow) is
+            // gone; Michael's corrections ask for the card to BE the column
+            // and for its tone to run seamlessly into the canvas, so the
+            // boundary is carried by the split divider's hairline alone.
+            .padding(.top, NativeWorkspaceChrome.chromePanelTopInset)
             // The traffic-light clearance band the padding above just created is
             // the third and last piece of the boundary. It carries nothing at
             // all, so this segment can be a plain overlay — and it has to be
@@ -1017,8 +1024,20 @@ struct RootShellView: View {
                     height: NativeWorkspaceChrome.chromePanelTopInset
                 )
             }
+            // Seamless rails ↔ canvas (2026-08-28, "the color and theme of
+            // the lhs and rhs rails should look seemless transition with the
+            // canvas"): the rail mounts the CANVAS recipe, not the rail
+            // recipe. Two instances of `WorkspaceBackdropView` are the same
+            // surface by construction — the live material samples what is
+            // behind the window per-region and the painted still is
+            // screen-aligned, so the column boundary carries no tone jump;
+            // only the divider hairline separates them. (The dedicated
+            // sidebar wash — `.sidebar` material + its own veil — is what
+            // made the rails read a step apart from the canvas, and its
+            // constants belong to the appearance layer this pass must not
+            // touch, so the chrome simply stops mounting it.)
             .background {
-                SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .leading)
+                WorkspaceBackdropView(mode: settings.workspaceBackdrop)
                     .ignoresSafeArea()
             }
             // `ideal:` below is honoured for the double-click reset but not for
@@ -1067,13 +1086,12 @@ struct RootShellView: View {
     /// only while something is hidden.
     private var detailArea: some View {
         GeometryReader { geometry in
-            // The Files rail sits OUTSIDE the chrome card, flush to the window
-            // edge like the left project rail. Only the content column keeps
-            // the card and its gutters, so the card's two horizontal insets
-            // come out of the width the panels share — the same pool the old
-            // inside-the-card geometry measured.
+            // Edge to edge (2026-08-28 graduation): the workspace fills its
+            // region completely — no floating chrome card, no gutters. The
+            // window's own 30pt corner is the only clip; inside it, content
+            // is flush.
             let widths = NativeDetailPaneSizing.resolve(
-                totalWidth: geometry.size.width - KaisolaVisualSystem.chromeInset * 2,
+                totalWidth: geometry.size.width,
                 preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
                 preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
             )
@@ -1087,28 +1105,14 @@ struct RootShellView: View {
                     // RootShell cannot reliably decide when its child should exist.
                     WorkspaceRestorationNoticeView(model: model)
                     detailPane(widths)
-                        .kaisolaChromePanel(
-                            topInset: NativeWorkspaceChrome.detailPanelTopInset(
-                                layout: settings.navigationLayout
-                            )
-                        )
                 }
                 if detailRailPanelVisible, let root = model.currentProjectDirectory {
-                    // Files live on the right, matching the editor/reference
-                    // rail in the Electron workspace. Shipped (preview off):
-                    // a full-bleed column painting its own glass. Under the
-                    // 2026-08-28 preview (decision 6) it rides the same
-                    // floating inset chrome card as the detail column — a
-                    // `chromeRadius` panel over the window glass with the
-                    // standard `chromeInset` gutter.
+                    // Files live on the right, a full-height flush column like
+                    // the left project rail: the same canvas surface, with the
+                    // resize divider's hairline as the whole boundary.
                     workspaceRailDivider
                     workspaceRail(root: root)
                         .id(root)
-                        .modifier(ShellPreviewRailPanel(
-                            topInset: NativeWorkspaceChrome.detailPanelTopInset(
-                                layout: settings.navigationLayout
-                            )
-                        ))
                         .frame(width: widths.rail)
                 }
             }
@@ -1215,7 +1219,7 @@ struct RootShellView: View {
                 .frame(width: 24, height: 22)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.accessoryBar)
+        .buttonStyle(.kaisolaChrome)
         .help(shortcut.map { "\(label) (\($0))" } ?? label)
         .accessibilityLabel(label)
         .accessibilityIdentifier(identifier)
@@ -1520,58 +1524,15 @@ struct RootShellView: View {
         }
     }
 
-    /// The top-bar mode's two presentations, preview-gated: the shipped
-    /// stacked shell, or the 2026-08-28 merged bar while the shell preview
-    /// is on.
-    @ViewBuilder
+    /// The top-bar mode: one 40pt session-tab bar over the detail pane —
+    /// compact project switcher leading, the active project's session tabs
+    /// packed immediately beside it, the bar's one flexible gap, then the
+    /// tight trailing cluster (New Session and the sidebar switch). Project
+    /// switching lives in the switcher's menu and saved Quick Actions keep
+    /// their context-menu and palette homes. The bar renders by iterating
+    /// `MergedTopBarGrammar.slots`, so the arrangement the tests pin is the
+    /// arrangement on screen.
     private var topBarLayout: some View {
-        if shellPreview.isOn {
-            mergedTopBarLayout
-        } else {
-            legacyTopBarLayout
-        }
-    }
-
-    /// A project tab strip over a session row, then the detail pane
-    /// (Electron's "Top bar" mode) — the shipped shell, untouched.
-    private var legacyTopBarLayout: some View {
-        let actions = shellActions
-        return RootTopBarShell(actions: actions) { actions in
-            ProjectTabStripView(
-                projects: model.projects,
-                selected: activeProjectBinding,
-                menu: actions.projectContextMenu,
-                newSession: actions.beginNewSession,
-                useSidebar: actions.useLeftTreeNavigation,
-                reorder: actions.moveProject
-            )
-            .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-        } quickActions: { actions in
-            if let active = model.projects.first(where: { $0.id == activeProjectID }),
-               let activeDir = active.directory {
-                QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    actions.runQuickAction(action, activeDir)
-                }
-            }
-        } sessions: { actions in
-            sessionStrip(actions: actions)
-        } detail: { _ in
-            detailArea
-        } footer: { _ in
-            footer
-        }
-    }
-
-    /// One 40pt session-tab bar over the detail pane (the previewed "Top
-    /// bar" revision, 2026-08-28 decision 2): compact project switcher
-    /// leading, the active project's session tabs packed immediately beside
-    /// it, the bar's one flexible gap, then the tight trailing cluster (New
-    /// Session and the sidebar switch). The old stacked project strip and
-    /// Quick Actions row are gone; project switching lives in the switcher's
-    /// menu and saved Quick Actions keep their context-menu and palette
-    /// homes. The bar renders by iterating `MergedTopBarGrammar.slots`, so
-    /// the arrangement the tests pin is the arrangement on screen.
-    private var mergedTopBarLayout: some View {
         let actions = shellActions
         return RootMergedTopBarShell(actions: actions) { actions in
             HStack(spacing: MergedTopBarGrammar.barSpacing) {
@@ -2185,13 +2146,15 @@ struct RootShellView: View {
             // this one costs the footer no width at all.
             filesVisible: settings.workspaceRailVisible,
             toggleFiles: { runCommand(.toggleFiles) },
+            // The footer gear TOGGLES the takeover: pressing it with Settings
+            // open is "back to app" (Michael's ChatGPT-app reference).
             showSettings: {
-                settingsSectionID = nil
-                showSettings = true
+                if !showSettings { settingsSectionID = nil }
+                applySettingsTakeover(.pressSettingsDoor)
             },
             showUsage: {
                 settingsSectionID = "usage"
-                showSettings = true
+                applySettingsTakeover(.openSection)
             }
         )
     }
@@ -2934,9 +2897,6 @@ struct RootShellView: View {
         hostsDetailDoors: Bool = false
     ) -> some View {
         GeometryReader { geometry in
-            // On the shared corner ladder since v1.1.8; it was a bare literal 8
-            // and so sat outside every relation the rest of the chrome holds.
-            let cardRadius = KaisolaVisualSystem.paneRadius
             let terminalChrome = terminalPaneChrome(for: id)
             let marksFocus = model.paneLayout(for: activeProjectID)
                 .marksFocus(
@@ -2956,24 +2916,17 @@ struct RootShellView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(terminalChrome.map { Color(nsColor: $0.background) }
                 ?? Color(nsColor: .textBackgroundColor))
-            // A lone pane is the chrome card's whole content, so it takes the
-            // card's own corners instead of floating as a second card: the
-            // old 6pt gutter put an 11pt-radius hairline ring inside the
-            // 22pt-radius chrome edge, and the two unrelated arcs a few
-            // points apart were exactly the "weird corner borders" around a
-            // solo chat. Grids keep the gutter, the tighter clip, and the
-            // border — there the ring separates siblings, which is a job.
-            .clipShape(RoundedRectangle(
-                cornerRadius: isSolo ? KaisolaVisualSystem.chromeRadius : cardRadius,
-                style: .continuous
-            ))
+            // Edge to edge (2026-08-28 graduation, "the chats/session tabs
+            // can take up the whole workspace, no need for them to have
+            // rounded corners"): panes fill their cells completely — no
+            // rounded pane-card silhouette, no gutters. The window's 30pt
+            // corner is the only curve. In a grid the square hairline ring
+            // still separates siblings, and focus keeps its accent edge; a
+            // solo pane IS the region and draws neither.
+            .clipped()
             .overlay {
-                // strokeBorder, not stroke: a centered stroke straddles the
-                // clip boundary, so its outer half rendered as a second ring
-                // just outside the card's own edge — every pane corner showed
-                // two concentric lines instead of one border.
                 if !isSolo {
-                    RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+                    Rectangle()
                         .strokeBorder(
                             marksFocus
                                 ? Color.accentColor.opacity(0.30)
@@ -2986,8 +2939,6 @@ struct RootShellView: View {
                         )
                 }
             }
-            .padding(.horizontal, isSolo ? 0 : 6)
-            .padding(.vertical, isSolo ? 0 : 4)
             .onDrop(
                 of: [UTType.utf8PlainText],
                 delegate: SessionPaneDropDelegate(
@@ -3085,63 +3036,23 @@ struct RootShellView: View {
                 CompanionControllerChipView(source: source, paneWidth: paneWidth)
                     .layoutPriority(1)
             }
-            if let mesh = model.meshes.first(where: { $0.id == id }) {
-                MeshStagedPromptQueueButton(mesh: mesh)
-                MeshConfigurationMenu(mesh: mesh)
-            }
-            if let chat = model.chats.first(where: { $0.id == id }),
-               SessionAccountBinding.declaredProvider(forAgentID: chat.agentID) != nil {
-                chatAccountMenu(chat)
-            }
-            // The chat's whole session-control set — zoom, checkpoints,
-            // accounting, export — as one overflow in the pane's only bar.
-            // The chat surface itself draws no header strip anymore.
-            if let chat = model.chats.first(where: { $0.id == id }) {
-                // The 24×22 slot lives on the menu's own label now; an outer
-                // frame around its `.fixedSize()` was dead weight.
-                AcpChatOverflowMenu(conversation: chat.conversation)
-                    .foregroundStyle(.kaisolaSecondary)
-            }
-            // accessoryBar, not plain: plain paints nothing on hover, so this
-            // row split into controls that light up (the two menus) and
-            // controls that play dead. One native hover answer for all of it.
-            Button { model.toggleMaximizeSurface(id) } label: {
-                Image(systemName: model.maximizedPaneID == id
-                    ? "arrow.down.right.and.arrow.up.left"
-                    : "arrow.up.left.and.arrow.down.right")
-                    .frame(width: 24, height: 22)
-            }
-            .buttonStyle(.accessoryBar)
-            .foregroundStyle(.kaisolaSecondary)
-            .help(model.maximizedPaneID == id ? "Restore pane" : "Maximize pane")
-            if model.sessions.contains(where: { $0.id == id }) {
-                Button {
-                    openTerminalTranscript(id)
-                } label: {
-                    Image(systemName: "doc.text.magnifyingglass")
-                        .frame(width: 24, height: 22)
+            // ONE tight trailing cluster, built by iterating the pinned
+            // grammar so the declutter the tests hold is the render on
+            // screen. 2026-08-28: the maximize arrow and the account button
+            // are gone from the header — maximize lives in the pane's
+            // context menu, account-and-model switching inside the ellipsis.
+            HStack(spacing: UnifiedSessionHeaderGrammar.clusterSpacing) {
+                ForEach(
+                    UnifiedSessionHeaderGrammar.trailingControls(
+                        isChat: model.chats.contains { $0.id == id },
+                        isMesh: model.meshes.contains { $0.id == id },
+                        isTerminal: model.sessions.contains { $0.id == id },
+                        hostsDetailDoors: hostsDetailDoors
+                    ),
+                    id: \.self
+                ) { control in
+                    headerControl(control, paneID: id)
                 }
-                .buttonStyle(.accessoryBar)
-                .foregroundStyle(.kaisolaSecondary)
-                .disabled(model.terminalTranscriptContext(for: id) == nil)
-                .help("Open the full retained terminal transcript")
-                popOutTerminalButton(id)
-            }
-            Button { Task { await model.minimizeSurface(id) } } label: {
-                Image(systemName: "minus.circle")
-                    .frame(width: 24, height: 22)
-            }
-            .buttonStyle(.accessoryBar)
-            .foregroundStyle(.kaisolaSecondary)
-            .help("Hide this session; keep it running")
-            // The show-doors used to float as a capsule overlay four view
-            // levels up, in a different coordinate space — 6pt off the header
-            // controls' baseline, and sitting directly ON TOP of this pane's
-            // minimize and maximize buttons whenever a panel was hidden. They
-            // are header controls now, in the header, of the pane that owns
-            // the workspace's top-trailing corner.
-            if hostsDetailDoors {
-                detailShowDoorButtons
             }
         }
         .padding(
@@ -3202,7 +3113,68 @@ struct RootShellView: View {
                     }
                 }
             }
+            // The removed header arrow's action, kept one right-click away
+            // (`UnifiedSessionHeaderGrammar.contextActions` pins it here).
+            Button(model.maximizedPaneID == id ? "Restore Pane" : "Maximize Pane") {
+                model.toggleMaximizeSurface(id)
+            }
             Button("Hide Pane") { Task { await model.minimizeSurface(id) } }
+        }
+    }
+
+    /// One trailing-cluster control, addressed by the grammar case the tests
+    /// pin. Every control keeps the shared 24×22 slot and the chrome style's
+    /// eased hover/press answer.
+    @ViewBuilder
+    private func headerControl(
+        _ control: UnifiedSessionHeaderGrammar.Control,
+        paneID id: String
+    ) -> some View {
+        switch control {
+        case .meshQueue:
+            if let mesh = model.meshes.first(where: { $0.id == id }) {
+                MeshStagedPromptQueueButton(mesh: mesh)
+            }
+        case .meshConfiguration:
+            if let mesh = model.meshes.first(where: { $0.id == id }) {
+                MeshConfigurationMenu(mesh: mesh)
+            }
+        case .chatOverflow:
+            // The chat's whole session-control set — account and model (the
+            // removed header button's actions), zoom, checkpoints,
+            // accounting, export — as one overflow in the pane's only bar.
+            if let chat = model.chats.first(where: { $0.id == id }) {
+                AcpChatOverflowMenu(conversation: chat.conversation) {
+                    if SessionAccountBinding.declaredProvider(forAgentID: chat.agentID) != nil {
+                        chatAccountMenuContent(chat)
+                        Divider()
+                    }
+                }
+                .foregroundStyle(.kaisolaSecondary)
+            }
+        case .terminalTranscript:
+            Button {
+                openTerminalTranscript(id)
+            } label: {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.kaisolaChrome)
+            .foregroundStyle(.kaisolaSecondary)
+            .disabled(model.terminalTranscriptContext(for: id) == nil)
+            .help("Open the full retained terminal transcript")
+        case .terminalPopOut:
+            popOutTerminalButton(id)
+        case .hide:
+            Button { Task { await model.minimizeSurface(id) } } label: {
+                Image(systemName: "minus.circle")
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.kaisolaChrome)
+            .foregroundStyle(.kaisolaSecondary)
+            .help("Hide this session; keep it running")
+        case .detailDoors:
+            detailShowDoorButtons
         }
     }
 
@@ -3214,70 +3186,61 @@ struct RootShellView: View {
         )
     }
 
-    /// The chat's subscription account, visible and changeable from inside the
-    /// chat — including mid-conversation. Switching restarts the provider
-    /// session under the new credentials; the transcript, draft, and queued
-    /// prompts stay (see `AppModel.switchChatAccount`).
-    private func chatAccountMenu(_ chat: AcpChatHandle) -> some View {
+    /// The chat's subscription account and model, visible and changeable from
+    /// inside the chat — including mid-conversation. Switching accounts
+    /// restarts the provider session under the new credentials; the
+    /// transcript, draft, and queued prompts stay (see
+    /// `AppModel.switchChatAccount`). 2026-08-28: no longer its own header
+    /// button — these sections open the ellipsis menu
+    /// (`AcpChatOverflowMenu`), the pane's one overflow.
+    @ViewBuilder
+    private func chatAccountMenuContent(_ chat: AcpChatHandle) -> some View {
         let provider = SessionAccountBinding.provider(forAgentID: chat.agentID)
         let currentLabel = chat.accountBinding?.label ?? "Project/default"
-        return Menu {
-            Section("Account · \(currentLabel)") {
+        Section("Account · \(currentLabel)") {
+            accountMenuRow(
+                title: "Project/default",
+                isCurrent: SessionAccountBinding.menuRowIsCurrent(
+                    binding: chat.accountBinding, profileID: nil
+                )
+            ) {
+                Task { await model.switchChatAccount(chat.id, to: nil) }
+            }
+            ForEach(
+                UsageAccountStore().profiles()
+                    .filter { $0.provider == provider }
+                    .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+            ) { profile in
                 accountMenuRow(
-                    title: "Project/default",
+                    title: profile.label,
                     isCurrent: SessionAccountBinding.menuRowIsCurrent(
-                        binding: chat.accountBinding, profileID: nil
+                        binding: chat.accountBinding, profileID: profile.id
                     )
                 ) {
-                    Task { await model.switchChatAccount(chat.id, to: nil) }
-                }
-                ForEach(
-                    UsageAccountStore().profiles()
-                        .filter { $0.provider == provider }
-                        .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
-                ) { profile in
-                    accountMenuRow(
-                        title: profile.label,
-                        isCurrent: SessionAccountBinding.menuRowIsCurrent(
-                            binding: chat.accountBinding, profileID: profile.id
-                        )
-                    ) {
-                        Task { await model.switchChatAccount(chat.id, to: profile) }
-                    }
+                    Task { await model.switchChatAccount(chat.id, to: profile) }
                 }
             }
-            Section("Model · \(chat.modelOverride ?? "Default")") {
-                accountMenuRow(title: "App default", isCurrent: chat.modelOverride == nil) {
-                    Task { await model.switchChatModel(chat.id, to: nil) }
-                }
-                ForEach(SessionModelOverride.quickChoices(forAgentID: chat.agentID), id: \.id) { choice in
-                    accountMenuRow(title: choice.title, isCurrent: chat.modelOverride == choice.id) {
-                        Task { await model.switchChatModel(chat.id, to: choice.id) }
-                    }
-                }
-                Button("Custom Model…") {
-                    customModelText = chat.modelOverride ?? ""
-                    customModelTarget = chat.id
-                }
-            }
-            Divider()
-            Text("Account switches start a fresh provider session; a model switch resumes the conversation. The transcript, draft, and queued prompts always stay.")
-        } label: {
-            Image(systemName: "person.crop.circle")
-                .frame(width: 24, height: 22)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .foregroundStyle(.kaisolaSecondary)
-        .help("Account: \(currentLabel) · Model: \(chat.modelOverride ?? "default") — switch either, even mid-conversation")
-        .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
+        Section("Model · \(chat.modelOverride ?? "Default")") {
+            accountMenuRow(title: "App default", isCurrent: chat.modelOverride == nil) {
+                Task { await model.switchChatModel(chat.id, to: nil) }
+            }
+            ForEach(SessionModelOverride.quickChoices(forAgentID: chat.agentID), id: \.id) { choice in
+                accountMenuRow(title: choice.title, isCurrent: chat.modelOverride == choice.id) {
+                    Task { await model.switchChatModel(chat.id, to: choice.id) }
+                }
+            }
+            Button("Custom Model…") {
+                customModelText = chat.modelOverride ?? ""
+                customModelTarget = chat.id
+            }
+        }
     }
 
     private func signInToRestoredChatAccount(_ chat: AcpChatHandle) {
         guard let profile = model.accountSignInProfile(for: chat.id) else {
             settingsSectionID = "accounts"
-            showSettings = true
+            applySettingsTakeover(.openSection)
             ToastCenter.shared.show(
                 "Open Accounts to add or repair this provider account.",
                 style: .info
@@ -3746,7 +3709,7 @@ struct RootShellView: View {
                 .frame(width: 24, height: 22)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.accessoryBar)
+        .buttonStyle(.kaisolaChrome)
         .foregroundStyle(.kaisolaSecondary)
         .help("Open this session in a new window")
     }
@@ -5062,34 +5025,58 @@ private struct SessionPaneDropDelegate: DropDelegate {
     }
 }
 
-/// Settings lives inside the workspace as a sheet so discoverability no longer
-/// depends on knowing the macOS menu shortcut. The traditional Command-comma
-/// settings window remains available too.
-private struct InAppSettingsSheet: View {
+/// Settings takes over the workspace (2026-08-28, "should take over the
+/// whole workspace kind of like chatgpt app"): the full-window two-column
+/// page — "← Back to app" atop the left rail, search, grouped sections; the
+/// selected section's card-grouped rows on the right. It is presentation
+/// only, mounted OVER the running workspace, so closing it restores every
+/// session exactly as it was. The old standalone ⌘, window and the sheet are
+/// retired; this is the one Settings surface.
+///
+/// Because this is an overlay rather than a sheet, Sparkle actions no longer
+/// need the dismissal dance the sheet coordinator existed for: an attached
+/// sheet blocked the termination request, an overlay blocks nothing, so
+/// check and install run directly.
+private struct WorkspaceSettingsTakeover: View {
     @ObservedObject var settings: NativePreviewSettings
     let workspace: URL?
     let initialSectionID: String?
-    let dismiss: () -> Void
-    let requestCheckForUpdates: () -> Void
-    let requestInstallPendingUpdate: () -> Void
-    /// Full capability parity with the ⌘, window (2026-08-06 spec §3c): the
-    /// sheet used to silently drop the updater's unavailability reason and
-    /// the restart warning's turn count.
-    var updateDetail: String?
-    var interruptibleTurnCount: (() -> Int)?
-    var canCheckForUpdates = true
+    let interruptibleTurnCount: () -> Int
+    let close: () -> Void
+    let closeOnEscape: () -> Void
 
     var body: some View {
         SettingsView(
             settings: settings,
-            checkForUpdates: canCheckForUpdates ? requestCheckForUpdates : nil,
-            installPendingUpdate: requestInstallPendingUpdate,
-            updateDetail: updateDetail,
+            checkForUpdates: KaisolaMacAppDelegate.sharedCanCheckForUpdates()
+                ? { NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil) }
+                : nil,
+            installPendingUpdate: { UpdateCenter.shared.installAndRelaunch() },
+            updateDetail: KaisolaMacAppDelegate.sharedUpdateAvailabilityDetail(),
             interruptibleTurnCount: interruptibleTurnCount,
             workspace: workspace,
-            dismiss: dismiss,
-            initialSectionID: initialSectionID
+            initialSectionID: initialSectionID,
+            backToApp: close,
+            titleBarClearance: NativeWorkspaceChrome.chromePanelTopInset
         )
+        // The page must fully occlude the live workspace beneath it. The
+        // canvas recipe does that by construction — its material samples
+        // behind the WINDOW (or paints the baked still), never sibling
+        // views — so Settings sits on the shell's own ground.
+        .background {
+            WorkspaceBackdropView(mode: settings.workspaceBackdrop)
+                .ignoresSafeArea()
+        }
+        // Esc restores the workspace. A zero-size cancel-action button is
+        // deterministic regardless of which control inside the page holds
+        // focus; `.onExitCommand` would need the takeover itself focused.
+        .background {
+            Button(action: closeOnEscape) { EmptyView() }
+                .keyboardShortcut(.cancelAction)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
     }
 }
 
@@ -5153,7 +5140,10 @@ enum NativeWorkspaceChrome {
     /// own Hide Sidebar toggle, which otherwise clips the sidebar card's
     /// top-right corner.
     static let chromePanelTopInset: CGFloat = 46
-    static let topBarTrafficLightClearance: CGFloat = 76
+    /// 76 → 88 with the Safari-inset traffic lights: the zoom button's
+    /// trailing edge moved from ~61 to ~74, and the merged bar's switcher
+    /// keeps a comfortable lane after it.
+    static let topBarTrafficLightClearance: CGFloat = 88
     static let projectSidebarMinimumWidth: CGFloat = 168
     /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
@@ -5290,13 +5280,16 @@ enum NativeWorkspaceChrome {
     /// moving up into the toolbar band. Only the sidebar half of that band is
     /// dead to the mouse.
     ///
-    /// **`.topBar`: the standard gutter.** Its old 28pt toggle strip outlived
-    /// the controls that used it. Show doors now float over the content only
-    /// while a pane is hidden, so an always-empty band has no owner.
+    /// **Graduated 2026-08-28: zero, both layouts.** The floating chrome card
+    /// is gone — the workspace fills its region edge to edge and the window's
+    /// 30pt corner is the only clip — so there is no card gutter left for
+    /// this inset to size. The function survives (rather than a deleted
+    /// constant) because it is the one place a future band would come back,
+    /// and the contract test pins the flush state.
     static func detailPanelTopInset(layout: NavigationLayout) -> CGFloat {
         switch layout {
-        case .leftTree: return KaisolaVisualSystem.chromeInset
-        case .topBar: return KaisolaVisualSystem.chromeInset
+        case .leftTree: return 0
+        case .topBar: return 0
         }
     }
 
@@ -5318,6 +5311,64 @@ enum NativeWorkspaceChrome {
         filesRailVisible: Bool
     ) -> Bool {
         layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted && !filesRailVisible
+    }
+}
+
+/// The pane header's trailing cluster and context actions, pinned as data so
+/// the 2026-08-28 declutter cannot silently regress: Michael — "the spacing
+/// of these should be done better, we can remove the arrow full screen
+/// button and the account button." `RootShellView.unifiedSessionHeader`
+/// renders the cluster by iterating `trailingControls`, so what the tests
+/// hold is what is on screen.
+///
+/// Action inventory for the two removed buttons:
+/// - Maximize/Restore (the arrow) → the pane's context menu
+///   (`contextActions` pins `.toggleMaximize`).
+/// - Account & model switching (the person glyph) → the chat's ellipsis
+///   overflow (`chatOverflow` carries `chatAccountMenuContent`); the app
+///   account stays on the footer's account chip.
+enum UnifiedSessionHeaderGrammar {
+    /// One tight, evenly spaced cluster instead of the old spread.
+    static let clusterSpacing: CGFloat = 2
+
+    enum Control: Hashable {
+        case meshQueue
+        case meshConfiguration
+        case chatOverflow
+        case terminalTranscript
+        case terminalPopOut
+        case hide
+        case detailDoors
+    }
+
+    static func trailingControls(
+        isChat: Bool,
+        isMesh: Bool,
+        isTerminal: Bool,
+        hostsDetailDoors: Bool
+    ) -> [Control] {
+        var controls: [Control] = []
+        if isMesh { controls.append(contentsOf: [.meshQueue, .meshConfiguration]) }
+        if isChat { controls.append(.chatOverflow) }
+        if isTerminal { controls.append(contentsOf: [.terminalTranscript, .terminalPopOut]) }
+        controls.append(.hide)
+        if hostsDetailDoors { controls.append(.detailDoors) }
+        return controls
+    }
+
+    enum ContextAction: Hashable {
+        case rename
+        case openTranscript
+        case moveToProject
+        case toggleMaximize
+        case hide
+    }
+
+    static func contextActions(isTerminal: Bool) -> [ContextAction] {
+        var actions: [ContextAction] = [.rename]
+        if isTerminal { actions.append(contentsOf: [.openTranscript, .moveToProject]) }
+        actions.append(contentsOf: [.toggleMaximize, .hide])
+        return actions
     }
 }
 
@@ -5603,7 +5654,6 @@ private struct TopBarProjectSwitcher: View {
     @Binding var selected: String?
     let contextMenu: (AppModel.ProjectGroup) -> AnyView
 
-    @Environment(\.shellPreview) private var shellPreview
     @State private var hovering = false
 
     var body: some View {
@@ -5642,7 +5692,7 @@ private struct TopBarProjectSwitcher: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background {
-                ShellTabShape.shape(preview: shellPreview)
+                ShellTabShape.shape()
                     .fill(Color.primary.opacity(hovering ? 0.07 : 0))
             }
             .contentShape(Rectangle())
@@ -5737,8 +5787,7 @@ private struct TopBarTrailingControls: View {
 
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.shellPreview) private var shellPreview
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// One hover at a time across the whole strip; the tabs had no pointer
     /// feedback at all, and a per-row `@State` would leave stale highlights
     /// behind fast pointer sweeps.
@@ -5758,11 +5807,6 @@ private struct SessionStrip: View {
 
     private var project: AppModel.ProjectGroup? {
         model.projects.first { $0.id == projectID }
-    }
-
-    private var selectedSurfaceID: String? {
-        if let draft, draft.id == selectedDraftID { return draft.id }
-        return model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
     }
 
     var body: some View {
@@ -5785,58 +5829,35 @@ private struct SessionStrip: View {
         // `draft != nil` matters: with no draft at all, `draft?.id ==
         // selectedDraftID` is `nil == nil` — true — and that phantom
         // "selected draft" suppressed every real tab's selected state. The
-        // old strip's resting fills hid the bug; the revision's active-card
+        // old strip's resting fills hid the bug; the graduated active-card
         // design exposed it.
         let draftSelected = draft != nil && draft?.id == selectedDraftID
-        // Preview ON — the merged bar's packed tabs (2026-08-28 feedback:
-        // "condensed"): a plain HStack at fixed `MergedTopBarGrammar.tabGap`
-        // gaps, not a horizontal ScrollView, sized to its content so the
-        // bar's flexible gap stays OUTSIDE the strip. At narrow widths the
-        // tabs compress in place — inactive titles truncate first, the
-        // active tab keeps its title longest via `layoutPriority` — and they
-        // never spread to fill a wide bar. (The full overflow policy, a
-        // count menu, is future work.)
-        // Preview OFF — the shipped 36pt scrolling strip, verbatim.
-        return Group {
-            if shellPreview.isOn {
-                HStack(spacing: MergedTopBarGrammar.tabGap) {
-                    tabRows(
-                        draftSelected: draftSelected,
-                        sessions: sessions,
-                        chats: chats,
-                        meshes: meshes,
-                        recentlyClosed: recentlyClosed
-                    )
-                }
-                .padding(.leading, MergedTopBarGrammar.tabGap)
-                .frame(maxHeight: .infinity)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            tabRows(
-                                draftSelected: draftSelected,
-                                sessions: sessions,
-                                chats: chats,
-                                meshes: meshes,
-                                recentlyClosed: recentlyClosed
-                            )
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                    }
-                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-                    .onChange(of: selectedSurfaceID) { _, id in
-                        guard let id else { return }
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            proxy.scrollTo(id, anchor: .center)
-                        }
-                    }
-                }
-                .frame(height: 36)
-            }
+        // The merged bar's packed tabs (2026-08-28 feedback: "condensed"): a
+        // plain HStack at fixed `MergedTopBarGrammar.tabGap` gaps, not a
+        // horizontal ScrollView, sized to its content so the bar's flexible
+        // gap stays OUTSIDE the strip. At narrow widths the tabs compress in
+        // place — inactive titles truncate first, the active tab keeps its
+        // title longest via `layoutPriority` — and they never spread to fill
+        // a wide bar. (The full overflow policy, a count menu, is future
+        // work.)
+        return HStack(spacing: MergedTopBarGrammar.tabGap) {
+            tabRows(
+                draftSelected: draftSelected,
+                sessions: sessions,
+                chats: chats,
+                meshes: meshes,
+                recentlyClosed: recentlyClosed
+            )
         }
+        .padding(.leading, MergedTopBarGrammar.tabGap)
+        .frame(maxHeight: .infinity)
+        // The one animated value the whole strip shares: hover washes ease
+        // in and out instead of flipping (2026-08-28, "General UI buttons
+        // and clicking should be smooth").
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: KaisolaChromeControlWash.duration),
+            value: hoveredTabID
+        )
     }
 
     /// Every tab in the strip, shared verbatim by the two containers: the
@@ -6080,45 +6101,24 @@ private struct SessionStrip: View {
         }
     }
 
-    /// Preview OFF — the shipped plates: selection follows
-    /// `QuietSelectionPill.fillOpacity`'s dark step-up (a mid-dark tint at
-    /// 0.10 over a dark panel was a 0.007 luminance delta — selection the eye
-    /// could not find), and hover lifts an unselected tab the same way the
-    /// rail's controls answer the pointer.
-    /// Preview ON — 2026-08-28 decision 3: the active tab is a white-led card
-    /// on the shared bar surface with the existing soft shadow language;
-    /// inactive tabs are quiet text on the glass with NO resting fill,
-    /// gaining a faint wash on hover. The tinted plates and hairline strokes
-    /// stay in the shipped strip only; under the preview, status speaks
-    /// through the small mark before each title, so `tint` no longer colours
-    /// the plate there.
+    /// The graduated pill tabs: the active tab is a white-led card on the
+    /// shared bar surface with the existing soft shadow language; inactive
+    /// tabs are quiet text on the glass with NO resting fill, gaining a
+    /// faint wash on hover. Status speaks through the small mark before each
+    /// title, so `tint` does not colour the plate. (`tint` stays in the
+    /// signature because each tab family still declares its palette voice —
+    /// the leading marks use it.)
     @ViewBuilder
     private func surfaceTabBackground(
         selected: Bool,
         tint: Color,
         hovered: Bool = false
     ) -> some View {
-        if !shellPreview.isOn {
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-                .fill(
-                    selected
-                        ? tint.opacity(colorScheme == .dark ? 0.22 : 0.13)
-                        : Color.primary.opacity(hovered ? 0.07 : 0.035)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-                        .stroke(
-                            selected
-                                ? tint.opacity(SurfaceTabChrome.sessionSelectedStrokeOpacity)
-                                : Color.primary.opacity(SurfaceTabChrome.inactiveStrokeOpacity),
-                            lineWidth: KaisolaVisualSystem.hairline
-                        )
-                }
-        } else if selected {
+        if selected {
             ShellTabCardBackground()
         } else if hovered {
-            ShellTabShape.shape(preview: shellPreview)
-                .fill(Color.primary.opacity(0.06))
+            ShellTabShape.shape()
+                .fill(Color.primary.opacity(KaisolaChromeControlWash.hoverOpacity))
         }
     }
 }
@@ -6674,10 +6674,34 @@ struct ConnectionFooterPresentation: Equatable {
     }
 }
 
+/// The footer's update affordance (2026-08-28: "when there is a new update it
+/// should be downloadable and small update button next to notification button
+/// in the bottom left corner"). Pure presentation over `UpdateCenter`'s two
+/// axes so visibility is a table the tests hold: absent entirely when nothing
+/// is downloaded, an actionable badge while an install is ready, and a
+/// disabled spinner once installation has started (so a second click cannot
+/// race the relaunch).
+enum FooterUpdateBadge: Equatable {
+    case hidden
+    case ready(version: String)
+    case installing
+
+    static func resolve(pendingVersion: String?, isInstalling: Bool) -> FooterUpdateBadge {
+        guard let pendingVersion else { return .hidden }
+        return isInstalling ? .installing : .ready(version: pendingVersion)
+    }
+
+    var help: String {
+        switch self {
+        case .hidden: ""
+        case let .ready(version): "Update to Kaisola \(version) — restarts to install"
+        case .installing: "Installing update and restarting…"
+        }
+    }
+}
 
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
-    @Environment(\.shellPreview) private var shellPreview
     var jumpToAttention: ((String) -> Void)?
     /// Resolves an inbox target to its project and liveness at render time —
     /// see `AttentionInboxModel`. Nil (previews, fixtures) renders the flat
@@ -6697,6 +6721,7 @@ private struct ConnectionFooter: View {
     @ObservedObject private var usage = UsageCenter.shared
 
     @ObservedObject private var attention = AttentionCenter.shared
+    @ObservedObject private var updates = UpdateCenter.shared
     @State private var showInbox = false
 
     private static let appVersion = Bundle.main.object(
@@ -6718,18 +6743,16 @@ private struct ConnectionFooter: View {
     /// `fixedSize`, so the name gets the whole remainder and truncates only
     /// when the sidebar is genuinely at its minimum.
     ///
-    /// Under the shell preview the footer slims per the 2026-08-28 revision
-    /// (decision 5): account chip, usage percent, attention bell, ellipsis —
-    /// the gear folds into the account and overflow menus (Settings stays one
-    /// ⌘, away and one menu item away). With the preview off the shipped
-    /// gear keeps its slot.
+    /// Order, graduated 2026-08-28: account chip, usage, the gear (the
+    /// Settings-takeover door — pressing it again is Back to app), then the
+    /// update badge sitting next to the bell it belongs beside, the bell,
+    /// and the overflow.
     var body: some View {
         HStack(spacing: FooterAccountBudget.gap) {
             accountMenu
             usageChip
-            if !shellPreview.isOn {
-                settingsButton
-            }
+            settingsButton
+            updateButton
             attentionButton
             overflowMenu
         }
@@ -6740,8 +6763,9 @@ private struct ConnectionFooter: View {
         .frame(height: 40)
     }
 
-    /// One click to Settings — the ⌘, destination, which until now existed
-    /// only inside two menus. Monochrome on purpose: it is a door, not a state.
+    /// One click to Settings — the workspace takeover's door and, while the
+    /// takeover is up, its "back to app". Monochrome on purpose: it is a
+    /// door, not a state.
     private var settingsButton: some View {
         Button(action: showSettings) {
             Image(systemName: "gearshape")
@@ -6750,11 +6774,46 @@ private struct ConnectionFooter: View {
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.kaisolaChrome)
         .fixedSize()
         .help("Settings (⌘,)")
         .accessibilityLabel("Settings")
         .accessibilityIdentifier("footer.settings")
+    }
+
+    /// The small install-and-relaunch affordance beside the bell. Wired to
+    /// `UpdateCenter`'s published state — the Sparkle plumbing that already
+    /// owns readiness — never a poll loop; absent entirely when there is
+    /// nothing to install (`FooterUpdateBadge`).
+    @ViewBuilder
+    private var updateButton: some View {
+        let badge = FooterUpdateBadge.resolve(
+            pendingVersion: updates.pendingUpdate?.version,
+            isInstalling: updates.isInstallingUpdate
+        )
+        if badge != .hidden {
+            Button {
+                UpdateCenter.shared.installAndRelaunch()
+            } label: {
+                Group {
+                    if badge == .installing {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
+                .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
+            }
+            .buttonStyle(.kaisolaChrome)
+            .fixedSize()
+            .disabled(badge == .installing)
+            .help(badge.help)
+            .accessibilityLabel(badge.help)
+            .accessibilityIdentifier("footer.update")
+        }
     }
 
     /// The primary account's tightest plan window, as one percentage that opens
@@ -6777,7 +6836,7 @@ private struct ConnectionFooter: View {
                     .frame(height: FooterAccountBudget.controlSlot)
                     .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.kaisolaChrome)
             .fixedSize()
             .help(reading.help)
             .accessibilityLabel(reading.accessibilityLabel)
@@ -7042,7 +7101,7 @@ private struct ConnectionFooter: View {
                     Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion)
                 )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.kaisolaChrome)
         .fixedSize()
         .help(
             attention.count > 0

@@ -1,13 +1,16 @@
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 @testable import Kaisola
 
 @MainActor
 final class RootShellLayoutsTests: XCTestCase {
+    // MARK: - Graduated shell contract
+
     func testLeftTreeShellRendersProjectsWorkspaceAndFooter() throws {
         XCTAssertEqual(
-            RootShellRenderContract.regions(for: .leftTree, preview: .off),
+            RootShellRenderContract.regions(for: .leftTree),
             [.projects, .workspace, .footer]
         )
 
@@ -26,43 +29,15 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertGreaterThan(image.tiffRepresentation?.count ?? 0, 1_000)
     }
 
-    func testTopBarShellKeepsTheShippedFiveRegionStackWhenThePreviewIsOff() throws {
-        // 2026-08-28 feedback round: the shell revision is a runtime preview
-        // now. Off must be exactly the shipped shell — main's five regions,
-        // Quick Actions row included.
+    func testTopBarShellIsTheMergedCondensedBar() throws {
+        // Graduation, 2026-08-28: the merged 40pt bar IS the top-bar mode.
+        // The legacy five-region stack (project strip, Quick Actions row,
+        // session strip) is deleted, so `.projects` and `.sessions` are the
+        // two halves of the one band.
         XCTAssertEqual(
-            RootShellRenderContract.regions(for: .topBar, preview: .off),
-            [.projects, .quickActions, .sessions, .workspace, .footer]
+            RootShellRenderContract.regions(for: .topBar),
+            [.projects, .sessions, .workspace, .footer]
         )
-
-        let image = try renderRootShell(
-            RootTopBarShell(actions: inertRootShellActions()) { _ in
-                Text("Projects")
-            } quickActions: { _ in
-                Text("Quick Actions")
-            } sessions: { _ in
-                Text("Sessions")
-            } detail: { _ in
-                Text("Workspace")
-            } footer: { _ in
-                Text("Footer")
-            }
-        )
-
-        XCTAssertEqual(image.size, NSSize(width: 720, height: 480))
-        XCTAssertGreaterThan(image.tiffRepresentation?.count ?? 0, 1_000)
-    }
-
-    func testTopBarShellMergesIntoOneBarOnlyWhileThePreviewIsOn() throws {
-        // 2026-08-28 revision, decision 2: under the preview the project strip
-        // and session strip are one 40pt bar and the persistent Quick Actions
-        // row is gone. Both on-variants share the merged structure.
-        for variant in [ShellPreviewVariant.pills, .capsules] {
-            XCTAssertEqual(
-                RootShellRenderContract.regions(for: .topBar, preview: variant),
-                [.projects, .sessions, .workspace, .footer]
-            )
-        }
 
         let image = try renderRootShell(
             RootMergedTopBarShell(actions: inertRootShellActions()) { _ in
@@ -76,15 +51,6 @@ final class RootShellLayoutsTests: XCTestCase {
 
         XCTAssertEqual(image.size, NSSize(width: 720, height: 480))
         XCTAssertGreaterThan(image.tiffRepresentation?.count ?? 0, 1_000)
-    }
-
-    func testLeftTreeContractIsTheSameWithThePreviewOnAndOff() {
-        for variant in ShellPreviewVariant.allCases {
-            XCTAssertEqual(
-                RootShellRenderContract.regions(for: .leftTree, preview: variant),
-                [.projects, .workspace, .footer]
-            )
-        }
     }
 
     func testMergedBarPacksTabsAfterTheSwitcherWithOneFlexibleGapBeforeTheTrailingCluster() {
@@ -105,133 +71,213 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(MergedTopBarGrammar.tabGap, 8)
     }
 
-    func testQuietRailFillsOnlyTheSelectedRowWhileThePreviewIsOn() {
+    func testQuietRailFillsOnlyTheSelectedRow() {
         // Michael, 2026-08-28: "I'd like there'd not to be a double card
-        // situation for the lhs rail." Under the preview's card rail, resting
-        // rows — split companions included — draw no fill; only the selected
-        // row wears the pill, and hover answers with the faint wash.
-        for variant in [ShellPreviewVariant.pills, .capsules] {
-            XCTAssertEqual(
-                QuietSelectionPill.fill(isSelected: true, isOnScreen: true, hovering: false, preview: variant),
-                .selectionPill
-            )
-            XCTAssertEqual(
-                QuietSelectionPill.fill(isSelected: true, isOnScreen: false, hovering: true, preview: variant),
-                .selectionPill,
-                "selection outranks hover"
-            )
-            XCTAssertEqual(
-                QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: false, preview: variant),
-                QuietRowFill.none,
-                "an on-screen companion row rests quiet inside the rail card"
-            )
-            XCTAssertEqual(
-                QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: true, preview: variant),
-                .hoverWash
-            )
-            XCTAssertEqual(
-                QuietSelectionPill.fill(isSelected: false, isOnScreen: false, hovering: false, preview: variant),
-                QuietRowFill.none
-            )
-        }
-    }
-
-    func testQuietRailKeepsTheShippedCompanionPillAndNoHoverWashWhenThePreviewIsOff() {
+        // situation for the lhs rail." Resting rows — split companions
+        // included — draw no fill; only the selected row wears the pill, and
+        // hover answers with the faint wash.
         XCTAssertEqual(
-            QuietSelectionPill.fill(isSelected: true, isOnScreen: false, hovering: false, preview: .off),
+            QuietSelectionPill.fill(isSelected: true, isOnScreen: true, hovering: false),
             .selectionPill
         )
         XCTAssertEqual(
-            QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: false, preview: .off),
-            .companionPill,
-            "off is exactly the shipped rail: a split's other pane keeps its fainter pill"
+            QuietSelectionPill.fill(isSelected: true, isOnScreen: false, hovering: true),
+            .selectionPill,
+            "selection outranks hover"
         )
         XCTAssertEqual(
-            QuietSelectionPill.fill(isSelected: false, isOnScreen: false, hovering: true, preview: .off),
+            QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: false),
             QuietRowFill.none,
-            "the hover wash is part of the preview, not the shipped rail"
+            "an on-screen companion row rests quiet inside the rail"
         )
         XCTAssertEqual(
-            QuietSelectionPill.fill(isSelected: false, isOnScreen: false, hovering: false, preview: .off),
+            QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: true),
+            .hoverWash
+        )
+        XCTAssertEqual(
+            QuietSelectionPill.fill(isSelected: false, isOnScreen: false, hovering: false),
             QuietRowFill.none
         )
     }
 
-    func testShellPreviewSettingDefaultsOffRoundTripsAndRejectsJunk() throws {
-        let suite = "kaisola-tests.shell-preview.\(UUID().uuidString)"
+    func testTheWindowCornerIsTheShellRadiusUnconditionally() {
+        // The 30pt real window corner graduated with the shell: no
+        // preview gate, no zero state.
+        XCTAssertEqual(ShellWindowChrome.cornerRadius, KaisolaVisualSystem.shellRadius)
+        XCTAssertEqual(ShellWindowChrome.cornerRadius, 30)
+    }
+
+    func testTheWorkspaceIsFlushInBothLayouts() {
+        // Edge to edge: no chrome-card gutter above the content in either
+        // layout; the window corner is the only clip.
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 0)
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 0)
+    }
+
+    // MARK: - Navigation-layout default and persistence
+
+    func testFreshInstallDefaultsToTheLeftTreeRailAndIgnoresTheRetiredPreviewKey() throws {
+        let suite = "kaisola-tests.shell-graduation.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
+        // A preview-era install may still carry the retired key; it must be
+        // ignored rather than migrated or crashed on.
+        defaults.set("capsules", forKey: "shellPreviewVariant")
+
         let fresh = NativePreviewSettings(defaults: defaults, persistsChanges: true)
-        XCTAssertEqual(fresh.shellPreviewVariant, .off, "the preview never turns itself on")
+        XCTAssertEqual(fresh.navigationLayout, .leftTree, "left tree is the graduated default")
 
-        fresh.shellPreviewVariant = .capsules
-        XCTAssertEqual(defaults.string(forKey: "shellPreviewVariant"), "capsules")
-        let reread = NativePreviewSettings(defaults: defaults, persistsChanges: true)
-        XCTAssertEqual(reread.shellPreviewVariant, .capsules)
+        // An explicitly persisted layout choice is preserved — only the
+        // fallback default changed.
+        defaults.set("topBar", forKey: "navigationLayout")
+        let chosen = NativePreviewSettings(defaults: defaults, persistsChanges: true)
+        XCTAssertEqual(chosen.navigationLayout, .topBar)
 
-        defaults.set("lozenges", forKey: "shellPreviewVariant")
+        defaults.set("ribbonBar", forKey: "navigationLayout")
         let junk = NativePreviewSettings(defaults: defaults, persistsChanges: true)
-        XCTAssertEqual(junk.shellPreviewVariant, .off, "an unknown stored value falls back to the shipped shell")
+        XCTAssertEqual(junk.navigationLayout, .leftTree, "an unknown stored layout falls back to the default")
     }
 
-    func testShellPreviewEnvironmentOverrideOutranksTheSetting() {
-        // KAISOLA_SHELL_PREVIEW_TABS keeps working for fixture processes and
-        // wins over the persisted choice; anything unparseable defers to it.
+    // MARK: - The v0.1.146 crash fix: structural switches defer
+
+    func testNavigationLayoutRequestNeverAppliesOnTheRequestingStack() throws {
+        // Crash signature (v0.1.146): objc_loadWeak ←
+        // -[NSSplitView _beginInteractivePeekAtInitialLocation:] ← mouseDown —
+        // a same-stack shell swap tearing the split view down inside AppKit's
+        // event-tracking pass. The fix is that a layout request must apply on
+        // a LATER default-mode run-loop turn, never synchronously.
+        let suite = "kaisola-tests.layout-defer.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = NativePreviewSettings(defaults: defaults, persistsChanges: true)
+
+        XCTAssertEqual(settings.navigationLayout, .leftTree)
+        settings.requestNavigationLayout(.topBar)
         XCTAssertEqual(
-            ShellPreviewVariant.resolved(
-                environment: ["KAISOLA_SHELL_PREVIEW_TABS": "capsules"],
-                setting: .off
-            ),
-            .capsules
+            settings.navigationLayout,
+            .leftTree,
+            "same-stack application is exactly the NSSplitView divider crash"
         )
+
+        spinRunLoop(until: { settings.navigationLayout == .topBar })
+        XCTAssertEqual(settings.navigationLayout, .topBar)
         XCTAssertEqual(
-            ShellPreviewVariant.resolved(
-                environment: ["KAISOLA_SHELL_PREVIEW_TABS": "pills"],
-                setting: .capsules
-            ),
-            .pills
-        )
-        XCTAssertEqual(
-            ShellPreviewVariant.resolved(
-                environment: ["KAISOLA_SHELL_PREVIEW_TABS": "off"],
-                setting: .pills
-            ),
-            .off
-        )
-        XCTAssertEqual(
-            ShellPreviewVariant.resolved(
-                environment: ["KAISOLA_SHELL_PREVIEW_TABS": "wedges"],
-                setting: .capsules
-            ),
-            .capsules
-        )
-        XCTAssertEqual(
-            ShellPreviewVariant.resolved(environment: [:], setting: .pills),
-            .pills
-        )
-        XCTAssertEqual(
-            ShellPreviewVariant.resolved(environment: [:], setting: .off),
-            .off
+            defaults.string(forKey: "navigationLayout"),
+            "topBar",
+            "the deferred application still persists the choice"
         )
     }
 
-    func testWindowCornerStaysSystemSquareUntilThePreviewTurnsItOn() {
-        XCTAssertEqual(ShellPreviewVariant.off.windowCornerRadius, 0)
-        XCTAssertEqual(ShellPreviewVariant.pills.windowCornerRadius, KaisolaVisualSystem.shellRadius)
-        XCTAssertEqual(ShellPreviewVariant.capsules.windowCornerRadius, KaisolaVisualSystem.shellRadius)
+    func testBurstsOfLayoutRequestsCoalesceToTheLastOne() throws {
+        let suite = "kaisola-tests.layout-coalesce.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = NativePreviewSettings(defaults: defaults, persistsChanges: true)
+        var applied: [NavigationLayout] = []
+        let cancellable = settings.$navigationLayout.dropFirst().sink { applied.append($0) }
+        defer { cancellable.cancel() }
+
+        settings.requestNavigationLayout(.topBar)
+        settings.requestNavigationLayout(.leftTree)
+        settings.requestNavigationLayout(.topBar)
+
+        spinRunLoop(until: { settings.navigationLayout == .topBar })
+        XCTAssertEqual(
+            applied,
+            [.topBar],
+            "one structural swap for a burst of requests, landing on the last"
+        )
     }
 
-    func testTopBarWorkspaceDoesNotReserveAnEmptyToggleStrip() {
-        XCTAssertEqual(
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
-            KaisolaVisualSystem.chromeInset
+    func testBootstrapNavigationLayoutIsSynchronousForLaunchTimeFixtureSetup() throws {
+        let suite = "kaisola-tests.layout-bootstrap.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = NativePreviewSettings(defaults: defaults, persistsChanges: true)
+
+        settings.bootstrapNavigationLayout(.topBar)
+        XCTAssertEqual(settings.navigationLayout, .topBar)
+    }
+
+    func testSettingsTakeoverPolicyTogglesOnTheDoorAndAlwaysRestoresOnBackAndEscape() {
+        // The takeover uses the same deferred structural-switch discipline;
+        // this pins its state table. The gear (and ⌘,) toggles; Back to app
+        // and Esc always restore; a deep link always lands open.
+        XCTAssertTrue(SettingsTakeoverPolicy.isPresented(after: .pressSettingsDoor, from: false))
+        XCTAssertFalse(
+            SettingsTakeoverPolicy.isPresented(after: .pressSettingsDoor, from: true),
+            "pressing the gear again restores the workspace"
+        )
+        XCTAssertFalse(SettingsTakeoverPolicy.isPresented(after: .backToApp, from: true))
+        XCTAssertFalse(SettingsTakeoverPolicy.isPresented(after: .escape, from: true))
+        XCTAssertTrue(SettingsTakeoverPolicy.isPresented(after: .openSection, from: false))
+        XCTAssertTrue(SettingsTakeoverPolicy.isPresented(after: .openSection, from: true))
+    }
+
+    // MARK: - Pane header declutter (2026-08-28)
+
+    func testChatHeaderDropsTheMaximizeArrowAndAccountButtonsIntoOneTightCluster() {
+        let chat = UnifiedSessionHeaderGrammar.trailingControls(
+            isChat: true,
+            isMesh: false,
+            isTerminal: false,
+            hostsDetailDoors: true
         )
         XCTAssertEqual(
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
-            NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree)
+            chat,
+            [.chatOverflow, .hide, .detailDoors],
+            "ellipsis and the panel toggles stay; the arrow and account buttons are gone"
+        )
+
+        let terminal = UnifiedSessionHeaderGrammar.trailingControls(
+            isChat: false,
+            isMesh: false,
+            isTerminal: true,
+            hostsDetailDoors: false
+        )
+        XCTAssertEqual(terminal, [.terminalTranscript, .terminalPopOut, .hide])
+
+        let mesh = UnifiedSessionHeaderGrammar.trailingControls(
+            isChat: false,
+            isMesh: true,
+            isTerminal: false,
+            hostsDetailDoors: false
+        )
+        XCTAssertEqual(mesh, [.meshQueue, .meshConfiguration, .hide])
+        XCTAssertEqual(UnifiedSessionHeaderGrammar.clusterSpacing, 2, "one tight cluster, not a spread")
+    }
+
+    func testTheRemovedMaximizeActionLivesInThePaneContextMenu() {
+        // Old spec's action-inventory rule: an action loses its button only
+        // if it keeps a home.
+        XCTAssertTrue(
+            UnifiedSessionHeaderGrammar.contextActions(isTerminal: false)
+                .contains(.toggleMaximize)
+        )
+        XCTAssertEqual(
+            UnifiedSessionHeaderGrammar.contextActions(isTerminal: true),
+            [.rename, .openTranscript, .moveToProject, .toggleMaximize, .hide]
         )
     }
+
+    // MARK: - Safari-style traffic lights
+
+    func testTrafficLightsShiftInwardPreservingTheStandardGaps() {
+        XCTAssertEqual(WorkspaceTrafficLights.leadingInset, 20, "Safari's ~20pt inset")
+        XCTAssertEqual(
+            WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [7, 27, 47]),
+            [20, 40, 60]
+        )
+        XCTAssertEqual(
+            WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [20, 40, 60]),
+            [20, 40, 60],
+            "already-shifted buttons are a fixed point, so re-application cannot walk"
+        )
+        XCTAssertEqual(WorkspaceTrafficLights.shiftedOrigins(standardMinXs: []), [])
+    }
+
+    // MARK: - Retained shell behaviors
 
     func testCollapsedSidebarMovesSessionIdentityPastWindowControls() {
         XCTAssertEqual(
@@ -333,6 +379,19 @@ final class RootShellLayoutsTests: XCTestCase {
 
         XCTAssertEqual(startedProjectIDs, ["project-a"])
         XCTAssertEqual(realSurfaceSelections, 1)
+    }
+
+    // MARK: - Helpers
+
+    /// Spins the main run loop in default mode until the condition holds (or
+    /// two seconds pass) — the deferred structural switch applies via
+    /// `RunLoop.main.perform(inModes: [.default])`, which a plain
+    /// expectation-wait can miss because XCTest waits in its own mode.
+    private func spinRunLoop(until condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(2)
+        while !condition() && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
     }
 
     private func renderRootShell<Content: View>(_ content: Content) throws -> NSImage {

@@ -209,9 +209,14 @@ function landOnMain(branch, title, body) {
       // review threads to be resolved, and an automated reviewer comments on
       // most pull requests, so the usual cause is a thread nobody has answered
       // — which no amount of waiting will clear. Say which it is rather than
-      // spending forty-five minutes finding out.
-      const unresolved = Number(output('gh', ['pr', 'view', number, '--json', 'reviewThreads',
-        '--jq', '[.reviewThreads[]? | select(.isResolved == false)] | length']) || '0')
+      // spending forty-five minutes finding out. A transient failure of this
+      // probe reads as zero threads and the loop simply polls again — the
+      // 0.1.144 run died here on the same read-replica lag the main view
+      // already tolerates.
+      const threads = command('gh', ['pr', 'view', number, '--json', 'reviewThreads',
+        '--jq', '[.reviewThreads[]? | select(.isResolved == false)] | length'],
+        { capture: true, allowFailure: true })
+      const unresolved = threads.status === 0 ? Number(threads.stdout.trim() || '0') : 0
       if (unresolved > 0) {
         fail(`pull request #${number} has ${unresolved} unresolved review thread(s); `
           + 'address them and re-run — the release resumes from here')

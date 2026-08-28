@@ -35,6 +35,15 @@ final class AppModelProjectContextTests: XCTestCase {
         }
     }
 
+    private struct GatedBrokerInfoPreparer: BrokerInfoPreparing {
+        let gate: DeterministicSuspensionGate
+
+        func prepare() async throws -> BrokerInfo {
+            await gate.suspend()
+            return ProjectContextBrokerPreparer.info
+        }
+    }
+
     private var storeFile: URL!
 
     override func setUpWithError() throws {
@@ -3925,6 +3934,210 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(conversation.loadedRowStartOrdinal, 680)
         XCTAssertEqual(conversation.hiddenEarlierCount, 680)
         await model.teardown()
+    }
+
+    @MainActor
+    func testReloadPublishesFocusedChatBeforeTerminalPreparationCompletes() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("chat-first-reload", isDirectory: true)
+        let projectDirectory = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "chat:focused"
+        let meshID = "mesh:bounded"
+        let meshColumnID = "mesh:bounded:base"
+        let activeTerminalID = "terminal:active-owned"
+        let endedTerminalID = "terminal:ended-owned"
+        let staleTerminalID = "terminal:stale-unowned"
+        let agent = try XCTUnwrap(
+            AgentRegistry.all.first { $0.id == "codex" && AcpAdapter.forAgent($0.id) != nil }
+                ?? AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil }
+        )
+
+        let sessionStore = NativeSessionStore(
+            fileURL: root.appendingPathComponent("native-sessions.json")
+        )
+        _ = sessionStore.openProject(directory: projectDirectory.path)
+        sessionStore.upsert(NativeOwnedSession(
+            id: activeTerminalID,
+            projectID: projectID,
+            cwd: root.appendingPathComponent("does-not-exist", isDirectory: true).path,
+            title: "Active owned",
+            createdAt: 1,
+            agentID: agent.id
+        ))
+        sessionStore.upsert(NativeOwnedSession(
+            id: endedTerminalID,
+            projectID: projectID,
+            cwd: projectDirectory.path,
+            title: "Ended owned",
+            createdAt: 2,
+            agentID: agent.id,
+            endedAt: 3
+        ))
+
+        let chatDescriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: projectID,
+            agentID: agent.id,
+            workspacePath: projectDirectory.path,
+            acpSessionID: nil,
+            accountBinding: nil,
+            title: "Focused chat"
+        )
+        let meshDescriptor = NativeRestorableMeshDescriptor(
+            id: meshID,
+            projectID: projectID,
+            basePath: projectDirectory.path,
+            title: "Bounded Mesh",
+            mode: .flat,
+            purpose: .idea,
+            lifecycle: .suspended,
+            columns: [NativeRestorableMeshColumnDescriptor(
+                id: meshColumnID,
+                agentID: agent.id,
+                role: .ideator,
+                worktreePath: nil,
+                branch: nil,
+                createdBaseOID: nil,
+                acpSessionID: nil,
+                provisioning: .attached,
+                workspaceKind: .base
+            )]
+        )
+        let terminalPane: (String, String, String?) -> NativeRestorablePaneState = {
+            id, title, agentID in
+            NativeRestorablePaneState(
+                id: id,
+                surface: NativeRestorableSurfaceState(
+                    kind: .terminal,
+                    id: id,
+                    projectID: projectID,
+                    agentID: agentID,
+                    title: title
+                )
+            )
+        }
+        let paneIDs = [
+            chatID,
+            activeTerminalID,
+            endedTerminalID,
+            staleTerminalID,
+            meshID,
+        ]
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace.json")
+        )
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(columns: [.init(sessionIDs: paneIDs)]),
+                panes: [
+                    NativeRestorablePaneState(
+                        id: chatID,
+                        surface: NativeRestorableSurfaceState(agentChat: chatDescriptor)
+                    ),
+                    terminalPane(activeTerminalID, "Active owned", agent.id),
+                    terminalPane(endedTerminalID, "Ended owned", agent.id),
+                    terminalPane(staleTerminalID, "Archived terminal", nil),
+                    NativeRestorablePaneState(
+                        id: meshID,
+                        surface: NativeRestorableSurfaceState(mesh: meshDescriptor)
+                    ),
+                ],
+                focusedPaneID: chatID
+            )]
+        ))
+
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        let chatRows = (0..<1_200).map {
+            AcpTranscriptRow.message(id: "chat-\($0)", text: "chat row \($0)")
+        }
+        let meshRows = (0..<1_200).map {
+            AcpTranscriptRow.message(id: "mesh-\($0)", text: "mesh row \($0)")
+        }
+        await transcriptStore.scheduleSave(chatRows, for: chatID, now: 1)
+        await transcriptStore.scheduleSave(meshRows, for: meshColumnID, now: 2)
+        await transcriptStore.flush()
+
+        let gate = DeterministicSuspensionGate()
+        let model = AppModel(
+            brokerPreparer: GatedBrokerInfoPreparer(gate: gate),
+            client: ProjectContextBrokerClient(),
+            controlClient: ProjectAccountNoLaunchBrokerControlClient(),
+            sessionStore: sessionStore,
+            cursorStore: TerminalCursorStore(
+                fileURL: root.appendingPathComponent("cursors.json")
+            ),
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { _ in await Task.yield() },
+            jitter: { 0 }
+        )
+
+        let reloadTask = Task { await model.reload() }
+        await gate.waitUntilEntered()
+
+        let selectedProjectID = model.selectedProjectID
+        let selectedChatID = model.selectedChatID
+        let focusedPaneID = model.focusedPaneID
+        let chat = model.chats.first { $0.id == chatID }?.conversation
+        let meshColumn = model.meshes.first { $0.id == meshID }?.columns.first {
+            $0.id == meshColumnID
+        }?.conversation
+        let materialized = model.chats.reduce(0) { $0 + $1.conversation.rows.count }
+            + model.meshes.flatMap(\.columns).reduce(0) { $0 + $1.conversation.rows.count }
+        let conversationCount = model.chats.count + model.meshes.flatMap(\.columns).count
+        let inMemoryLayoutIDs = model.paneLayout(for: projectID).sessionIDs
+        let inMemorySnapshot = model.workspaceSnapshotForTesting(projectID: projectID)
+        if let inMemorySnapshot {
+            try await workspaceStore.saveProjectState(inMemorySnapshot, makeSelected: false)
+        }
+        let diskSnapshot = try await workspaceStore.projectState(for: projectID)
+
+        await gate.release()
+        await reloadTask.value
+        await model.teardown()
+
+        XCTAssertEqual(selectedProjectID, projectID)
+        XCTAssertEqual(selectedChatID, chatID)
+        XCTAssertEqual(focusedPaneID, chatID)
+        XCTAssertEqual(chat?.rows.count, AcpConversation.defaultVisibleLimit)
+        XCTAssertEqual(chat?.hiddenEarlierCount, 1_080)
+        XCTAssertEqual(meshColumn?.rows.count, AcpConversation.defaultVisibleLimit)
+        XCTAssertEqual(meshColumn?.hiddenEarlierCount, 1_080)
+        XCTAssertLessThanOrEqual(
+            materialized,
+            conversationCount * AcpConversation.defaultVisibleLimit
+        )
+        XCTAssertEqual(inMemoryLayoutIDs, paneIDs)
+        let durableSnapshotPaneIDs = [
+            chatID,
+            activeTerminalID,
+            staleTerminalID,
+            meshID,
+        ]
+        for snapshot in [inMemorySnapshot, diskSnapshot] {
+            let terminalIDs = Set(snapshot?.panes.compactMap { pane in
+                pane.surface.kind == .terminal ? pane.id : nil
+            } ?? [])
+            XCTAssertTrue(terminalIDs.contains(activeTerminalID))
+            XCTAssertTrue(terminalIDs.contains(staleTerminalID))
+            XCTAssertFalse(terminalIDs.contains(endedTerminalID))
+            XCTAssertEqual(snapshot?.layout.sessionIDs, durableSnapshotPaneIDs)
+        }
     }
 
     /// A chat whose stored rows cannot be decoded keeps its surface, says so,

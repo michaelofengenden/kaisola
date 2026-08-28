@@ -106,6 +106,9 @@ struct TerminalCreation: Equatable, Sendable {
     /// Nil for a cold record: a restore of a terminal that ended before the
     /// engine restart serves history without spawning a shell.
     let pid: Int32?
+    /// True when create adopted a stable id that was already live. Stale
+    /// callers must not compensate by releasing another window's terminal.
+    var existed: Bool = false
     /// True when the create resolved to an ended terminal (cold record).
     var exited: Bool = false
     let streamEpoch: String?

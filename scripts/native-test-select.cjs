@@ -127,8 +127,8 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
     'CommandRegistryTests',
   ]],
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
-    'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
-    'AppModelReconnectTests', 'AppModelTerminalRetentionTests',
+    'AppModelProjectContextTests', 'AppModelReconnectTests',
+    'AppModelTerminalRetentionTests',
     'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift', [

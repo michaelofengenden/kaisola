@@ -1393,7 +1393,12 @@ private struct QuietProjectGroup: View {
             if let branch = model.branch(for: record.id) { parts.append("⎇ \(branch)") }
             if let process = model.meta(for: record.id)?.processName { parts.append(process) }
         }
-        if !model.isOwned(record.id) { parts.append("observed") }
+        let ownership = TerminalOwnershipPresentation(
+            isLiveOwner: model.isOwned(record.id),
+            hasDurableOwnership: model.canClose(record.id),
+            directory: model.directory(for: record.id)
+        )
+        if ownership.isObserved { parts.append("observed") }
         // Adopted terminals name their provenance — a moved session must never
         // silently pass as native to the project showing it.
         if model.sessionAdoptions[record.id] != nil {

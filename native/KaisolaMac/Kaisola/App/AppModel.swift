@@ -119,7 +119,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    enum TerminalOwnershipRestorationPhase: Equatable {
+        case idle
+        case awaitingInventory(generation: Int)
+        case restoringController(generation: Int)
+        case settled(generation: Int)
+
+        func hasAuthoritativeInventory(for generation: Int) -> Bool {
+            switch self {
+            case let .restoringController(current), let .settled(current):
+                current == generation
+            case .idle, .awaitingInventory:
+                false
+            }
+        }
+
+        var isRestoring: Bool {
+            switch self {
+            case .awaitingInventory, .restoringController: true
+            case .idle, .settled: false
+            }
+        }
+    }
+
     @Published private(set) var connectionState: ConnectionState = .looking
+    @Published private(set) var terminalOwnershipRestorationPhase:
+        TerminalOwnershipRestorationPhase = .idle
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
     /// A new-window pop-out target that could not be resolved. Kept separate
@@ -165,6 +190,13 @@ final class AppModel: ObservableObject {
     /// and account binding are the user's call).
     @Published private(set) var pendingAgentResume: [String: String] = [:]
     private var resurrectionSweepInFlight = false
+    private struct DormantResurrectionEpoch: Equatable, Sendable {
+        let connectionGeneration: Int
+        let observerRouteLossSequence: Int
+        let resurrectionSequence: Int
+    }
+    private var dormantResurrectionSequence = 0
+    private var dormantResurrectionTask: Task<Void, Never>?
     /// Throttles the ownership self-heal (2026-08-07 phantom-owner incident:
     /// a refused attach used to be permanent until the user reloaded).
     private var lastAttachRetryAt: Date?
@@ -347,10 +379,28 @@ final class AppModel: ObservableObject {
     /// draft has been read but before any migration write is allowed. Nil in
     /// production; tests use it to place deletion on that exact boundary.
     private let beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)?
+    /// Deterministic test seam immediately before a lost observer route clears
+    /// its retained split documents. Production always passes nil.
+    private let beforeRouteSplitCleanup: (@Sendable () async -> Void)?
     private var selectedSession: BrokerTerminalRecord?
     private var activeBrokerIdentity: String?
     private var connectedBrokerFeatures: Set<String> = []
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectTaskToken: UUID?
+    private var reconnectDialInFlight = false
+    private var observerConnectionTask: Task<Bool, Never>?
+    private var observerConnectionToken: UUID?
+    private var observerConnectionGeneration: Int?
+    private var observerConnectionRouteLossSequence: Int?
+    private var observerRouteCleanupTask: Task<Void, Never>?
+    private var observerRouteCleanupToken: UUID?
+    private var controllerConnectionAttemptRouteSequence: Int?
+    private var controllerObserverRouteSequence: Int?
+    private var controllerRestorationTask: Task<Void, Never>?
+    private var controllerRestorationRouteSequence: Int?
+    private var controllerRestorationToken: UUID?
+    private var projectActivationGeneration = 0
+    private var projectObserverTransitionTask: Task<Void, Never>?
     private var cursorSaveTask: Task<Void, Never>?
     private var inventoryRefreshTask: Task<Void, Never>?
     private var consecutiveInventoryFailures = 0
@@ -437,11 +487,21 @@ final class AppModel: ObservableObject {
     /// operation cannot erase a card the user has already reopened.
     private var splitIntentTokens: [String: UUID] = [:]
     private var connectionGeneration = 0
+    /// `connectionGeneration` spans every automatic retry in one reload. A
+    /// route can still die while its controller restoration is suspended, so
+    /// this attempt-local fence prevents that older continuation from
+    /// publishing Connected over the disconnect state (or over a newer retry).
+    private var observerRouteLossSequence = 0
     /// Discards late subscription results after a faster subsequent tab click.
     private var terminalSelectionGeneration = 0
     private var shouldReconnect = false
     private var hasStarted = false
     private var restoredWorkspaceState = false
+    /// Bounded header and persistence metadata for terminal panes read from the
+    /// workspace archive. It keeps unknown panes round-trippable only until a
+    /// current inventory classifies them; transcripts and rendered state never
+    /// enter this map.
+    private var terminalPaneMetadataByID: [String: NativeRestorableSurfaceState] = [:]
     private var isRestoringWorkspaceState = false
     private var workspaceSaveTasks: [String: Task<Void, Never>] = [:]
     private var pendingNewTranscriptChatIDs: Set<String> = []
@@ -504,7 +564,8 @@ final class AppModel: ObservableObject {
         beforeRecentlyClosedChatMaterialization: (@Sendable (String) async -> Void)? = nil,
         afterWorkspaceRestorationRead: (@Sendable () async -> Void)? = nil,
         beforeRestoredChatMaterialization: (@Sendable (String) async -> Void)? = nil,
-        beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)? = nil
+        beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)? = nil,
+        beforeRouteSplitCleanup: (@Sendable () async -> Void)? = nil
     ) {
         // One in-process facade backs every seam a test double did not
         // replace, so a default window's preparer, observer, and controller
@@ -534,6 +595,7 @@ final class AppModel: ObservableObject {
         self.beforeRestoredChatMaterialization = beforeRestoredChatMaterialization
         self.beforeRecentlyClosedLegacyDraftMigration =
             beforeRecentlyClosedLegacyDraftMigration
+        self.beforeRouteSplitCleanup = beforeRouteSplitCleanup
         let transientTitleRepairs = Dictionary(uniqueKeysWithValues: sessionStore
             .sessions()
             .compactMap { stored -> (String, String)? in
@@ -566,6 +628,9 @@ final class AppModel: ObservableObject {
 
     deinit {
         transcriptPersistenceHealthTask?.cancel()
+        dormantResurrectionTask?.cancel()
+        observerRouteCleanupTask?.cancel()
+        projectObserverTransitionTask?.cancel()
     }
 
     /// Installed visual receipts assert this concrete no-launch route rather
@@ -973,6 +1038,17 @@ final class AppModel: ObservableObject {
         return unifiedSessionCards.contains(id, in: projectID)
     }
 
+    private func isActiveVisibleTerminal(_ id: String) -> Bool {
+        guard let selectedProjectID,
+              let record = sessions.first(where: { $0.id == id }),
+              displayProjectID(record) == selectedProjectID else { return false }
+        return unifiedSessionCards.contains(id, in: selectedProjectID)
+    }
+
+    private func isActiveVisibleSecondary(_ id: String) -> Bool {
+        id != selectedSessionID && isActiveVisibleTerminal(id)
+    }
+
     /// Window-aware notification routing asks each model before mutating it.
     /// Terminal inventories can be shared across windows, while chats and Mesh
     /// are window-local, so the delegate prefers a visible owner first.
@@ -1109,6 +1185,21 @@ final class AppModel: ObservableObject {
         sessions.first(where: { $0.id == id }).map { displayProjectID($0) }
             ?? chats.first(where: { $0.id == id })?.projectID
             ?? meshes.first(where: { $0.id == id })?.projectID
+            ?? restorableTerminalProjectID(for: id)
+    }
+
+    private func restorableTerminalProjectID(for id: String) -> String? {
+        guard let projectID = sessionAdoptions[id]
+                ?? terminalPaneMetadataByID[id]?.projectID
+                ?? persistedOwnedSessions.first(where: { $0.id == id })?.projectID else {
+            return nil
+        }
+        switch terminalPaneRestorationDisposition(id: id, projectID: projectID) {
+        case .durable, .awaitingInventory:
+            return projectID
+        case .live, .invalid:
+            return nil
+        }
     }
 
     /// The project a terminal is *shown* in: the adoption overlay's answer,
@@ -1148,6 +1239,7 @@ final class AppModel: ObservableObject {
             selectedProjectName = project.name
         }
         focusPane(terminalID, projectID: projectID)
+        beginProjectObserverTransition(focusID: terminalID)
         scheduleWorkspaceStateSave(projectID: previousDisplay)
         scheduleWorkspaceStateSave(projectID: projectID)
         let destination = projects.first(where: { $0.id == projectID })?.name ?? "that project"
@@ -1181,6 +1273,9 @@ final class AppModel: ObservableObject {
         } else if sessions.contains(where: { $0.id == id }) {
             selectedChatID = nil
             selectedMeshID = nil
+        } else if restorableTerminalProjectID(for: id) != nil {
+            selectedChatID = nil
+            selectedMeshID = nil
         }
     }
 
@@ -1194,7 +1289,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func focusSurface(_ id: String) async {
+    func focusSurface(_ id: String, reconcileObservers: Bool = true) async {
         if sessions.contains(where: { $0.id == id }) {
             await focusTerminalSurface(id)
             requestSurfaceKeyboardFocus(id)
@@ -1202,6 +1297,28 @@ final class AppModel: ObservableObject {
             selectChat(id)
         } else if meshes.contains(where: { $0.id == id }) {
             selectMesh(id)
+        } else if let projectID = restorableTerminalProjectID(for: id) {
+            if let project = projects.first(where: { $0.id == projectID }) {
+                selectedProjectID = project.id
+                selectedProjectName = project.name
+            }
+            selectedChatID = nil
+            selectedMeshID = nil
+            focusPane(id, projectID: projectID)
+            requestSurfaceKeyboardFocus(id)
+            let activationGeneration = reconcileObservers
+                ? reserveProjectObserverTransition()
+                : nil
+            await releaseTerminalPrimaryPreservingRestoredFocus()
+            if let activationGeneration,
+               activationGeneration == projectActivationGeneration,
+               selectedProjectID == projectID {
+                scheduleProjectObserverTransition(
+                    projectID: projectID,
+                    focusID: nil,
+                    activationGeneration: activationGeneration
+                )
+            }
         }
     }
 
@@ -1236,8 +1353,14 @@ final class AppModel: ObservableObject {
     /// Promote a visible secondary terminal without dropping the old primary
     /// from the live dock. The old primary is re-subscribed as a secondary only
     /// when its card is still present in the user's layout.
-    private func focusTerminalSurface(_ id: String) async {
+    private func focusTerminalSurface(
+        _ id: String,
+        expectedProjectActivationGeneration: Int? = nil
+    ) async {
+        if let expectedProjectActivationGeneration,
+           expectedProjectActivationGeneration != projectActivationGeneration { return }
         guard let record = sessions.first(where: { $0.id == id }) else { return }
+        let presentationProjectID = displayProjectID(record)
         // Primary and secondary observers share one owner-scoped broker slot.
         // Publish the primary-role epoch before any unsubscribe can suspend so
         // a stale split cleanup knows it must repair the winning primary.
@@ -1254,25 +1377,58 @@ final class AppModel: ObservableObject {
         // Also cancels an in-flight secondary subscribe, even before a split
         // document has arrived. Selection then installs the primary observer.
         await unsubscribeSplit(id)
-        await select(id)
+        if let expectedProjectActivationGeneration,
+           expectedProjectActivationGeneration != projectActivationGeneration { return }
+        await select(id, reconcileObservers: false)
+        if let expectedProjectActivationGeneration,
+           expectedProjectActivationGeneration != projectActivationGeneration { return }
         if let previousID,
            previousID != id,
-           previousProjectID == record.projectID,
-           paneLayouts[record.projectID]?.contains(previousID) == true,
+           previousProjectID == presentationProjectID,
+           paneLayouts[presentationProjectID]?.contains(previousID) == true,
            splitDocuments[previousID] == nil {
             await subscribeSplit(previousID)
         }
-        focusPane(id, projectID: record.projectID)
+        focusPane(id, projectID: presentationProjectID)
+        if expectedProjectActivationGeneration == nil {
+            beginProjectObserverTransition(focusID: nil)
+        }
+    }
+
+    @discardableResult
+    private func reserveProjectObserverTransition() -> Int {
+        projectActivationGeneration &+= 1
+        projectObserverTransitionTask?.cancel()
+        projectObserverTransitionTask = nil
+        return projectActivationGeneration
+    }
+
+    private func beginProjectObserverTransition(focusID: String?) {
+        let activationGeneration = reserveProjectObserverTransition()
+        scheduleProjectObserverTransition(
+            projectID: selectedProjectID,
+            focusID: focusID,
+            activationGeneration: activationGeneration
+        )
     }
 
     /// Switch the top-level workspace context by stable id, then restore a real
     /// surface inside it. A project click is therefore an action, not a label
     /// highlight that leaves another project's terminal visible underneath.
     func activateProject(id: String?) {
+        projectActivationGeneration &+= 1
+        let activationGeneration = projectActivationGeneration
+        projectObserverTransitionTask?.cancel()
+        projectObserverTransitionTask = nil
         guard let id, let project = projects.first(where: { $0.id == id }) else {
             selectedProjectID = nil
             selectedProjectName = nil
             Task { try? await workspaceStateStore.setSelectedProjectID(nil) }
+            scheduleProjectObserverTransition(
+                projectID: nil,
+                focusID: nil,
+                activationGeneration: activationGeneration
+            )
             return
         }
         selectedProjectID = project.id
@@ -1298,28 +1454,249 @@ final class AppModel: ObservableObject {
             visibleIDs.contains(selected)
                 && sessions.first(where: { $0.id == selected }).map { self.displayProjectID($0) } == project.id
         } ?? false
-        guard !selectedChatBelongsHere, !selectedMeshBelongsHere, !selectedTerminalBelongsHere else { return }
+        let focusID: String?
+        if selectedChatBelongsHere || selectedMeshBelongsHere || selectedTerminalBelongsHere {
+            focusID = nil
+        } else if let paneID = paneLayouts[project.id]?.sessionIDs.first,
+                  projectID(forSurface: paneID) == project.id {
+            focusID = paneID
+        } else if let terminal = project.sessions.first(where: { !$0.exited })
+                    ?? project.sessions.first {
+            focusID = terminal.id
+        } else if let chat = chats(in: project.id).first {
+            focusID = chat.id
+        } else if let mesh = meshes(in: project.id).first {
+            focusID = mesh.id
+        } else {
+            focusID = nil
+        }
+        let asynchronousFocusID: String?
+        if let focusID, chats.contains(where: { $0.id == focusID }) {
+            selectChat(focusID, reconcileObservers: false)
+            asynchronousFocusID = nil
+        } else if let focusID, meshes.contains(where: { $0.id == focusID }) {
+            selectMesh(focusID, reconcileObservers: false)
+            asynchronousFocusID = nil
+        } else {
+            asynchronousFocusID = focusID
+        }
+        scheduleProjectObserverTransition(
+            projectID: project.id,
+            focusID: asynchronousFocusID,
+            activationGeneration: activationGeneration
+        )
+    }
 
-        if let paneID = paneLayouts[project.id]?.sessionIDs.first,
-           projectID(forSurface: paneID) == project.id {
-            if chats.contains(where: { $0.id == paneID }) {
-                selectChat(paneID)
-            } else if meshes.contains(where: { $0.id == paneID }) {
-                selectMesh(paneID)
-            } else {
-                Task { await focusSurface(paneID) }
+    private func scheduleProjectObserverTransition(
+        projectID: String?,
+        focusID: String?,
+        activationGeneration: Int
+    ) {
+        let targetTerminalIDs = Set((projectID.flatMap { paneLayouts[$0]?.sessionIDs } ?? [])
+            .filter { id in sessions.contains(where: { $0.id == id }) })
+        let affectedTerminalIDs = Set(splitDocuments.keys)
+            .union(pendingSplitSubscriptions.keys)
+            .union(targetTerminalIDs)
+        for terminalID in affectedTerminalIDs {
+            splitIntentTokens[terminalID] = UUID()
+        }
+        let observerGeneration = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
+        projectObserverTransitionTask = Task { [weak self] in
+            guard let self,
+                  activationGeneration == self.projectActivationGeneration,
+                  self.selectedProjectID == projectID else { return }
+            let obsoleteTerminalIDs = Set(self.splitDocuments.keys)
+                .union(self.pendingSplitSubscriptions.keys)
+                .subtracting(targetTerminalIDs)
+            let cleanupTasks = obsoleteTerminalIDs.map { terminalID in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          activationGeneration == self.projectActivationGeneration else { return }
+                    await self.unsubscribeSplit(terminalID)
+                }
+            }
+
+            await self.focusProjectActivationTarget(
+                focusID,
+                projectID: projectID,
+                activationGeneration: activationGeneration
+            )
+            guard activationGeneration == self.projectActivationGeneration,
+                  self.selectedProjectID == projectID else { return }
+            if self.observerRouteIsCurrent(
+                generation: observerGeneration,
+                routeLossSequence: routeLossSequence
+            ), self.connectionState.isConnected {
+                await self.restoreVisibleSecondarySubscriptions(
+                    expectedConnectionGeneration: observerGeneration,
+                    expectedRouteLossSequence: routeLossSequence,
+                    expectedProjectActivationGeneration: activationGeneration
+                )
+            }
+            for task in cleanupTasks { await task.value }
+        }
+    }
+
+    private func focusProjectActivationTarget(
+        _ focusID: String?,
+        projectID: String?,
+        activationGeneration: Int
+    ) async {
+        guard activationGeneration == projectActivationGeneration,
+              selectedProjectID == projectID else { return }
+        guard let focusID else {
+            let preservedChatID = selectedChatID
+            let preservedMeshID = selectedMeshID
+            if projectID == nil
+                || !currentSelectedSurfaceBelongsToActiveProject()
+                || ((preservedChatID != nil || preservedMeshID != nil)
+                    && selectedSessionID != nil) {
+                await releaseTerminalPrimaryPreservingRestoredFocus()
+                guard activationGeneration == projectActivationGeneration,
+                      selectedProjectID == projectID else { return }
+                if let preservedChatID,
+                   chats.first(where: { $0.id == preservedChatID })?.projectID == projectID {
+                    selectChat(preservedChatID, reconcileObservers: false)
+                } else if let preservedMeshID,
+                          meshes.first(where: { $0.id == preservedMeshID })?.projectID == projectID {
+                    selectMesh(preservedMeshID, reconcileObservers: false)
+                }
             }
             return
         }
+        if sessions.contains(where: { $0.id == focusID }) {
+            await focusTerminalSurface(
+                focusID,
+                expectedProjectActivationGeneration: activationGeneration
+            )
+            return
+        }
+        if selectedSessionID != nil {
+            await releaseTerminalPrimaryPreservingRestoredFocus()
+        }
+        guard activationGeneration == projectActivationGeneration,
+              selectedProjectID == projectID else { return }
+        if chats.contains(where: { $0.id == focusID }) {
+            selectChat(focusID, reconcileObservers: false)
+        } else if meshes.contains(where: { $0.id == focusID }) {
+            selectMesh(focusID, reconcileObservers: false)
+        } else if restorableTerminalProjectID(for: focusID) == projectID {
+            await focusSurface(focusID, reconcileObservers: false)
+        }
+    }
 
-        if let terminal = project.sessions.first(where: { !$0.exited }) ?? project.sessions.first {
-            Task { await select(terminal.id) }
-        } else if let chat = chats(in: project.id).first {
-            selectChat(chat.id)
-        } else if let mesh = meshes(in: project.id).first {
-            selectMesh(mesh.id)
-        } else {
-            Task { await select(nil) }
+    private func currentSelectedSurfaceBelongsToActiveProject() -> Bool {
+        guard let selectedProjectID else { return false }
+        if let selectedChatID {
+            return chats.first(where: { $0.id == selectedChatID })?.projectID == selectedProjectID
+        }
+        if let selectedMeshID {
+            return meshes.first(where: { $0.id == selectedMeshID })?.projectID == selectedProjectID
+        }
+        if let selectedSessionID,
+           let record = sessions.first(where: { $0.id == selectedSessionID }) {
+            return displayProjectID(record) == selectedProjectID
+        }
+        if let focusedPaneID,
+           restorableTerminalProjectID(for: focusedPaneID) == selectedProjectID {
+            return true
+        }
+        return false
+    }
+
+    private enum TerminalPaneRestorationDisposition {
+        case live(BrokerTerminalRecord)
+        case durable(NativeOwnedSession)
+        case awaitingInventory(NativeRestorableSurfaceState)
+        case invalid
+    }
+
+    private func durableTerminalPaneCandidate(
+        id: String,
+        projectID: String
+    ) -> NativeOwnedSession? {
+        guard !sessionStore.isProjectClosed(projectID),
+              let stored = persistedOwnedSessions.first(where: { $0.id == id }),
+              (sessionAdoptions[id] ?? stored.projectID) == projectID,
+              stored.endedAt == nil,
+              !sessionStore.isTerminalTombstoned(id) else { return nil }
+        return stored
+    }
+
+    private func terminalPaneRestorationDisposition(
+        id: String,
+        projectID: String
+    ) -> TerminalPaneRestorationDisposition {
+        if let record = sessions.first(where: {
+            $0.id == id
+                && displayProjectID($0) == projectID
+                && !sessionStore.isTerminalTombstoned($0.id)
+        }) {
+            return .live(record)
+        }
+        if let stored = durableTerminalPaneCandidate(id: id, projectID: projectID) {
+            return .durable(stored)
+        }
+        guard !terminalOwnershipRestorationPhase.hasAuthoritativeInventory(
+            for: connectionGeneration
+        ),
+              !sessionStore.isProjectClosed(projectID),
+              !sessionStore.isTerminalTombstoned(id),
+              persistedOwnedSessions.first(where: { $0.id == id })?.endedAt == nil,
+              let archived = terminalPaneMetadataByID[id],
+              archived.kind == .terminal,
+              archived.projectID == projectID else {
+            return .invalid
+        }
+        return .awaitingInventory(archived)
+    }
+
+    func missingTerminalPaneContext(
+        for id: String,
+        projectID: String
+    ) -> MissingTerminalPaneContext {
+        let contextState: (String, String, Bool) -> MissingTerminalPaneContext = {
+            title, symbol, canClose in
+            let state: MissingTerminalPaneContext.State
+            switch self.terminalOwnershipRestorationPhase {
+            case let .awaitingInventory(generation)
+                where generation == self.connectionGeneration:
+                state = .awaitingInventory
+            case let .restoringController(generation)
+                where generation == self.connectionGeneration:
+                state = .restoringController
+            case .idle, .awaitingInventory, .restoringController, .settled:
+                state = .settledDurable
+            }
+            return MissingTerminalPaneContext(
+                state: state,
+                title: title,
+                symbol: symbol,
+                canClose: canClose
+            )
+        }
+        let symbol: (String?) -> String = { agentID in
+            agentID.flatMap { AgentRegistry.profile(id: $0)?.symbol } ?? "terminal"
+        }
+
+        switch terminalPaneRestorationDisposition(id: id, projectID: projectID) {
+        case let .durable(stored):
+            return contextState(stored.title, symbol(stored.agentID), true)
+        case let .awaitingInventory(archived):
+            return MissingTerminalPaneContext(
+                state: .awaitingInventory,
+                title: archived.title ?? "Terminal",
+                symbol: symbol(archived.agentID),
+                canClose: false
+            )
+        case .live, .invalid:
+            return MissingTerminalPaneContext(
+                state: .invalid,
+                title: "Terminal",
+                symbol: "terminal",
+                canClose: false
+            )
         }
     }
 
@@ -1333,19 +1710,26 @@ final class AppModel: ObservableObject {
         for projectID: String,
         persist: Bool
     ) -> Bool {
-        // Dormant terminals stay: their PTYs died with an earlier run, but
-        // the panes are resurrection targets, not garbage.
-        let available = Set(
-            sessions.lazy.filter { self.displayProjectID($0) == projectID }.map(\.id)
-        ).union(chats(in: projectID).map(\.id))
+        let restorableTerminalIDs = (paneLayouts[projectID]?.sessionIDs ?? []).filter { id in
+            switch terminalPaneRestorationDisposition(id: id, projectID: projectID) {
+            case .live, .durable, .awaitingInventory: true
+            case .invalid: false
+            }
+        }
+        let available = Set(restorableTerminalIDs)
+            .union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
-            .union(dormantTerminalIDs(in: projectID))
-        guard unifiedSessionCards.reconcile(
+        let changed = unifiedSessionCards.reconcile(
             projectID,
             availableSurfaceIDs: available
-        ) else { return false }
-        if persist { scheduleWorkspaceStateSave(projectID: projectID) }
-        return true
+        )
+        let retainedIDs = Set(paneLayouts[projectID]?.sessionIDs ?? [])
+        let discardedMetadataIDs = terminalPaneMetadataByID.compactMap { id, metadata in
+            metadata.projectID == projectID && !retainedIDs.contains(id) ? id : nil
+        }
+        for id in discardedMetadataIDs { terminalPaneMetadataByID.removeValue(forKey: id) }
+        if changed, persist { scheduleWorkspaceStateSave(projectID: projectID) }
+        return changed
     }
 
     private func reconcileAllPaneLayoutsWithAvailableSurfaces() {
@@ -2210,6 +2594,7 @@ final class AppModel: ObservableObject {
             scheduleWorkspaceStateSave(projectID: project.id)
         }
         objectWillChange.send()
+        beginProjectObserverTransition(focusID: nil)
     }
 
     func renameProject(id: String, to name: String) {
@@ -2224,6 +2609,7 @@ final class AppModel: ObservableObject {
     /// Close a project tab. Its live sessions keep running on the broker; this
     /// just removes the tab from the persisted list.
     func closeProject(id: String) {
+        let wasSelected = selectedProjectID == id
         deferredFileWorkspaceStates[id] = workspaceSnapshot(projectID: id)
             .flatMap(fileOnlyWorkspaceState(from:))
         fileTabsByProject[id] = nil
@@ -2245,11 +2631,16 @@ final class AppModel: ObservableObject {
             selectedProjectName = fallback?.name
         }
         objectWillChange.send()
+        if wasSelected {
+            beginProjectObserverTransition(focusID: nil)
+        }
     }
 
     /// Restore the most recently closed project tab (⌘⇧T) and select it.
     func reopenLastClosedProject() {
+        var restoredProject = false
         if let restored = sessionStore.reopenLastClosedProject() {
+            restoredProject = true
             refreshPersistedNavigationState(publish: false)
             selectedProjectID = restored.id
             selectedProjectName = restored.name
@@ -2260,6 +2651,9 @@ final class AppModel: ObservableObject {
             }
         }
         objectWillChange.send()
+        if restoredProject {
+            beginProjectObserverTransition(focusID: nil)
+        }
     }
 
     var hasClosedProjects: Bool { !sessionStore.closedProjects().isEmpty }
@@ -2349,8 +2743,8 @@ final class AppModel: ObservableObject {
         var seen = Set<String>()
 
         for terminalID in layout.sessionIDs {
-            if let terminal = sessions.first(where: { $0.id == terminalID }),
-               displayProjectID(terminal) == projectID {
+            switch terminalPaneRestorationDisposition(id: terminalID, projectID: projectID) {
+            case let .live(terminal):
                 guard seen.insert(terminalID).inserted else { continue }
                 panes.append(NativeRestorablePaneState(
                     id: terminalID,
@@ -2358,15 +2752,11 @@ final class AppModel: ObservableObject {
                         kind: .terminal,
                         id: terminalID,
                         projectID: projectID,
+                        agentID: agentProfile(for: terminalID)?.id,
                         title: sessionTitle(for: terminal)
                     )
                 ))
-            } else if dormantTerminalIDs.contains(terminalID),
-                      let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }),
-                      stored.projectID == projectID {
-                // A dormant terminal is not in live inventory, but its pane is
-                // a resurrection target — dropping it here is how panes used
-                // to be erased forever on the first save after a reboot.
+            case let .durable(stored):
                 guard seen.insert(terminalID).inserted else { continue }
                 panes.append(NativeRestorablePaneState(
                     id: terminalID,
@@ -2374,9 +2764,19 @@ final class AppModel: ObservableObject {
                         kind: .terminal,
                         id: terminalID,
                         projectID: projectID,
+                        agentID: stored.agentID,
+                        accountBinding: stored.accountBinding,
                         title: stored.title
                     )
                 ))
+            case let .awaitingInventory(archived):
+                guard seen.insert(terminalID).inserted else { continue }
+                panes.append(NativeRestorablePaneState(
+                    id: terminalID,
+                    surface: archived
+                ))
+            case .invalid:
+                continue
             }
         }
 
@@ -2446,14 +2846,27 @@ final class AppModel: ObservableObject {
             guard let root = projects.first(where: { $0.id == projectID })?.directory else { return nil }
             return Self.relativePath(for: URL(fileURLWithPath: selected), workspace: root)
         }
-        guard !panes.isEmpty || !layout.isEmpty || !restorableFileTabs.isEmpty else { return nil }
+        var restorableLayout = layout
+        // A brand-new chat enters the layout synchronously, before its SQLite
+        // incarnation fence completes. Preserve that provisional layout intent
+        // exactly as before; the scheduled save after `beginNewChatID` writes
+        // its descriptor. Every classified-invalid terminal is still removed.
+        let provisionalChatIDs = pendingNewTranscriptChatIDs.intersection(
+            Set(layout.sessionIDs)
+        )
+        let visiblePaneIDs = Set(panes.lazy.filter { !$0.isMinimized }.map(\.id))
+            .union(provisionalChatIDs)
+        restorableLayout.normalize(availableSessionIDs: visiblePaneIDs)
+        guard !panes.isEmpty || !restorableLayout.isEmpty || !restorableFileTabs.isEmpty else {
+            return nil
+        }
         let focused = focusedPaneID.flatMap { id in
             panes.contains(where: { $0.id == id && !$0.isMinimized }) ? id : nil
         }
         return NativeProjectWorkspaceState(
             projectID: projectID,
-            layout: layout,
-            arrangement: layout.columns.count > 1 ? .grid : .rows,
+            layout: restorableLayout,
+            arrangement: restorableLayout.columns.count > 1 ? .grid : .rows,
             panes: panes,
             focusedPaneID: focused,
             fileTabs: restorableFileTabs,
@@ -3148,6 +3561,18 @@ final class AppModel: ObservableObject {
         let restorableProjects = restoration.projects.filter {
             !sessionStore.isProjectClosed($0.projectID)
         }
+        terminalPaneMetadataByID.removeAll(keepingCapacity: true)
+        for projectState in restorableProjects {
+            let visiblePaneIDs = Set(projectState.layout.sessionIDs)
+            for pane in projectState.panes
+            where !pane.isRecentlyClosed
+                && !pane.isMinimized
+                && pane.surface.kind == .terminal
+                && pane.surface.projectID == projectState.projectID
+                && visiblePaneIDs.contains(pane.id) {
+                terminalPaneMetadataByID[pane.id] = pane.surface
+            }
+        }
         // A crash can land after the transcript tombstone but before the
         // workspace descriptor is removed. Prune every descriptor while its
         // tombstone still proves deletion intent; reclaiming tombstones first
@@ -3627,7 +4052,9 @@ final class AppModel: ObservableObject {
                 // later resurrection revives the same pane instead of the next
                 // state save erasing it forever.
                 let available = Set(
-                    sessions.lazy.filter { $0.projectID == projectState.projectID }.map(\.id)
+                    sessions.lazy.filter {
+                        self.displayProjectID($0) == projectState.projectID
+                    }.map(\.id)
                 ).union(chats(in: projectState.projectID).map(\.id))
                     .union(meshes(in: projectState.projectID).map(\.id))
                     .union(dormantTerminalIDs(in: projectState.projectID))
@@ -3903,6 +4330,7 @@ final class AppModel: ObservableObject {
         focusPane(chatID, projectID: project.id)
         focusSurfaceFields(chatID)
         scheduleWorkspaceStateSave(projectID: project.id)
+        beginProjectObserverTransition(focusID: nil)
         return chatID
     }
 
@@ -4781,7 +5209,7 @@ final class AppModel: ObservableObject {
         ToastCenter.shared.show("Switched to \(profile.name). Fresh provider session; the transcript stays.", style: .success)
     }
 
-    func selectChat(_ chatID: String?) {
+    func selectChat(_ chatID: String?, reconcileObservers: Bool = true) {
         selectedChatID = chatID
         if let chatID {
             missingSessionRecovery = nil
@@ -4794,6 +5222,9 @@ final class AppModel: ObservableObject {
             selectedMeshID = nil
             attentionCenter.clear(targetID: chatID)
             requestSurfaceKeyboardFocus(chatID)
+            if reconcileObservers {
+                beginProjectObserverTransition(focusID: nil)
+            }
         }
     }
 
@@ -4999,7 +5430,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func selectMesh(_ meshID: String?) {
+    func selectMesh(_ meshID: String?, reconcileObservers: Bool = true) {
         selectedMeshID = meshID
         if let meshID {
             missingSessionRecovery = nil
@@ -5011,6 +5442,9 @@ final class AppModel: ObservableObject {
             }
             selectedChatID = nil
             requestSurfaceKeyboardFocus(meshID)
+            if reconcileObservers {
+                beginProjectObserverTransition(focusID: nil)
+            }
         }
     }
 
@@ -5860,27 +6294,66 @@ final class AppModel: ObservableObject {
         flushPendingTerminalOutputs()
         hasStarted = true
         shouldReconnect = true
+        invalidateDormantResurrection()
+        projectActivationGeneration &+= 1
+        projectObserverTransitionTask?.cancel()
+        projectObserverTransitionTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
-        await persistCurrentCursor()
-        await clearSplits()
+        reconnectTaskToken = nil
+        reconnectDialInFlight = false
+        observerRouteCleanupTask?.cancel()
+        observerRouteCleanupTask = nil
+        observerRouteCleanupToken = nil
         connectionGeneration &+= 1
+        observerRouteLossSequence &+= 1
+        terminalSelectionGeneration &+= 1
         let generation = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
+        let previousObserverTask = observerConnectionTask
+        let previousObserverToken = observerConnectionToken
+        let previousControllerTask = controllerRestorationTask
+        let previousControllerToken = controllerRestorationToken
+        await client.setDisconnectHandler(nil)
+        _ = await previousObserverTask?.value
+        if observerConnectionToken == previousObserverToken {
+            observerConnectionTask = nil
+            observerConnectionToken = nil
+            observerConnectionGeneration = nil
+            observerConnectionRouteLossSequence = nil
+        }
+        await client.setEventHandler(nil)
+        await previousControllerTask?.value
+        if controllerRestorationToken == previousControllerToken {
+            controllerRestorationTask = nil
+            controllerRestorationRouteSequence = nil
+            controllerRestorationToken = nil
+        }
+        await disconnectCurrentController()
+        await persistCurrentCursor()
+        await clearSplits(
+            expectedConnectionGeneration: generation,
+            expectedRouteLossSequence: routeLossSequence
+        )
+        terminalOwnershipRestorationPhase = .awaitingInventory(generation: generation)
         connectionState = .looking
         connectedBrokerFeatures = []
         await client.disconnect()
         selectedSession = nil
 
-        let connected = await connect(generation: generation, reconnectAttempt: nil)
         await restoreWorkspaceStateIfNeeded()
+        let connected = await connect(
+            generation: generation,
+            routeLossSequence: routeLossSequence,
+            reconnectAttempt: nil
+        )
         await restoreTerminalDraftTrackers()
-        if connected {
-            await restoreVisibleSecondarySubscriptions(
-                expectedConnectionGeneration: generation
-            )
-        }
         if !connected {
-            scheduleReconnect(attempt: 0, generation: generation)
+            scheduleReconnect(
+                attempt: 0,
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            )
         }
     }
 
@@ -5890,9 +6363,16 @@ final class AppModel: ObservableObject {
         guard hasStarted,
               shouldReconnect,
               case .unavailable = connectionState else { return }
+        if reconnectDialInFlight { return }
         reconnectTask?.cancel()
         reconnectTask = nil
-        scheduleReconnect(attempt: 0, generation: connectionGeneration, immediate: true)
+        reconnectTaskToken = nil
+        scheduleReconnect(
+            attempt: 0,
+            generation: connectionGeneration,
+            routeLossSequence: observerRouteLossSequence,
+            immediate: true
+        )
     }
 
     /// Sleep can invalidate a Unix socket without promptly waking a blocked
@@ -5951,7 +6431,7 @@ final class AppModel: ObservableObject {
         missingSessionRecovery = nil
     }
 
-    func select(_ id: String?) async {
+    func select(_ id: String?, reconcileObservers: Bool = true) async {
         // Preserve every byte that arrived before this interaction boundary;
         // the document below is the snapshot persisted and retained on leave.
         flushPendingTerminalOutputs()
@@ -5962,12 +6442,17 @@ final class AppModel: ObservableObject {
         // `terminalDocument`; copying every packet into the retained deck
         // causes needless whole-shell invalidations.
         let previousSession = selectedSession
+        let previousProjectID = selectedProjectID
         let previousDocument = terminalDocument
         if let currentSessionID = previousDocument.sessionID {
             terminalSurfaceDocuments[currentSessionID] = previousDocument
         }
 
         let next = id.flatMap { requested in sessions.first(where: { $0.id == requested }) }
+        let shouldReconcileObservers = reconcileObservers
+            && next != nil
+            && (previousSession?.id != next?.id
+                || previousProjectID != next.map { self.displayProjectID($0) })
         if let next {
             // Direct selection paths (restore, project activation, commands)
             // are primary-role intents too, not only split-card promotion.
@@ -5980,17 +6465,18 @@ final class AppModel: ObservableObject {
         // reappear whenever a chat/Mesh/CLI tab was selected.
         if let next {
             missingSessionRecovery = nil
+            let presentationProjectID = displayProjectID(next)
             let retainedDocument = terminalSurfaceDocuments[next.id]
                 ?? (previousDocument.sessionID == next.id
                     ? previousDocument
                     : .loading(sessionID: next.id))
             selectedSession = next
             selectedSessionID = next.id
-            if let project = projects.first(where: { $0.id == next.projectID }) {
+            if let project = projects.first(where: { $0.id == presentationProjectID }) {
                 selectedProjectID = project.id
                 selectedProjectName = project.name
             }
-            focusPane(next.id, projectID: next.projectID)
+            focusPane(next.id, projectID: presentationProjectID)
             selectedChatID = nil
             selectedMeshID = nil
             browserCardURL = nil
@@ -6029,6 +6515,9 @@ final class AppModel: ObservableObject {
         let retainedDocument = terminalSurfaceDocuments[next.id]
             ?? .loading(sessionID: next.id)
         guard connectionState.isConnected else {
+            if shouldReconcileObservers {
+                beginProjectObserverTransition(focusID: nil)
+            }
             return
         }
 
@@ -6065,6 +6554,9 @@ final class AppModel: ObservableObject {
         } catch {
             guard selectionGeneration == terminalSelectionGeneration else { return }
             publishPrimaryDocument(.failure(sessionID: next.id, message: error.kaisolaSafeDescription))
+        }
+        if shouldReconcileObservers {
+            beginProjectObserverTransition(focusID: nil)
         }
     }
 
@@ -6391,11 +6883,18 @@ final class AppModel: ObservableObject {
         titleOverride: String? = nil,
         draftRestoreSeed: TerminalDraftResumeSeed? = nil,
         terminalIDOverride: String? = nil,
+        projectIDOverride: String? = nil,
         restore: Bool = false,
         select: Bool = true,
-        environmentBinding: SessionAccountBinding? = nil
+        environmentBinding: SessionAccountBinding? = nil,
+        restorationEpoch: DormantResurrectionEpoch? = nil
     ) async -> TerminalLaunchResult {
-        guard controlAvailable, connectionState.isConnected else {
+        let controllerRestoreCanCreate = restore
+            && terminalOwnershipRestorationPhase.hasAuthoritativeInventory(
+                for: connectionGeneration
+            )
+        guard controlAvailable,
+              connectionState.isConnected || controllerRestoreCanCreate else {
             // Never fail silently: say WHY sessions can't be created here.
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
@@ -6404,7 +6903,8 @@ final class AppModel: ObservableObject {
             return .failed(Self.terminalCreationUnavailableMessage)
         }
         let cwd = directory.path
-        let projectID = NativeSessionStore.projectID(forDirectory: cwd)
+        let projectID = projectIDOverride
+            ?? NativeSessionStore.projectID(forDirectory: cwd)
         let terminalID = terminalIDOverride
             ?? NativeSessionStore.terminalID(projectID: projectID)
         let userShell = NativeTerminalLaunchEnvironment.resolvedShell(
@@ -6521,6 +7021,27 @@ final class AppModel: ObservableObject {
                 rows: 30,
                 restore: restore
             )
+            let restorationIsStale = restorationEpoch.map {
+                !dormantResurrectionIsCurrent($0) || Task.isCancelled
+            } ?? false
+            let closedWhileCreating = sessionStore.isTerminalTombstoned(
+                creation.terminalID
+            ) || sessionStore.isProjectClosed(projectID)
+            if restorationIsStale || closedWhileCreating {
+                // A completed create after final teardown has no later route
+                // that can adopt its stable id. Best-effort release prevents
+                // an untracked PTY; reload races leave it for the winning route
+                // to discover and adopt instead of destroying that route's id.
+                // A create that adopted an already-live id belongs to another
+                // window and must never be used as compensation.
+                if !creation.existed && (closedWhileCreating || !shouldReconnect) {
+                    try? await controlClient.release(
+                        projectID: creation.projectID,
+                        terminalID: creation.terminalID
+                    )
+                }
+                return .failed(Self.terminalObserverFallbackMessage)
+            }
             let folder = (cwd as NSString).lastPathComponent
             let requestedTitle = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
             let sessionTitle = requestedTitle.flatMap { $0.isEmpty ? nil : $0 }
@@ -6586,6 +7107,10 @@ final class AppModel: ObservableObject {
             Task { [weak self] in await self?.refreshInventory() }
             return .launched(terminalID)
         } catch {
+            if let restorationEpoch,
+               (!dormantResurrectionIsCurrent(restorationEpoch) || Task.isCancelled) {
+                return .failed(Self.terminalObserverFallbackMessage)
+            }
             let message = error.kaisolaSafeDescription
             publishPrimaryDocument(.failure(sessionID: terminalID, message: message))
             return .failed(message)
@@ -6883,6 +7408,7 @@ final class AppModel: ObservableObject {
             return
         }
         let recoveryGeneration = connectionGeneration
+        let recoveryRouteLossSequence = observerRouteLossSequence
         terminalInputRecoveringIDs.insert(terminalID)
         defer { terminalInputRecoveringIDs.remove(terminalID) }
         do {
@@ -6894,6 +7420,7 @@ final class AppModel: ObservableObject {
                 terminalID: terminalID
             )
             guard recoveryGeneration == connectionGeneration,
+                  recoveryRouteLossSequence == observerRouteLossSequence,
                   controlAvailable,
                   isOwned(terminalID),
                   sessions.contains(where: { $0.id == terminalID && !$0.exited }) else {
@@ -6903,14 +7430,20 @@ final class AppModel: ObservableObject {
             terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
             ToastCenter.shared.show("Terminal input restored.", style: .success)
         } catch {
-            guard recoveryGeneration == connectionGeneration, controlAvailable else { return }
+            guard recoveryGeneration == connectionGeneration,
+                  recoveryRouteLossSequence == observerRouteLossSequence,
+                  controlAvailable else { return }
             if Self.isControllerConnectionFailure(error) {
                 reportTerminalInputFailure(terminalID)
                 controlAvailable = false
                 ownedTerminalIDs = []
                 terminalInputDegradedIDs.removeAll()
                 terminalInputRecoveringIDs.removeAll()
-                connectionLost(error, generation: recoveryGeneration)
+                connectionLost(
+                    error,
+                    generation: recoveryGeneration,
+                    routeLossSequence: recoveryRouteLossSequence
+                )
             } else {
                 terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
                 reportTerminalInputFailure(terminalID, scopedToTerminal: true)
@@ -6940,6 +7473,7 @@ final class AppModel: ObservableObject {
             terminalInputQueues[terminalID] = queue
             guard packet.generation == generation else { continue }
             let writeGeneration = connectionGeneration
+            let writeRouteLossSequence = observerRouteLossSequence
             do {
                 try await controlClient.write(
                     projectID: packet.projectID,
@@ -6974,6 +7508,7 @@ final class AppModel: ObservableObject {
                 }
                 guard !Task.isCancelled,
                       writeGeneration == connectionGeneration,
+                      writeRouteLossSequence == observerRouteLossSequence,
                       controlAvailable else { return }
                 if Self.isControllerConnectionFailure(error) {
                     reportTerminalInputFailure(terminalID)
@@ -6982,7 +7517,11 @@ final class AppModel: ObservableObject {
                     ownedTerminalIDs = []
                     terminalInputDegradedIDs.removeAll()
                     terminalInputRecoveringIDs.removeAll()
-                    connectionLost(error, generation: writeGeneration)
+                    connectionLost(
+                        error,
+                        generation: writeGeneration,
+                        routeLossSequence: writeRouteLossSequence
+                    )
                 } else {
                     // Never retry an ambiguous terminal.write. Request IDs are
                     // correlation-only, so a timeout may mean the bytes were
@@ -7462,6 +8001,8 @@ final class AppModel: ObservableObject {
             recordUndo: recordUndo,
             brokerGenerationID: brokerGenerationID
         )
+        adoptionStore.clear(terminalID: terminalID)
+        sessionAdoptions.removeValue(forKey: terminalID)
         refreshPersistedNavigationState(publish: false)
         dormantTerminalIDs.remove(terminalID)
         terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
@@ -7520,7 +8061,9 @@ final class AppModel: ObservableObject {
     /// pane open only in its own project's layout.
     private func dormantTerminalIDs(in projectID: String) -> Set<String> {
         let byID = Dictionary(
-            persistedOwnedSessions.map { ($0.id, $0.projectID) },
+            persistedOwnedSessions.map {
+                ($0.id, sessionAdoptions[$0.id] ?? $0.projectID)
+            },
             uniquingKeysWith: { first, _ in first }
         )
         return dormantTerminalIDs.filter { byID[$0] == projectID }
@@ -7528,9 +8071,12 @@ final class AppModel: ObservableObject {
 
     /// Owed broker releases, drained after every close and every connect.
     /// Idempotent: an absent terminal acknowledges the release too.
-    func drainPendingReleases() async {
-        guard controlAvailable else { return }
-        for pending in sessionStore.pendingReleaseList() {
+    @discardableResult
+    func drainPendingReleases() async -> Bool {
+        guard controlAvailable else { return false }
+        let pendingReleases = sessionStore.pendingReleaseList()
+        guard !pendingReleases.isEmpty else { return false }
+        for pending in pendingReleases {
             do {
                 // The broker acknowledges release idempotently — an absent
                 // terminal succeeds — so success is the ONLY ack. An error
@@ -7552,6 +8098,7 @@ final class AppModel: ObservableObject {
             }
         }
         await refreshInventory()
+        return true
     }
 
     /// Compatibility shim for existing async call sites; the commit itself is
@@ -7583,7 +8130,7 @@ final class AppModel: ObservableObject {
             && connectionState.isConnected
             && !reopeningTerminalIDs.contains(terminalID)
             && sessions.contains(where: { $0.id == terminalID && $0.exited })
-            && isOwned(terminalID)
+            && sessionStore.owns(terminalID: terminalID)
             && persistedOwnedSessions.contains(where: { $0.id == terminalID })
     }
 
@@ -7596,7 +8143,9 @@ final class AppModel: ObservableObject {
               let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else {
             return
         }
-        let originalLayout = paneLayouts[record.projectID]
+        let presentationProjectID = displayProjectID(record)
+        let originalLayout = paneLayouts[presentationProjectID]
+        let wasPrimary = selectedSessionID == terminalID
         reopeningTerminalIDs.insert(terminalID)
         defer { reopeningTerminalIDs.remove(terminalID) }
 
@@ -7607,33 +8156,95 @@ final class AppModel: ObservableObject {
             accountBinding: stored.accountBinding,
             sourceTerminalID: terminalID
         )
-        guard let createdID = await recreateSession(from: closed) else { return }
+        guard let createdID = await recreateSession(from: closed, select: false),
+              let createdRecord = sessions.first(where: { $0.id == createdID }) else { return }
+        guard transferTerminalPresentation(
+            from: terminalID,
+            to: createdRecord,
+            presentationProjectID: presentationProjectID
+        ) else {
+            ToastCenter.shared.show(
+                "The terminal reopened, but its workspace placement could not be restored.",
+                style: .error
+            )
+            await focusTerminalSurface(createdID)
+            return
+        }
         // The create suspended; another window may have closed the old id
         // (tombstoned it) meanwhile. Its close already reconciled the layout,
         // so swap against the CURRENT layout, never the pre-await snapshot —
         // overwriting with the stale copy was a lost-update.
         if sessionStore.isTerminalTombstoned(terminalID) {
-            unifiedSessionCards.focusPresentation(on: createdID)
-            scheduleWorkspaceStateSave(projectID: record.projectID)
+            await focusTerminalSurface(createdID)
+            scheduleWorkspaceStateSave(projectID: presentationProjectID)
             return
         }
-        if unifiedSessionCards.replace(
+        let replaced = unifiedSessionCards.replace(
             terminalID,
             with: createdID,
-            in: record.projectID,
+            in: presentationProjectID,
             fallback: originalLayout
-        ) {
-            scheduleWorkspaceStateSave(projectID: record.projectID)
+        )
+        guard replaced else {
+            retireReopenedTerminal(terminalID)
+            await focusTerminalSurface(createdID)
+            return
         }
-        // The replacement owns the pane now; the old record must not linger
-        // as a permanent resurrection candidate (§4b). Runs after the layout
-        // swap so the reconcile inside commitClose sees the new id, not a
-        // hole. No undo entry: the user asked for a replacement, not a close.
+        // The replacement owns the pane now. Retire the old durable identity
+        // before any observer operation can suspend, so a slow subscribe cannot
+        // leave two saved identities for one explicit reopen action.
+        retireReopenedTerminal(terminalID)
+        if wasPrimary {
+            await focusTerminalSurface(createdID)
+        } else {
+            await subscribeSplit(createdID)
+            focusPane(createdID, projectID: presentationProjectID)
+        }
+        scheduleWorkspaceStateSave(projectID: presentationProjectID)
+    }
+
+    private func retireReopenedTerminal(_ terminalID: String) {
+        // Avoid commitClose's asynchronous nil-selection cleanup racing the
+        // replacement focus. This synchronous clear also fences stale primary
+        // subscription continuations before ownership is retired.
+        if selectedSessionID == terminalID {
+            clearTerminalPrimaryPreservingRestoredFocus()
+        }
+        // No undo entry: the user asked for a replacement, not a close.
         commitClose(terminalID, recordUndo: false)
         Task { [weak self] in await self?.drainPendingReleases() }
     }
 
-    private func recreateSession(from closed: ClosedSession) async -> String? {
+    private func transferTerminalPresentation(
+        from oldTerminalID: String,
+        to createdRecord: BrokerTerminalRecord,
+        presentationProjectID: String
+    ) -> Bool {
+        let priorAdoption = sessionAdoptions[oldTerminalID]
+        adoptionStore.clear(terminalID: oldTerminalID)
+        sessionAdoptions.removeValue(forKey: oldTerminalID)
+        guard createdRecord.projectID != presentationProjectID else { return true }
+        guard adoptionStore.adopt(
+            terminalID: createdRecord.id,
+            into: presentationProjectID
+        ) else {
+            if let priorAdoption,
+               adoptionStore.adopt(
+                   terminalID: oldTerminalID,
+                   into: priorAdoption
+               ) {
+                sessionAdoptions[oldTerminalID] = priorAdoption
+            }
+            return false
+        }
+        sessionAdoptions[createdRecord.id] = presentationProjectID
+        return true
+    }
+
+    private func recreateSession(
+        from closed: ClosedSession,
+        select: Bool = true
+    ) async -> String? {
         let directory = URL(fileURLWithPath: closed.cwd)
         let agent = closed.agentID.flatMap { AgentRegistry.profile(id: $0) }
         await draftPersistenceTask?.value
@@ -7656,7 +8267,8 @@ final class AppModel: ObservableObject {
             lockedAccountBinding: closed.accountBinding,
             resumeAgent: agent?.resumeCommand != nil,
             titleOverride: closed.title,
-            draftRestoreSeed: draftSeed
+            draftRestoreSeed: draftSeed,
+            select: select
         )).terminalID
     }
 
@@ -7668,8 +8280,14 @@ final class AppModel: ObservableObject {
     func refreshInventory() async {
         refreshPersistedNavigationState(publish: false)
         guard connectionState.isConnected else { return }
+        let inventoryGeneration = connectionGeneration
+        let inventoryRouteLossSequence = observerRouteLossSequence
         do {
             let status = try await client.inventory()
+            guard observerRouteIsCurrent(
+                generation: inventoryGeneration,
+                routeLossSequence: inventoryRouteLossSequence
+            ), connectionState.isConnected else { return }
             consecutiveInventoryFailures = 0
             // `@Published` fires on every assignment regardless of equality, and
             // this runs on a 2.5s timer for the life of the app — assigning
@@ -7690,10 +8308,18 @@ final class AppModel: ObservableObject {
             }
             await retryUnownedAttaches()
         } catch {
+            guard observerRouteIsCurrent(
+                generation: inventoryGeneration,
+                routeLossSequence: inventoryRouteLossSequence
+            ) else { return }
             consecutiveInventoryFailures += 1
             if consecutiveInventoryFailures >= 3 {
                 consecutiveInventoryFailures = 0
-                connectionLost(error, generation: connectionGeneration)
+                connectionLost(
+                    error,
+                    generation: inventoryGeneration,
+                    routeLossSequence: inventoryRouteLossSequence
+                )
                 return
             }
         }
@@ -7808,65 +8434,145 @@ final class AppModel: ObservableObject {
     /// the terminals this app created in earlier runs. Records absent from
     /// the live inventory are retained as dormant resurrection candidates,
     /// never deleted here.
-    private func restoreOwnedSessions(
-        info: BrokerInfo,
-        generation: Int
-    ) async {
+    private func observerRouteIsCurrent(
+        generation: Int,
+        routeLossSequence: Int
+    ) -> Bool {
+        generation == connectionGeneration
+            && routeLossSequence == observerRouteLossSequence
+            && shouldReconnect
+    }
+
+    private func dormantResurrectionIsCurrent(_ epoch: DormantResurrectionEpoch) -> Bool {
+        observerRouteIsCurrent(
+            generation: epoch.connectionGeneration,
+            routeLossSequence: epoch.observerRouteLossSequence
+        ) && epoch.resurrectionSequence == dormantResurrectionSequence
+    }
+
+    private func invalidateDormantResurrection() {
+        dormantResurrectionSequence &+= 1
+        dormantResurrectionTask?.cancel()
+    }
+
+    private func invalidateControllerAuthority() {
         invalidateAllTerminalInput(notifyIfDiscarded: true)
         controlAvailable = false
         ownedTerminalIDs = []
-        terminalInputDegradedIDs = []
-        terminalInputRecoveringIDs = []
+        terminalInputDegradedIDs.removeAll()
+        terminalInputRecoveringIDs.removeAll()
+        for task in terminalResizeTasks.values { task.cancel() }
+        terminalResizeTasks.removeAll()
+    }
+
+    /// Disconnect exactly the controller connection claimed by one observer
+    /// route. Clearing the route marker before awaiting makes a second stale
+    /// continuation a no-op instead of disconnecting a newer controller.
+    private func disconnectControllerIfOwned(by routeLossSequence: Int) async {
+        guard controllerObserverRouteSequence == routeLossSequence
+                || controllerConnectionAttemptRouteSequence == routeLossSequence else { return }
+        if controllerConnectionAttemptRouteSequence == routeLossSequence {
+            controllerConnectionAttemptRouteSequence = nil
+        }
+        controllerObserverRouteSequence = nil
+        invalidateControllerAuthority()
+        await controlClient.setDisconnectHandler(nil)
+        await controlClient.disconnect()
+    }
+
+    private func disconnectCurrentController() async {
+        let hadController = controllerConnectionAttemptRouteSequence != nil
+            || controllerObserverRouteSequence != nil
+            || controlAvailable
+        controllerConnectionAttemptRouteSequence = nil
+        controllerObserverRouteSequence = nil
+        invalidateControllerAuthority()
+        guard hadController else { return }
+        await controlClient.setDisconnectHandler(nil)
+        await controlClient.disconnect()
+    }
+
+    private func restoreOwnedSessions(
+        info: BrokerInfo,
+        generation: Int,
+        routeLossSequence: Int
+    ) async {
+        invalidateControllerAuthority()
+        controllerConnectionAttemptRouteSequence = routeLossSequence
         await controlClient.setDisconnectHandler { [weak self] error in
             Task { @MainActor in
-                guard let self, self.controlAvailable else { return }
-                self.invalidateAllTerminalInput(notifyIfDiscarded: true)
-                self.controlAvailable = false
-                self.ownedTerminalIDs = []
-                self.terminalInputDegradedIDs.removeAll()
-                self.terminalInputRecoveringIDs.removeAll()
-                for task in self.terminalResizeTasks.values { task.cancel() }
-                self.terminalResizeTasks.removeAll()
+                guard let self,
+                      self.controllerObserverRouteSequence == routeLossSequence else { return }
                 // The observer socket may still be streaming, but a full
                 // generation reconnect is the safest ownership reattach: it
                 // re-probes identity, restores both lanes, and never touches
                 // the detached broker's PTYs.
-                self.connectionLost(error, generation: generation)
+                self.connectionLost(
+                    error,
+                    generation: generation,
+                    routeLossSequence: routeLossSequence
+                )
             }
         }
         do {
             try await controlClient.connect(to: info, ownerID: sessionStore.ownerID())
         } catch {
             // Observation continues against brokers that refuse control.
+            if controllerConnectionAttemptRouteSequence == routeLossSequence {
+                controllerConnectionAttemptRouteSequence = nil
+            }
             return
         }
-        guard generation == connectionGeneration,
-              connectionState.isConnected else {
-            await controlClient.disconnect()
-            connectionLost(BrokerClientError.identityChanged, generation: generation)
+        guard controllerConnectionAttemptRouteSequence == routeLossSequence else {
             return
         }
-        controlAvailable = true
+        controllerConnectionAttemptRouteSequence = nil
+        controllerObserverRouteSequence = routeLossSequence
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else {
+            await disconnectControllerIfOwned(by: routeLossSequence)
+            return
+        }
         sessionStore.recoverOwnedSessions(from: sessions)
         refreshPersistedNavigationState(publish: false)
+        let durableRecords = persistedOwnedSessions.filter {
+            durableTerminalPaneCandidate(
+                id: $0.id,
+                projectID: sessionAdoptions[$0.id] ?? $0.projectID
+            ) != nil
+        }
+        let liveTerminalIDs = Set(sessions.map(\.id))
+        dormantTerminalIDs = Set(durableRecords.compactMap { stored in
+            liveTerminalIDs.contains(stored.id) ? nil : stored.id
+        })
         var owned: Set<String> = []
-        var dormant: Set<String> = []
         var attachRefusals = 0
-        for stored in persistedOwnedSessions {
+        for stored in durableRecords {
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                await disconnectControllerIfOwned(by: routeLossSequence)
+                return
+            }
             guard let record = sessions.first(where: { $0.id == stored.id }) else {
-                // Absence from the current inventory is not deletion — the
-                // PTY simply did not survive the relaunch. The pane goes
-                // dormant, survives layout normalization, and is a
-                // resurrection candidate.
-                dormant.insert(stored.id)
                 continue
             }
-            if record.exited {
-                owned.insert(stored.id)
-                continue
-            }
+            guard !record.exited else { continue }
             do {
                 try await controlClient.attach(projectID: stored.projectID, terminalID: stored.id)
+                guard observerRouteIsCurrent(
+                    generation: generation,
+                    routeLossSequence: routeLossSequence
+                ) else {
+                    await disconnectControllerIfOwned(by: routeLossSequence)
+                    return
+                }
+                guard terminalStillEligibleForOwnership(stored.id) else {
+                    continue
+                }
                 owned.insert(stored.id)
             } catch {
                 // Another controller holds it; leave it observed — but never
@@ -7877,8 +8583,19 @@ final class AppModel: ObservableObject {
                 attachRefusals += 1
             }
         }
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else {
+            await disconnectControllerIfOwned(by: routeLossSequence)
+            return
+        }
+        controlAvailable = true
+        // A different terminal can exit while a later attach is suspended.
+        // Re-filter the whole accumulator at the publication boundary so that
+        // stale successful attaches cannot undo the exit event's revocation.
+        owned = Set(owned.filter(terminalStillEligibleForOwnership))
         ownedTerminalIDs = owned
-        dormantTerminalIDs = dormant
         if attachRefusals > 0 {
             ToastCenter.shared.show(
                 Self.terminalAttachRefusalMessage(count: attachRefusals),
@@ -7891,15 +8608,43 @@ final class AppModel: ObservableObject {
         for terminalID in owned {
             scheduleDesiredTerminalResize(terminalID, force: true)
         }
+    }
+
+    private func scheduleDormantTerminalResurrection(
+        generation: Int,
+        routeLossSequence: Int
+    ) {
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else { return }
         // Owed releases from closes that happened while disconnected drain
-        // FIRST, so a resurrection sweep can never race a queued close.
-        Task { [weak self] in
-            await self?.drainPendingReleases()
-            // Resurrection is scheduled HERE — not only from reload() — so a
-            // connection that drops and comes back mid-session also gets its
-            // lost terminals back. Detached: never blocks restore or
-            // reconnect.
-            await self?.resurrectDormantTerminals()
+        // first, so a resurrection sweep can never race a queued close. Every
+        // successful connection schedules this after the observer has been
+        // published as connected; the work stays independent from Chat/Mesh.
+        dormantResurrectionSequence &+= 1
+        let epoch = DormantResurrectionEpoch(
+            connectionGeneration: generation,
+            observerRouteLossSequence: routeLossSequence,
+            resurrectionSequence: dormantResurrectionSequence
+        )
+        let previousTask = dormantResurrectionTask
+        previousTask?.cancel()
+        dormantResurrectionTask = Task { [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            guard self.dormantResurrectionIsCurrent(epoch), !Task.isCancelled else { return }
+            let releasesRefreshedInventory = await self.drainPendingReleases()
+            guard self.dormantResurrectionIsCurrent(epoch), !Task.isCancelled else { return }
+            if !releasesRefreshedInventory, !self.dormantTerminalIDs.isEmpty {
+                // Controller restoration can suspend after the observer's
+                // first inventory. Re-read immediately before any create so a
+                // terminal revived by another window is observed, never
+                // adopted through a same-id create.
+                await self.refreshInventory()
+                guard self.dormantResurrectionIsCurrent(epoch), !Task.isCancelled else { return }
+            }
+            await self.resurrectDormantTerminals(epoch: epoch)
         }
     }
 
@@ -7950,6 +8695,11 @@ final class AppModel: ObservableObject {
     /// cost and account binding are the user's call). Runs after the restored
     /// UI is up; failures leave the pane dormant for the next attempt.
     func resurrectDormantTerminals() async {
+        await resurrectDormantTerminals(epoch: nil)
+    }
+
+    private func resurrectDormantTerminals(epoch: DormantResurrectionEpoch?) async {
+        if let epoch, !dormantResurrectionIsCurrent(epoch) { return }
         guard controlAvailable, !dormantTerminalIDs.isEmpty else { return }
         // One sweep at a time: startup, automatic recovery, and launch can all schedule
         // this, and two overlapping sweeps could double-spawn the same id.
@@ -7958,6 +8708,8 @@ final class AppModel: ObservableObject {
         defer { resurrectionSweepInFlight = false }
         let records = persistedOwnedSessions.filter { dormantTerminalIDs.contains($0.id) }
         for stored in records {
+            if let epoch,
+               (!dormantResurrectionIsCurrent(epoch) || Task.isCancelled) { return }
             guard controlAvailable, dormantTerminalIDs.contains(stored.id) else { continue }
             // Closed-stays-closed (§4b/§4c): never respawn a terminal the
             // user closed, one whose process ended, or one whose project is
@@ -7970,8 +8722,14 @@ final class AppModel: ObservableObject {
             }
             // Freshest inventory wins: the terminal may have surfaced since
             // restore marked it dormant.
-            guard !sessions.contains(where: { $0.id == stored.id }) else {
+            if sessions.contains(where: { $0.id == stored.id }) {
                 dormantTerminalIDs.remove(stored.id)
+                if projectID(forSurface: stored.id) == selectedProjectID,
+                   selectedSessionID != stored.id {
+                    await subscribeSplit(stored.id)
+                    if let epoch,
+                       (!dormantResurrectionIsCurrent(epoch) || Task.isCancelled) { return }
+                }
                 continue
             }
             // A vanished directory keeps the pane dormant rather than
@@ -7984,21 +8742,14 @@ final class AppModel: ObservableObject {
                 agent: nil,
                 titleOverride: stored.title,
                 terminalIDOverride: stored.id,
+                projectIDOverride: stored.projectID,
                 restore: true,
                 select: false,
-                environmentBinding: stored.agentID != nil ? stored.accountBinding : nil
+                environmentBinding: stored.agentID != nil ? stored.accountBinding : nil,
+                restorationEpoch: epoch
             )
-            // The spawn suspended; the user (or another window) may have
-            // closed this id meanwhile. A create that landed for a tombstoned
-            // id gets a compensating release immediately — the store already
-            // refused the upsert, so the PTY would otherwise leak untracked.
-            if sessionStore.isTerminalTombstoned(stored.id) {
-                try? await controlClient.release(
-                    projectID: stored.projectID, terminalID: stored.id
-                )
-                dormantTerminalIDs.remove(stored.id)
-                continue
-            }
+            if let epoch,
+               (!dormantResurrectionIsCurrent(epoch) || Task.isCancelled) { return }
             guard created.terminalID == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)
             // A restore can resolve to a COLD record (the terminal had ended
@@ -8020,6 +8771,10 @@ final class AppModel: ObservableObject {
                 ) {
                     pendingAgentResume[stored.id] = agentID
                 }
+            }
+            if projectID(forSurface: stored.id) == selectedProjectID,
+               selectedSessionID != stored.id {
+                await subscribeSplit(stored.id)
             }
         }
     }
@@ -8044,13 +8799,28 @@ final class AppModel: ObservableObject {
         pendingAgentResume.removeValue(forKey: terminalID)
     }
 
+    private func terminalStillEligibleForOwnership(_ terminalID: String) -> Bool {
+        sessions.contains { $0.id == terminalID && !$0.exited }
+            && persistedOwnedSessions.contains {
+                $0.id == terminalID && $0.endedAt == nil
+            }
+            && !sessionStore.isTerminalTombstoned(terminalID)
+    }
+
     /// Ownership self-heal: a session this install owns on record but could
     /// not attach (a stale owner lease, another window mid-handoff) is
     /// retried on the inventory cadence, throttled to every 10s.
     /// The moment the blocker releases — as in the 2026-08-07 incident —
     /// input comes back on its own instead of waiting for a manual reload.
     private func retryUnownedAttaches() async {
-        guard controlAvailable else { return }
+        let generation = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
+        guard controlAvailable,
+              controllerObserverRouteSequence == routeLossSequence,
+              observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+              ) else { return }
         let unowned = persistedOwnedSessions.filter { stored in
             !ownedTerminalIDs.contains(stored.id)
                 && !dormantTerminalIDs.contains(stored.id)
@@ -8060,17 +8830,35 @@ final class AppModel: ObservableObject {
         guard !unowned.isEmpty else { return }
         if let last = lastAttachRetryAt, Date().timeIntervalSince(last) < 10 { return }
         lastAttachRetryAt = Date()
-        var regained = 0
+        var regainedIDs: Set<String> = []
         for stored in unowned {
+            guard controlAvailable,
+                  controllerObserverRouteSequence == routeLossSequence,
+                  observerRouteIsCurrent(
+                    generation: generation,
+                    routeLossSequence: routeLossSequence
+                  ) else { return }
             do {
                 try await controlClient.attach(projectID: stored.projectID, terminalID: stored.id)
+                guard controlAvailable,
+                      controllerObserverRouteSequence == routeLossSequence,
+                      observerRouteIsCurrent(
+                        generation: generation,
+                        routeLossSequence: routeLossSequence
+                      ) else { return }
+                guard terminalStillEligibleForOwnership(stored.id) else {
+                    continue
+                }
                 ownedTerminalIDs.insert(stored.id)
                 scheduleDesiredTerminalResize(stored.id, force: true)
-                regained += 1
+                regainedIDs.insert(stored.id)
             } catch {
                 continue
             }
         }
+        let regained = regainedIDs.filter {
+            ownedTerminalIDs.contains($0) && terminalStillEligibleForOwnership($0)
+        }.count
         if regained > 0 {
             ToastCenter.shared.show(
                 regained == 1
@@ -8087,25 +8875,45 @@ final class AppModel: ObservableObject {
         // Seal and forget interactive intent before the first suspension. A
         // direct quit call must not leave a drain alive while owners detach.
         invalidateAllTerminalInput()
-        guard controlAvailable else { return }
-        for stored in persistedOwnedSessions where ownedTerminalIDs.contains(stored.id) {
-            try? await controlClient.detachOwner(projectID: stored.projectID, terminalID: stored.id)
+        if controlAvailable {
+            for stored in persistedOwnedSessions where ownedTerminalIDs.contains(stored.id) {
+                try? await controlClient.detachOwner(
+                    projectID: stored.projectID,
+                    terminalID: stored.id
+                )
+            }
         }
-        await controlClient.setDisconnectHandler(nil)
-        await controlClient.disconnect()
-        controlAvailable = false
+        await disconnectCurrentController()
     }
 
     func disconnect() async {
         flushPendingTerminalOutputs()
         shouldReconnect = false
+        let previousObserverTask = observerConnectionTask
+        let previousObserverToken = observerConnectionToken
+        let previousControllerTask = controllerRestorationTask
+        let previousControllerToken = controllerRestorationToken
+        invalidateDormantResurrection()
+        projectActivationGeneration &+= 1
+        projectObserverTransitionTask?.cancel()
+        projectObserverTransitionTask = nil
+        observerRouteCleanupTask?.cancel()
+        observerRouteCleanupTask = nil
+        observerRouteCleanupToken = nil
         for task in terminalDraftRestoreTasks.values { task.cancel() }
         terminalDraftRestoreTasks.removeAll()
         pendingTerminalDraftRestores.removeAll()
         terminalLastOutputAt.removeAll()
         connectionGeneration &+= 1
+        observerRouteLossSequence &+= 1
+        terminalSelectionGeneration &+= 1
+        let disconnectGeneration = connectionGeneration
+        let disconnectRouteLossSequence = observerRouteLossSequence
+        terminalOwnershipRestorationPhase = .idle
         reconnectTask?.cancel()
         reconnectTask = nil
+        reconnectTaskToken = nil
+        reconnectDialInFlight = false
         inventoryRefreshTask?.cancel()
         inventoryRefreshTask = nil
         consecutiveInventoryFailures = 0
@@ -8121,9 +8929,27 @@ final class AppModel: ObservableObject {
         terminalInputRecoveringIDs.removeAll()
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
+        await client.setDisconnectHandler(nil)
+        _ = await previousObserverTask?.value
+        if observerConnectionToken == previousObserverToken {
+            observerConnectionTask = nil
+            observerConnectionToken = nil
+            observerConnectionGeneration = nil
+            observerConnectionRouteLossSequence = nil
+        }
+        await client.setEventHandler(nil)
+        await previousControllerTask?.value
+        if controllerRestorationToken == previousControllerToken {
+            controllerRestorationTask = nil
+            controllerRestorationRouteSequence = nil
+            controllerRestorationToken = nil
+        }
         await controlClient.setDisconnectHandler(nil)
         await persistCurrentCursor()
-        await clearSplits()
+        await clearSplits(
+            expectedConnectionGeneration: disconnectGeneration,
+            expectedRouteLossSequence: disconnectRouteLossSequence
+        )
         if usesVisualFixtureTransport {
             controlAvailable = false
             connectedBrokerFeatures = []
@@ -8138,8 +8964,183 @@ final class AppModel: ObservableObject {
         connectedBrokerFeatures = []
     }
 
-    private func connect(generation: Int, reconnectAttempt: Int?) async -> Bool {
-        guard generation == connectionGeneration, shouldReconnect else { return false }
+    private enum PostInventoryFocusResolution {
+        case terminal(String)
+        case restoredSurface
+        case none
+
+        var terminalID: String? {
+            guard case let .terminal(id) = self else { return nil }
+            return id
+        }
+    }
+
+    private func postInventoryFocusResolution() -> PostInventoryFocusResolution {
+        let projectID = selectedProjectID
+        let inventoryTerminal: (String) -> BrokerTerminalRecord? = { id in
+            self.sessions.first { record in
+                record.id == id
+                    && (projectID == nil || self.displayProjectID(record) == projectID)
+            }
+        }
+        let liveTerminal: (String) -> BrokerTerminalRecord? = { id in
+            inventoryTerminal(id).flatMap { $0.exited ? nil : $0 }
+        }
+
+        if let focusedPaneID {
+            if chats.contains(where: {
+                $0.id == focusedPaneID && (projectID == nil || $0.projectID == projectID)
+            }) || meshes.contains(where: {
+                $0.id == focusedPaneID && (projectID == nil || $0.projectID == projectID)
+            }) {
+                return .restoredSurface
+            }
+            if let live = liveTerminal(focusedPaneID) {
+                return .terminal(live.id)
+            }
+            if let projectID {
+                switch terminalPaneRestorationDisposition(
+                    id: focusedPaneID,
+                    projectID: projectID
+                ) {
+                case .durable, .awaitingInventory:
+                    return .restoredSurface
+                case let .live(record):
+                    return .terminal(record.id)
+                case .invalid:
+                    break
+                }
+            }
+        }
+
+        if let selectedSessionID,
+           let terminal = liveTerminal(selectedSessionID) {
+            return .terminal(terminal.id)
+        }
+        if let stored = sessionStore.lastSelectedSessionID(),
+           let terminal = liveTerminal(stored) {
+            return .terminal(terminal.id)
+        }
+        if let first = sessions.first(where: {
+            !$0.exited && (projectID == nil || displayProjectID($0) == projectID)
+        }) {
+            return .terminal(first.id)
+        }
+        if let first = sessions.first(where: {
+            projectID == nil || displayProjectID($0) == projectID
+        }) {
+            return .terminal(first.id)
+        }
+        return .none
+    }
+
+    /// Clear only the observer primary for this connection. The restored Chat,
+    /// Mesh, or durable missing-terminal focus remains the visual selection,
+    /// and the saved terminal history remains available for a later fallback.
+    private func clearTerminalPrimaryPreservingRestoredFocus() {
+        flushPendingTerminalOutputs()
+        terminalSelectionGeneration &+= 1
+        if let sessionID = terminalDocument.sessionID {
+            terminalSurfaceDocuments[sessionID] = terminalDocument
+        }
+        selectedSession = nil
+        selectedSessionID = nil
+        terminalDocument = .empty
+    }
+
+    /// Move away from a live terminal without disturbing the Chat, Mesh, or
+    /// durable missing pane that is already selected. The old primary observer
+    /// is released only after its final frame and cursor are retained; the
+    /// project reconciler can then restore it as a visible secondary.
+    private func releaseTerminalPrimaryPreservingRestoredFocus() async {
+        flushPendingTerminalOutputs()
+        terminalSelectionGeneration &+= 1
+        let selectionGeneration = terminalSelectionGeneration
+        let previousSession = selectedSession
+        let previousDocument = terminalDocument
+        if let sessionID = previousDocument.sessionID {
+            terminalSurfaceDocuments[sessionID] = previousDocument
+        }
+        selectedSession = nil
+        selectedSessionID = nil
+        terminalDocument = .empty
+        cursorSaveTask?.cancel()
+        cursorSaveTask = nil
+        await persist(previousDocument, for: previousSession)
+        guard selectionGeneration == terminalSelectionGeneration else { return }
+        if let previousSession, connectionState.isConnected {
+            try? await client.unsubscribe(
+                from: previousSession,
+                ownerID: observerOwnerID
+            )
+        }
+    }
+
+    private func connect(
+        generation: Int,
+        routeLossSequence: Int,
+        reconnectAttempt: Int?
+    ) async -> Bool {
+        if let existingTask = observerConnectionTask,
+           let existingToken = observerConnectionToken {
+            let joinsExistingRoute = observerConnectionGeneration == generation
+                && observerConnectionRouteLossSequence == routeLossSequence
+            let result = await existingTask.value
+            if observerConnectionToken == existingToken {
+                observerConnectionTask = nil
+                observerConnectionToken = nil
+                observerConnectionGeneration = nil
+                observerConnectionRouteLossSequence = nil
+            }
+            if joinsExistingRoute { return result }
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else { return false }
+            // Another caller may have installed the winning route while this
+            // one waited. Re-enter the coordinator so both callers share it.
+            return await connect(
+                generation: generation,
+                routeLossSequence: routeLossSequence,
+                reconnectAttempt: reconnectAttempt
+            )
+        }
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else { return false }
+        let token = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.performObserverConnect(
+                generation: generation,
+                routeLossSequence: routeLossSequence,
+                reconnectAttempt: reconnectAttempt
+            )
+        }
+        observerConnectionTask = task
+        observerConnectionToken = token
+        observerConnectionGeneration = generation
+        observerConnectionRouteLossSequence = routeLossSequence
+        let result = await task.value
+        if observerConnectionToken == token {
+            observerConnectionTask = nil
+            observerConnectionToken = nil
+            observerConnectionGeneration = nil
+            observerConnectionRouteLossSequence = nil
+        }
+        return result
+    }
+
+    private func performObserverConnect(
+        generation: Int,
+        routeLossSequence: Int,
+        reconnectAttempt: Int?
+    ) async -> Bool {
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else { return false }
         // Retrying from a settled offline state stays silent: flipping to
         // "Reconnecting" every backoff cycle strobes the UI forever against a
         // broker that will keep refusing (for example one that predates
@@ -8160,15 +9161,45 @@ final class AppModel: ObservableObject {
             // against the connection a later attempt goes on to establish.
             await client.setDisconnectHandler(nil)
             await client.setEventHandler { [weak self] event in
-                Task { @MainActor in self?.consume(event) }
+                Task { @MainActor in
+                    guard let self,
+                          self.observerRouteIsCurrent(
+                            generation: generation,
+                            routeLossSequence: routeLossSequence
+                          ) else { return }
+                    self.consume(event)
+                }
             }
             let info = try await brokerPreparer.prepare()
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else { return false }
             activeBrokerIdentity = info.persistenceIdentity
             let hello = try await client.connect(to: info)
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                await client.disconnect()
+                return false
+            }
             let status = try await client.inventory()
-            guard generation == connectionGeneration, shouldReconnect else { return false }
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                await client.disconnect()
+                return false
+            }
             await client.setDisconnectHandler { [weak self] error in
-                Task { @MainActor in self?.connectionLost(error, generation: generation) }
+                Task { @MainActor in
+                    self?.connectionLost(
+                        error,
+                        generation: generation,
+                        routeLossSequence: routeLossSequence
+                    )
+                }
             }
 
             let visibleTerminals = status.terminals.filter {
@@ -8177,60 +9208,111 @@ final class AppModel: ObservableObject {
             notifyInventoryCompletions(previous: sessions, next: visibleTerminals)
             sessions = visibleTerminals
             connectedBrokerFeatures = hello.features
-            if restoredWorkspaceState {
-                // A reconnect inventory is authoritative before any old split
-                // subscription is restored. Prune finished ids in the same
-                // main-actor turn so the UI never flashes a dead placeholder.
-                reconcileAllPaneLayoutsWithAvailableSurfaces()
+            stampEndedFromInventory(visibleTerminals)
+            refreshPersistedNavigationState(publish: false)
+            let liveTerminalIDs = Set(visibleTerminals.map(\.id))
+            dormantTerminalIDs = Set(persistedOwnedSessions.compactMap { stored in
+                guard durableTerminalPaneCandidate(
+                    id: stored.id,
+                    projectID: sessionAdoptions[stored.id] ?? stored.projectID
+                ) != nil,
+                      !liveTerminalIDs.contains(stored.id) else { return nil }
+                return stored.id
+            })
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                throw BrokerClientError.identityChanged
             }
+            terminalOwnershipRestorationPhase = .restoringController(
+                generation: generation
+            )
+            reconcileAllPaneLayoutsWithAvailableSurfaces()
             // The route can be torn down while the observer hello and
             // inventory probes suspend. Re-check immediately before
             // publishing a connected state or restoring the controller lane.
-            guard generation == connectionGeneration, shouldReconnect else {
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
                 throw BrokerClientError.identityChanged
+            }
+            let controllerToken = UUID()
+            let controllerTask = Task { [weak self] in
+                guard let self else { return }
+                await self.restoreOwnedSessions(
+                    info: info,
+                    generation: generation,
+                    routeLossSequence: routeLossSequence
+                )
+            }
+            controllerRestorationTask = controllerTask
+            controllerRestorationRouteSequence = routeLossSequence
+            controllerRestorationToken = controllerToken
+            await controllerTask.value
+            if controllerRestorationToken == controllerToken {
+                controllerRestorationTask = nil
+                controllerRestorationRouteSequence = nil
+                controllerRestorationToken = nil
+            }
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                return false
             }
             connectionState = .connected(
                 version: hello.version,
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )
-            await restoreOwnedSessions(info: info, generation: generation)
+            terminalOwnershipRestorationPhase = .settled(generation: generation)
             startInventoryRefresh(generation: generation)
-            // Prefer the in-memory selection, then the persisted one from the
-            // last run (whole-app persistence), then the first session.
-            let preferredID = selectedSessionID.flatMap { selected in
-                sessions.contains(where: { $0.id == selected }) ? selected : nil
-            } ?? sessionStore.lastSelectedSessionID().flatMap { stored in
-                sessions.contains(where: { $0.id == stored }) ? stored : nil
-            } ?? sessions.first?.id
+            let resolvedFocus = postInventoryFocusResolution()
             recoverInventoryCompletionAttention(
                 from: status.terminals,
-                selectedSessionID: preferredID
+                selectedSessionID: resolvedFocus.terminalID
             )
             selectedSession = nil
-            if let preferredID {
-                selectedSessionID = preferredID
-                await select(preferredID)
-            } else {
-                selectedSessionID = nil
-                terminalDocument = .empty
+            switch resolvedFocus {
+            case let .terminal(id):
+                selectedSessionID = id
+                await select(id, reconcileObservers: false)
+            case .restoredSurface, .none:
+                clearTerminalPrimaryPreservingRestoredFocus()
             }
-            // Initial launch restores its disk layout after connect(). Every
-            // later successful reconnect already has that layout in memory and
-            // must re-establish all visible secondaries, not only the primary.
-            if restoredWorkspaceState {
-                await restoreVisibleSecondarySubscriptions(
-                    expectedConnectionGeneration: generation
-                )
-            }
+            // Every successful connection restores all visible observers from
+            // the already-published local layout, not only a terminal primary.
+            await restoreVisibleSecondarySubscriptions(
+                expectedConnectionGeneration: generation,
+                expectedRouteLossSequence: routeLossSequence,
+                expectedProjectActivationGeneration: projectActivationGeneration
+            )
+            scheduleDormantTerminalResurrection(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            )
             return true
         } catch {
             // A post-dial failure (identity re-check, inventory, diagnostics)
             // otherwise leaves the successfully dialed socket open: the broker
             // counts a client that the app has already given up on, and the
             // next attempt dials beside the leak.
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else {
+                // Observer dials are serialized, so closing a stale completion
+                // cannot tear down a newer route that is already connecting.
+                await client.disconnect()
+                return false
+            }
             await client.disconnect()
-            guard generation == connectionGeneration, shouldReconnect else { return false }
+            guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            ) else { return false }
             connectedBrokerFeatures = []
             let description = error.kaisolaSafeDescription
             if case let .unavailable(existing) = connectionState, existing == description {
@@ -8242,33 +9324,87 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func scheduleReconnect(attempt: Int, generation: Int, immediate: Bool = false) {
-        guard generation == connectionGeneration,
-              shouldReconnect,
-              reconnectTask == nil else { return }
+    private func scheduleReconnect(
+        attempt: Int,
+        generation: Int,
+        routeLossSequence: Int,
+        immediate: Bool = false
+    ) {
+        guard observerRouteIsCurrent(
+                generation: generation,
+                routeLossSequence: routeLossSequence
+              ),
+              reconnectTask == nil,
+              reconnectTaskToken == nil,
+              observerRouteCleanupTask == nil else { return }
         let delay = immediate ? 0 : reconnectBackoff.delayNanoseconds(
             forAttempt: attempt,
             jitterUnit: jitter()
         )
         let sleeper = sleep
-        reconnectTask = Task { [weak self] in
+        let token = UUID()
+        reconnectTaskToken = token
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
                 if delay > 0 { try await sleeper(delay) }
             } catch {
+                self.finishReconnectReservation(token)
                 return
             }
             guard !Task.isCancelled else { return }
-            await self?.runReconnectAttempt(attempt, generation: generation)
+            await self.runReconnectAttempt(
+                attempt,
+                generation: generation,
+                routeLossSequence: routeLossSequence,
+                token: token
+            )
         }
     }
 
-    private func runReconnectAttempt(_ attempt: Int, generation: Int) async {
+    private func finishReconnectReservation(_ token: UUID) {
+        guard reconnectTaskToken == token else { return }
+        reconnectTask?.cancel()
         reconnectTask = nil
-        guard generation == connectionGeneration, shouldReconnect else { return }
+        reconnectTaskToken = nil
+        reconnectDialInFlight = false
+    }
+
+    private func runReconnectAttempt(
+        _ attempt: Int,
+        generation: Int,
+        routeLossSequence: Int,
+        token: UUID
+    ) async {
+        guard reconnectTaskToken == token,
+              observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else { return }
+        reconnectDialInFlight = true
         await client.disconnect()
+        guard reconnectTaskToken == token,
+              observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else {
+            finishReconnectReservation(token)
+            return
+        }
         selectedSession = nil
-        if !(await connect(generation: generation, reconnectAttempt: attempt)) {
-            scheduleReconnect(attempt: attempt + 1, generation: generation)
+        let connected = await connect(
+            generation: generation,
+            routeLossSequence: routeLossSequence,
+            reconnectAttempt: attempt
+        )
+        guard reconnectTaskToken == token else { return }
+        finishReconnectReservation(token)
+        if !connected {
+            scheduleReconnect(
+                attempt: attempt + 1,
+                generation: generation,
+                routeLossSequence: routeLossSequence
+            )
         }
     }
 
@@ -8318,6 +9454,9 @@ final class AppModel: ObservableObject {
         // socket. Drain this terminal first so cursor persistence and recovery
         // observe the same order.
         flushPendingTerminalOutput(for: event.terminalID)
+        if case .exit = event.kind {
+            applyTerminalExitLifecycle(event.terminalID)
+        }
 
         // Split panes get the same event handling as the primary document.
         if splitDocuments[event.terminalID] != nil, event.terminalID != selectedSession?.id {
@@ -8349,19 +9488,39 @@ final class AppModel: ObservableObject {
             terminalDocument.exited = true
             publishTerminalSurfaceDocument(terminalDocument)
             queueCursorPersistence()
-            // A dead shell has nothing to resume into; without this, a
-            // resurrected shell that exits immediately renders the resume
-            // chip and the "Session ended" banner stacked on each other.
-            pendingAgentResume.removeValue(forKey: event.terminalID)
-            // Exit evidence (§4b): an ended terminal is never resurrected.
-            sessionStore.stampEnded(
-                event.terminalID,
-                at: Int64(Date().timeIntervalSince1970 * 1_000)
-            )
-            refreshPersistedNavigationState(publish: false)
         case .activity:
             break
         }
+    }
+
+    private func applyTerminalExitLifecycle(_ terminalID: String) {
+        if let index = sessions.firstIndex(where: { $0.id == terminalID }) {
+            sessions[index].exited = true
+            if selectedSession?.id == terminalID {
+                selectedSession = sessions[index]
+            }
+        }
+        // The exit frame is the immediate authority boundary. Waiting for the
+        // next inventory left a dead terminal looking writable and turned the
+        // first rejected keystroke into a misleading input-failure state.
+        ownedTerminalIDs.remove(terminalID)
+        companionControlledTerminalIDs.remove(terminalID)
+        terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
+        terminalResizeGeneration[terminalID, default: 0] &+= 1
+        invalidateTerminalInput(for: terminalID)
+        terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
+        terminalInputDegradedIDs.remove(terminalID)
+        terminalInputRecoveringIDs.remove(terminalID)
+        acknowledgedAgentTurnTerminalIDs.remove(terminalID)
+        // A dead shell has nothing to resume into; without this, a resurrected
+        // shell that exits immediately renders resume and ended states together.
+        pendingAgentResume.removeValue(forKey: terminalID)
+        // Exit evidence (§4b): an ended terminal is never resurrected.
+        sessionStore.stampEnded(
+            terminalID,
+            at: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        refreshPersistedNavigationState(publish: false)
     }
 
     private func enqueueTerminalOutput(
@@ -8517,13 +9676,18 @@ final class AppModel: ObservableObject {
     }
 
     private func subscribeSplit(_ terminalID: String) async {
+        let reservedPrimaryPaneCount = selectedSessionID == nil ? 0 : 1
+        let activeSplitCount = splitDocuments.keys.filter(isActiveVisibleSecondary).count
         guard connectionState.isConnected,
+              isActiveVisibleSecondary(terminalID),
               splitDocuments[terminalID] == nil,
               pendingSplitSubscriptions[terminalID] == nil,
               terminalID != selectedSessionID,
-              splitOrder.count < SessionPaneLayout.maximumPaneCount - 1,
+              activeSplitCount
+                < SessionPaneLayout.maximumPaneCount - reservedPrimaryPaneCount,
               let record = sessions.first(where: { $0.id == terminalID }) else { return }
         let connection = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
         let intent = splitIntentTokens[terminalID] ?? UUID()
         splitIntentTokens[terminalID] = intent
         let token = UUID()
@@ -8534,21 +9698,23 @@ final class AppModel: ObservableObject {
                 await cleanUpStaleSplitSubscription(
                     terminalID,
                     record: record,
-                    subscriptionConnectionGeneration: connection
+                    subscriptionConnectionGeneration: connection,
+                    subscriptionRouteLossSequence: routeLossSequence
                 )
                 return
             }
             pendingSplitSubscriptions[terminalID] = nil
             guard connection == connectionGeneration,
+                  routeLossSequence == observerRouteLossSequence,
                   splitIntentTokens[terminalID] == intent,
                   connectionState.isConnected,
-                  selectedSessionID != terminalID,
-                  isSurfaceVisible(terminalID),
-                  sessions.contains(where: { $0.id == terminalID && !$0.exited }) else {
+                  isActiveVisibleSecondary(terminalID),
+                  sessions.contains(where: { $0.id == terminalID }) else {
                 await cleanUpStaleSplitSubscription(
                     terminalID,
                     record: record,
-                    subscriptionConnectionGeneration: connection
+                    subscriptionConnectionGeneration: connection,
+                    subscriptionRouteLossSequence: routeLossSequence
                 )
                 return
             }
@@ -8559,9 +9725,9 @@ final class AppModel: ObservableObject {
             guard pendingSplitSubscriptions[terminalID] == token else { return }
             pendingSplitSubscriptions[terminalID] = nil
             guard connection == connectionGeneration,
+                  routeLossSequence == observerRouteLossSequence,
                   splitIntentTokens[terminalID] == intent,
-                  selectedSessionID != terminalID,
-                  isSurfaceVisible(terminalID) else { return }
+                  isActiveVisibleSecondary(terminalID) else { return }
             // Preserve a last-good frame when one exists. A first-time failure
             // gets an explicit card-local error instead of an infinite spinner;
             // the next broker reconnect retries the visible intent.
@@ -8584,23 +9750,40 @@ final class AppModel: ObservableObject {
     /// deliberately scoped to the active project/window: hidden project layouts
     /// remain durable metadata but do not consume broker observers or renderers.
     private func restoreVisibleSecondarySubscriptions(
-        expectedConnectionGeneration: Int
+        expectedConnectionGeneration: Int,
+        expectedRouteLossSequence: Int,
+        expectedProjectActivationGeneration: Int
     ) async {
-        guard expectedConnectionGeneration == connectionGeneration,
+        guard observerRouteIsCurrent(
+                generation: expectedConnectionGeneration,
+                routeLossSequence: expectedRouteLossSequence
+              ),
+              expectedProjectActivationGeneration == projectActivationGeneration,
               connectionState.isConnected,
               let selectedProjectID,
               let layout = paneLayouts[selectedProjectID] else { return }
+        let restoringProjectID = selectedProjectID
         var seen = Set<String>()
         let terminalIDs = layout.sessionIDs.filter { id in
             guard seen.insert(id).inserted,
                   id != selectedSessionID,
-                  sessions.contains(where: { $0.id == id && !$0.exited }) else { return false }
+                  sessions.contains(where: { $0.id == id }) else { return false }
             return true
         }
         for terminalID in terminalIDs {
-            guard expectedConnectionGeneration == connectionGeneration,
-                  connectionState.isConnected else { return }
+            guard observerRouteIsCurrent(
+                    generation: expectedConnectionGeneration,
+                    routeLossSequence: expectedRouteLossSequence
+                  ),
+                  expectedProjectActivationGeneration == projectActivationGeneration,
+                  connectionState.isConnected,
+                  self.selectedProjectID == restoringProjectID else { return }
+            splitIntentTokens[terminalID] = UUID()
             await subscribeSplit(terminalID)
+            guard self.selectedProjectID == restoringProjectID,
+                  expectedProjectActivationGeneration == projectActivationGeneration else {
+                return
+            }
         }
     }
 
@@ -8611,30 +9794,44 @@ final class AppModel: ObservableObject {
     private func cleanUpStaleSplitSubscription(
         _ terminalID: String,
         record: BrokerTerminalRecord,
-        subscriptionConnectionGeneration: Int
+        subscriptionConnectionGeneration: Int,
+        subscriptionRouteLossSequence: Int
     ) async {
         let cleanupIntent = splitIntentTokens[terminalID]
         guard subscriptionConnectionGeneration == connectionGeneration,
+              subscriptionRouteLossSequence == observerRouteLossSequence,
               connectionState.isConnected,
               selectedSessionID != terminalID,
               pendingSplitSubscriptions[terminalID] == nil,
-              !isSurfaceVisible(terminalID) else { return }
+              !isActiveVisibleTerminal(terminalID) else { return }
         try? await client.unsubscribe(from: record, ownerID: observerOwnerID)
-        guard subscriptionConnectionGeneration == connectionGeneration else { return }
+        guard subscriptionConnectionGeneration == connectionGeneration,
+              subscriptionRouteLossSequence == observerRouteLossSequence else {
+            if splitIntentTokens[terminalID] != cleanupIntent {
+                await repairCurrentObserverRole(terminalID)
+            }
+            return
+        }
         if splitIntentTokens[terminalID] != cleanupIntent {
             // A newer primary/secondary role raced the owner-scoped
             // unsubscribe. It may have successfully subscribed while this
             // stale cleanup was suspended, so establish the winning role again
             // only after the destructive unsubscribe has completed.
-            pendingSplitSubscriptions[terminalID] = nil
-            splitDocuments[terminalID] = nil
-            splitOrder.removeAll { $0 == terminalID }
-            if selectedSessionID == terminalID {
-                splitIntentTokens[terminalID] = UUID()
-                await select(terminalID)
-            } else if isSurfaceVisible(terminalID) {
-                await subscribeSplit(terminalID)
-            }
+            await repairCurrentObserverRole(terminalID)
+        }
+    }
+
+    private func repairCurrentObserverRole(_ terminalID: String) async {
+        pendingSplitSubscriptions[terminalID] = nil
+        splitDocuments[terminalID] = nil
+        splitOrder.removeAll { $0 == terminalID }
+        guard connectionState.isConnected else { return }
+        if selectedSessionID == terminalID {
+            splitIntentTokens[terminalID] = UUID()
+            await select(terminalID)
+        } else if isActiveVisibleSecondary(terminalID) {
+            splitIntentTokens[terminalID] = UUID()
+            await subscribeSplit(terminalID)
         }
     }
 
@@ -8650,6 +9847,7 @@ final class AppModel: ObservableObject {
         let intent = splitIntentTokens[terminalID] ?? UUID()
         splitIntentTokens[terminalID] = intent
         let connection = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
         // Invalidate a blocked in-flight result even when no document has
         // arrived yet. The late-result fence performs the safe cleanup.
         pendingSplitSubscriptions[terminalID] = nil
@@ -8659,21 +9857,24 @@ final class AppModel: ObservableObject {
         }
         await persistSplitCursor(terminalID)
         guard splitIntentTokens[terminalID] == intent,
-              connection == connectionGeneration else { return }
+              connection == connectionGeneration,
+              routeLossSequence == observerRouteLossSequence else { return }
         if connectionState.isConnected,
            let record = sessions.first(where: { $0.id == terminalID }) {
             try? await client.unsubscribe(from: record, ownerID: observerOwnerID)
         }
-        guard connection == connectionGeneration else { return }
+        guard connection == connectionGeneration,
+              routeLossSequence == observerRouteLossSequence else {
+            if splitIntentTokens[terminalID] != intent {
+                await repairCurrentObserverRole(terminalID)
+            }
+            return
+        }
         if splitIntentTokens[terminalID] != intent {
             // A reopen landed while the broker unsubscribe was suspended. The
             // old owner observer is now gone; replace it in-order rather than
             // letting the stale completion blank the newly visible card.
-            splitDocuments[terminalID] = nil
-            splitOrder.removeAll { $0 == terminalID }
-            if selectedSessionID != terminalID, isSurfaceVisible(terminalID) {
-                await subscribeSplit(terminalID)
-            }
+            await repairCurrentObserverRole(terminalID)
             return
         }
         splitDocuments[terminalID] = nil
@@ -8689,15 +9890,22 @@ final class AppModel: ObservableObject {
     }
 
     /// Drop every split (connection loss / reload), persisting cursors.
-    private func clearSplits(expectedConnectionGeneration: Int? = nil) async {
+    private func clearSplits(
+        expectedConnectionGeneration: Int? = nil,
+        expectedRouteLossSequence: Int? = nil
+    ) async {
         if let expectedConnectionGeneration,
            expectedConnectionGeneration != connectionGeneration { return }
+        if let expectedRouteLossSequence,
+           expectedRouteLossSequence != observerRouteLossSequence { return }
         let documents = splitDocuments.values
         for document in documents { retainTerminalSurfaceDocument(document) }
         pendingSplitSubscriptions.removeAll()
         for id in splitOrder { await persistSplitCursor(id) }
         if let expectedConnectionGeneration,
            expectedConnectionGeneration != connectionGeneration { return }
+        if let expectedRouteLossSequence,
+           expectedRouteLossSequence != observerRouteLossSequence { return }
         splitDocuments.removeAll()
         splitOrder.removeAll()
     }
@@ -8705,10 +9913,10 @@ final class AppModel: ObservableObject {
     private func resubscribeSplit(_ terminalID: String) async {
         guard splitDocuments[terminalID] != nil,
               pendingSplitSubscriptions[terminalID] == nil,
-              selectedSessionID != terminalID,
-              isSurfaceVisible(terminalID),
+              isActiveVisibleSecondary(terminalID),
               let record = sessions.first(where: { $0.id == terminalID }) else { return }
         let connection = connectionGeneration
+        let routeLossSequence = observerRouteLossSequence
         let intent = splitIntentTokens[terminalID] ?? UUID()
         splitIntentTokens[terminalID] = intent
         let token = UUID()
@@ -8719,20 +9927,22 @@ final class AppModel: ObservableObject {
                 await cleanUpStaleSplitSubscription(
                     terminalID,
                     record: record,
-                    subscriptionConnectionGeneration: connection
+                    subscriptionConnectionGeneration: connection,
+                    subscriptionRouteLossSequence: routeLossSequence
                 )
                 return
             }
             pendingSplitSubscriptions[terminalID] = nil
             guard connection == connectionGeneration,
+                  routeLossSequence == observerRouteLossSequence,
                   splitIntentTokens[terminalID] == intent,
                   connectionState.isConnected,
-                  selectedSessionID != terminalID,
-                  isSurfaceVisible(terminalID) else {
+                  isActiveVisibleSecondary(terminalID) else {
                 await cleanUpStaleSplitSubscription(
                     terminalID,
                     record: record,
-                    subscriptionConnectionGeneration: connection
+                    subscriptionConnectionGeneration: connection,
+                    subscriptionRouteLossSequence: routeLossSequence
                 )
                 return
             }
@@ -8848,19 +10058,65 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func connectionLost(_ error: any Error, generation: Int) {
-        guard generation == connectionGeneration, shouldReconnect else { return }
+    private func connectionLost(
+        _ error: any Error,
+        generation: Int,
+        routeLossSequence: Int
+    ) {
+        guard observerRouteIsCurrent(
+            generation: generation,
+            routeLossSequence: routeLossSequence
+        ) else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectTaskToken = nil
+        reconnectDialInFlight = false
+        invalidateDormantResurrection()
+        projectObserverTransitionTask?.cancel()
+        projectObserverTransitionTask = nil
+        let lostRouteLossSequence = routeLossSequence
+        observerRouteLossSequence &+= 1
+        terminalSelectionGeneration &+= 1
+        let recoveryRouteLossSequence = observerRouteLossSequence
+        invalidateControllerAuthority()
         flushPendingTerminalOutputs()
         connectedBrokerFeatures = []
+        terminalOwnershipRestorationPhase = .awaitingInventory(generation: generation)
         connectionState = .unavailable(error.kaisolaSafeDescription)
-        Task { [weak self] in
+        let cleanupToken = UUID()
+        observerRouteCleanupToken = cleanupToken
+        observerRouteCleanupTask?.cancel()
+        observerRouteCleanupTask = Task { [weak self] in
             guard let self else { return }
+            await self.beforeRouteSplitCleanup?()
+            let controllerTask = self.controllerRestorationRouteSequence
+                == lostRouteLossSequence
+                ? self.controllerRestorationTask
+                : nil
+            if let controllerTask {
+                await controllerTask.value
+            } else {
+                await self.disconnectControllerIfOwned(by: lostRouteLossSequence)
+            }
             // Subscriptions died with the socket. Finish retaining/persisting
             // them before reconnect starts, otherwise the old cleanup task can
             // erase the newly restored secondary documents.
-            await self.clearSplits(expectedConnectionGeneration: generation)
-            guard generation == self.connectionGeneration, self.shouldReconnect else { return }
-            self.scheduleReconnect(attempt: 0, generation: generation)
+            await self.clearSplits(
+                expectedConnectionGeneration: generation,
+                expectedRouteLossSequence: recoveryRouteLossSequence
+            )
+            guard self.observerRouteCleanupToken == cleanupToken,
+                  self.observerRouteIsCurrent(
+                    generation: generation,
+                    routeLossSequence: recoveryRouteLossSequence
+                  ) else { return }
+            self.observerRouteCleanupTask = nil
+            self.observerRouteCleanupToken = nil
+            self.scheduleReconnect(
+                attempt: 0,
+                generation: generation,
+                routeLossSequence: recoveryRouteLossSequence
+            )
         }
     }
 

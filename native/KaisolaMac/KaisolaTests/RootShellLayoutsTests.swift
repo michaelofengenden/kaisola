@@ -350,7 +350,7 @@ final class RootShellLayoutsTests: XCTestCase {
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             "clearing the drag is what a double-click does, so it must resolve to the default"
         )
-        XCTAssertEqual(opening, 196)
+        XCTAssertEqual(opening, 180)
 
         // A width the user dragged still outranks the default when the window
         // reopens — the reset is the only thing that discards it.

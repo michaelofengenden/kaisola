@@ -3867,8 +3867,18 @@ private struct NavigationSidebarResizeAffordance: View {
 
     var body: some View {
         ZStack {
+            // 0.42 → 0.78 at rest (2026-08-28, "the right border of the left
+            // hand side card disappears into the panel divider").
+            //
+            // 0.42 was set when the rail carried its own tone and the boundary
+            // was a tonal step that the hairline merely sharpened. The
+            // graduated rail mounts the CANVAS recipe, so the two sides are
+            // now deliberately the same colour and this hairline is the ONLY
+            // thing marking the edge — at 42% it was reading as a seam in one
+            // surface rather than as the card's border. Hover still answers
+            // with a further step, so the divider keeps saying it is grabbable.
             Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(hovered ? 0.95 : 0.42))
+                .fill(Color(nsColor: .separatorColor).opacity(hovered ? 1.0 : 0.78))
                 .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
             Capsule()
                 .fill(Color.accentColor.opacity(hovered ? 0.72 : 0.08))
@@ -3961,7 +3971,7 @@ enum InitialSidebarWidth {
     /// 2026-08-26 move to 245; 245 joined with the 2026-08-28 move to 196.
     /// Dragged widths persist, so a user choice can never sit in this band by
     /// accident.
-    static let previouslyForcedIdeals: [CGFloat] = [210, 245, 248, 290]
+    static let previouslyForcedIdeals: [CGFloat] = [196, 210, 245, 248, 290]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3990,7 +4000,8 @@ enum InitialSidebarWidth {
 
     /// The key generation moves whenever the flag's meaning changes: v2
     /// recorded "this window was widened to 248", v3 "moved to 290", v4 "moved
-    /// to 245", and v5 "narrowed to 196". Each bump revisits flagged windows
+    /// to 245", v5 "narrowed to 196", and v6 "narrowed again to 180". Each
+    /// bump revisits flagged windows
     /// exactly once to move them to the current ideal (or to the user's own
     /// persisted width, which wins outright).
     ///
@@ -3999,7 +4010,7 @@ enum InitialSidebarWidth {
     /// would reach only windows that had never been opened — which is the
     /// exact way the 2026-08-14 widening missed the windows it was asked for.
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v5.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v6.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -5186,12 +5197,14 @@ enum NativeWorkspaceChrome {
     /// pins the Files rail to; 290 → 245 on 2026-08-26, again by request —
     /// the double-click reset should land "1-2cm less wide" than it did;
     /// 245 → 196 on 2026-08-28, once more by request, "at least 20% less
-    /// wide" — 196 is exactly that, and it is also the Files rail's own
-    /// default, so a window whose two rails are both reset is symmetric.
+    /// wide" — 196 was exactly that; 196 → 180 the same day, because 20% off
+    /// still read wide in the running app. 180 is 26.5% off the 245 it
+    /// started at and sits 12pt clear of `projectSidebarMinimumWidth`, so the
+    /// drag still has somewhere narrower to go.
     /// Users who dragged their rail keep their width — a drag persists
     /// (`NativePreviewSettings.projectRailWidth`), so this constant sizes
     /// fresh windows and the divider's double-click reset.
-    static let projectSidebarIdealWidth: CGFloat = 196
+    static let projectSidebarIdealWidth: CGFloat = 180
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

@@ -543,14 +543,34 @@ enum QuietRowBudget {
     /// smaller font and wider lane draw ~31 characters at rest, and 18 sat
     /// only three above the half-lane floor.
     ///
-    /// 20 → 11 across the 2026-08-28 narrowings (245 → 196 → 180, twice by
+    /// 20 → 11 across the 2026-08-28 narrowings (245 → 196 → 180, each by
     /// request). This constant tracks the lane in both directions: the 180pt
     /// lane is 84.5pt and draws 13 characters of a real title, so a
     /// 20-character window was calling pairs identical that the rail visibly
-    /// tells apart. 11 sits under the measurement, the way 12 did at 210pt,
-    /// and stays above the half-lane floor that stops it flagging every
-    /// shared word.
+    /// tells apart. 11 sits under the measurement and above the half-lane
+    /// floor that stops it flagging every shared word.
     static let ambiguousTitleCharacters = 11
+
+    /// Below this width the row stops drawing its time-in-state label.
+    ///
+    /// The 2026-08-28 narrowings took the rail to 150pt, and at that width the
+    /// row was still paying every token it paid at 290: indent, identity mark,
+    /// gaps, the time label and its dot came to ~95 points, leaving the title
+    /// 54. Measured at the 125 originally asked for it was 29pt and TWO
+    /// characters, with two different sessions both rendering "M…a" — the rail
+    /// no longer telling its own rows apart, which is the one job the title
+    /// lane has.
+    ///
+    /// The time label is the right thing to spend: it is the widest optional
+    /// token in the lane, it repeats a fact the status dot already colours,
+    /// and hover and VoiceOver still carry it. The dot stays — six points, and
+    /// it is the row's only live state. Above this width nothing changes.
+    static let timeLabelMinimumSidebarWidth: CGFloat = 160
+
+    /// Whether a rail this wide can afford the time-in-state label.
+    static func showsTimeLabel(sidebarWidth: CGFloat) -> Bool {
+        sidebarWidth >= timeLabelMinimumSidebarWidth
+    }
 
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
@@ -2026,7 +2046,15 @@ private struct QuietSurfaceRowView: View {
             QuietRowBody(
                 identity: identity,
                 label: label,
-                timeLabel: timeInState.compactLabel,
+                // Dropped outright on a narrow rail rather than allowed to
+                // squeeze the title; see `QuietRowBudget.showsTimeLabel`. An
+                // empty label costs the lane nothing, and hover and VoiceOver
+                // still carry the time.
+                timeLabel: QuietRowBudget.showsTimeLabel(
+                    sidebarWidth: NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+                        storedWidth: NativePreviewSettings.shared.projectRailWidth
+                    )
+                ) ? timeInState.compactLabel : "",
                 status: status,
                 isSelected: isSelected,
                 // Forwarded, which it was not: every caller computes

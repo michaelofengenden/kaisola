@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.145 — 2026-08-28
+
+- The glass drinks more of the desktop. The painted glass was technically tinted but visibly grey next to the wallpaper behind it; the desktop's share of the pane colour rises by about forty percent in both appearances, the saturation ceiling lifts, the warmth layer strengthens, and the light-mode sidebar picks up the live tint it never had. Legibility is untouched: the veil's transmission and the ink-contrast targets stay pinned exactly where they were.
+- The effort chip remembers. The reasoning-effort choice was pure session state, reset to the adapter's default on every relaunch. It is now remembered per agent and re-applied through the connect handshake, with the discipline the permission mode earned in 0.1.138: only an adapter-confirmed value is kept, a refusal rolls the chip back and realigns the memory, and a replayed history cannot overwrite the choice.
+- Signed in stays signed in, this time at the keychain's level. 0.1.136 fixed the migration that deleted tokens; underneath it, the stored item's own protection was bound to the exact binary that created it, because the legacy keychain never rewrites an item's access rules after creation. Every update therefore arrived as a stranger: macOS re-prompted for keychain access, and denying once read as signed out. The store now refreshes the item's protection one time, recreating it under the stable signing identity, after which updates walk straight in. A surviving session answers one last access prompt and is then rebound; a session already lost to the earlier bug needs one fresh sign-in, which then holds.
+- The release script's second blind spot gets the 0.1.144 treatment: the review-threads probe now retries transient reads instead of dying mute.
+
 ## 0.1.144 — 2026-08-28
 
 - Chats come back before terminals do. Opening a project now restores the chat workspace first and lets terminal setup follow, so the conversation you left is on screen without waiting for the slower half of the window; a large new reconnect test bed pins the ordering.

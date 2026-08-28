@@ -332,6 +332,34 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: []), [20])
     }
 
+    /// "The default rail width should also be the default when double-clicking
+    /// the panel divider" (2026-08-28). It is — both read
+    /// `projectSidebarIdealWidth` — and this is what stops them drifting into
+    /// two literals that answer the question differently.
+    ///
+    /// The divider's own `mouseDown` sets that constant and then clears the
+    /// persisted drag, so the width the reset lands on and the width a fresh
+    /// window opens at have to be the same number by construction rather than
+    /// by coincidence.
+    func testDoubleClickResetAndTheOpeningDefaultAreTheSameWidth() {
+        let opening = NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+            storedWidth: NativePreviewSettings.projectRailWidthUnset
+        )
+        XCTAssertEqual(
+            opening,
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            "clearing the drag is what a double-click does, so it must resolve to the default"
+        )
+        XCTAssertEqual(opening, 196)
+
+        // A width the user dragged still outranks the default when the window
+        // reopens — the reset is the only thing that discards it.
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 268),
+            268
+        )
+    }
+
     // MARK: - Retained shell behaviors
 
     func testCollapsedSidebarMovesSessionIdentityPastWindowControls() {

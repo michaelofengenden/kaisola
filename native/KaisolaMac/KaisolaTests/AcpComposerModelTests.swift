@@ -1434,6 +1434,200 @@ extension AcpComposerModelTests {
             "restore must use the adapter-confirmed session value, not a local guess"
         )
     }
+
+    /// The chosen effort level is a per-AGENT preference: a confirmed chip
+    /// selection is persisted under the agent id, a later conversation of the
+    /// same agent re-applies it at connect, and a conversation of a DIFFERENT
+    /// agent never inherits it.
+    @MainActor
+    func testSelectedEffortPersistsPerAgentAndRestoresAcrossConversationLifetimes() async throws {
+        let agentID = "effort-agent-\(UUID().uuidString)"
+        let otherAgentID = "effort-other-agent-\(UUID().uuidString)"
+        defer {
+            for id in [agentID, otherAgentID] {
+                UserDefaults.standard.removeObject(
+                    forKey: AcpConversation.persistedEffortDefaultsKeys(for: id).first!
+                )
+            }
+        }
+        let firstConversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: ReasoningEffortAcpTransport())
+        )
+        await firstConversation.start()
+        XCTAssertEqual(firstConversation.configOptions.first?.currentValue, "low")
+
+        firstConversation.selectConfigOption("reasoning_effort", value: "high")
+        let persistDeadline = ContinuousClock.now + .seconds(2)
+        while AcpConversation.loadPersistedEffortValue(for: agentID) == nil,
+              ContinuousClock.now < persistDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            AcpConversation.loadPersistedEffortValue(for: agentID),
+            "high",
+            "a confirmed user selection is remembered for the agent"
+        )
+        _ = await firstConversation.stop()
+
+        let restoredTransport = ReasoningEffortAcpTransport()
+        let restoredConversation = AcpConversation(
+            title: "Restored", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: restoredTransport)
+        )
+        await restoredConversation.start()
+
+        XCTAssertEqual(
+            restoredConversation.configOptions.first?.currentValue,
+            "high",
+            "a fresh session of the same agent starts at the remembered effort"
+        )
+        let restoredRequests = await restoredTransport.effortRequests()
+        XCTAssertEqual(restoredRequests, ["high"])
+
+        // A different agent id shares nothing: its adapter boots at "low" and
+        // no restoration request is ever sent.
+        let unrelatedTransport = ReasoningEffortAcpTransport()
+        let unrelatedConversation = AcpConversation(
+            title: "Unrelated", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: otherAgentID,
+            client: AcpClient(transport: unrelatedTransport)
+        )
+        await unrelatedConversation.start()
+        XCTAssertEqual(unrelatedConversation.configOptions.first?.currentValue, "low")
+        let unrelatedRequests = await unrelatedTransport.effortRequests()
+        XCTAssertTrue(unrelatedRequests.isEmpty)
+    }
+
+    /// A remembered effort the adapter still offers but refuses to enter is
+    /// not replayed on every launch: the adapter's own value stays on screen
+    /// and the memory realigns to it — the permission-mode rollback semantics.
+    @MainActor
+    func testRememberedEffortTheAdapterRefusesFallsBackAndRealignsMemory() async throws {
+        let agentID = "effort-refused-agent-\(UUID().uuidString)"
+        let effortKey = try XCTUnwrap(
+            AcpConversation.persistedEffortDefaultsKeys(for: agentID).first
+        )
+        defer { UserDefaults.standard.removeObject(forKey: effortKey) }
+        UserDefaults.standard.set("high", forKey: effortKey)
+
+        let transport = ReasoningEffortAcpTransport(rejectedValues: ["high"])
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        XCTAssertEqual(
+            conversation.configOptions.first?.currentValue,
+            "low",
+            "a refused restoration keeps the adapter's own confirmed value on screen"
+        )
+        let requests = await transport.effortRequests()
+        XCTAssertEqual(requests, ["high"], "the restoration is attempted exactly once")
+        XCTAssertEqual(
+            AcpConversation.loadPersistedEffortValue(for: agentID),
+            "low",
+            "memory realigns to the adapter's value so the refusal is not retried every launch"
+        )
+    }
+
+    /// With no remembered value the connect handshake sends nothing: the
+    /// adapter's own default stands and no config request is made.
+    @MainActor
+    func testNoRememberedEffortMakesNoEffortRequestOnConnect() async throws {
+        let agentID = "effort-none-agent-\(UUID().uuidString)"
+        defer {
+            UserDefaults.standard.removeObject(
+                forKey: AcpConversation.persistedEffortDefaultsKeys(for: agentID).first!
+            )
+        }
+        let transport = ReasoningEffortAcpTransport()
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "low")
+        let requests = await transport.effortRequests()
+        XCTAssertTrue(requests.isEmpty, "no memory, no request")
+        XCTAssertNil(
+            AcpConversation.loadPersistedEffortValue(for: agentID),
+            "the adapter's boot default is not itself a decision to persist"
+        )
+    }
+
+    /// A remembered value the adapter's effort option no longer offers is
+    /// never sent: the adapter's current value stands rather than a guessed
+    /// restoration, and the memory is left for a build that offers it again.
+    @MainActor
+    func testRememberedEffortValueTheAdapterNoLongerOffersIsNeverSent() async throws {
+        let agentID = "effort-gone-agent-\(UUID().uuidString)"
+        let effortKey = try XCTUnwrap(
+            AcpConversation.persistedEffortDefaultsKeys(for: agentID).first
+        )
+        defer { UserDefaults.standard.removeObject(forKey: effortKey) }
+        UserDefaults.standard.set("ultra", forKey: effortKey)
+
+        let transport = ReasoningEffortAcpTransport()
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "low")
+        let requests = await transport.effortRequests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    /// `session/load` replays historical notifications before its response. A
+    /// replayed effort announcement is history, not a decision: it must not
+    /// overwrite the remembered per-agent effort before the restore handshake
+    /// has run, or the memory wipes itself on every relaunch.
+    @MainActor
+    func testConnectTimeEffortAnnouncementDoesNotWipeTheRememberedChoice() async throws {
+        let agentID = "effort-replay-agent-\(UUID().uuidString)"
+        let effortKey = try XCTUnwrap(
+            AcpConversation.persistedEffortDefaultsKeys(for: agentID).first
+        )
+        defer { UserDefaults.standard.removeObject(forKey: effortKey) }
+        UserDefaults.standard.set("high", forKey: effortKey)
+
+        let transport = ReasoningEffortAcpTransport(announceEffortOnLoad: "low")
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", transcriptAgentID: agentID,
+            client: AcpClient(transport: transport),
+            resumeSessionID: "effort-session"
+        )
+        await conversation.start()
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (conversation.configOptions.first?.currentValue != "high"
+            || AcpConversation.loadPersistedEffortValue(for: agentID) != "high"),
+            ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            conversation.configOptions.first?.currentValue,
+            "high",
+            "the restore handshake wins over replayed history"
+        )
+        XCTAssertEqual(
+            AcpConversation.loadPersistedEffortValue(for: agentID),
+            "high",
+            "a replayed announcement must not rewrite the remembered effort"
+        )
+        let requests = await transport.effortRequests()
+        XCTAssertEqual(requests, ["high"])
+    }
 }
 
 /// Narrow ACP fixture for reasoning-effort state. It persists the confirmed
@@ -1444,9 +1638,12 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
     private var waiter: CheckedContinuation<Data?, Never>?
     private var effort = "low"
     private let rejectedValues: Set<String>
+    private let announceEffortOnLoad: String?
+    private var requestedValues: [String] = []
 
-    init(rejectedValues: Set<String> = []) {
+    init(rejectedValues: Set<String> = [], announceEffortOnLoad: String? = nil) {
         self.rejectedValues = rejectedValues
+        self.announceEffortOnLoad = announceEffortOnLoad
     }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {}
@@ -1469,6 +1666,23 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
             reply(id: id, result: sessionResult(id: "effort-session"))
         case "session/load", "session/resume":
             let sessionID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "effort-session"
+            // The real adapters replay session notifications BEFORE the load
+            // response; a historical effort announcement arriving first is
+            // the exact hazard the memory arming exists for.
+            if object["method"]?.stringValue == "session/load", let announceEffortOnLoad {
+                effort = announceEffortOnLoad
+                enqueue(JSONValue.object([
+                    "jsonrpc": .string("2.0"),
+                    "method": .string("session/update"),
+                    "params": .object([
+                        "sessionId": .string(sessionID),
+                        "update": .object([
+                            "sessionUpdate": .string("config_option_update"),
+                            "configOptions": configOptions(),
+                        ]),
+                    ]),
+                ]))
+            }
             reply(id: id, result: sessionResult(id: sessionID))
         case "session/set_config_option":
             guard let params = object["params"]?.objectValue,
@@ -1477,6 +1691,7 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
                 replyError(id: id, message: "Unknown config option")
                 return
             }
+            requestedValues.append(value)
             guard !rejectedValues.contains(value) else {
                 replyError(id: id, message: "Rejected reasoning effort: \(value)")
                 return
@@ -1487,6 +1702,8 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
             if let id { reply(id: id, result: .null) }
         }
     }
+
+    func effortRequests() -> [String] { requestedValues }
 
     func receive(maximumBytes: Int) async throws -> Data? {
         if !outbound.isEmpty { return outbound.removeFirst() }

@@ -382,6 +382,94 @@ enum LightGlassFrost {
     /// turn the shared material back into an opaque-looking panel.
     static let railCarrierWhiteCoverage: Double = 0.0
 
+    /// The live path's answer to "white backgrounds finally read white".
+    ///
+    /// `DesktopBackdropRenderer.solveToneMap` made the *painted* still a
+    /// floor: dim desktops are lifted, bright ones pass through, so a white
+    /// wallpaper arrives white and stays white under the veil. The live
+    /// source has no still — the desktop arrives as AppKit's `.sidebar`
+    /// material, whose plate is a grey-tinged recipe that tops out visibly
+    /// below white. With Clear's 0.20 veil scale there is almost no white
+    /// over it: a white-ish desktop lands the rails and canvas near the
+    /// material's own luminance while the bars ride their 0.55 white plate
+    /// to ~0.99, and the app reads grey exactly where it should read white.
+    /// Michael, fourth round of this report: "the background/canvas of the
+    /// app should always be either white or glass (never gray, sometimes
+    /// when glass is on white-ish backgrounds, it becomes gray)."
+    ///
+    /// So the live path gets the same floor, driven by the one thing it
+    /// knows about the desktop: the sampled tint the lively-tint layer
+    /// already consumes. The sample's chroma spread splits one unit of
+    /// treatment two ways — `liveTintChromaShare` is the colourful share
+    /// and the white lift takes the remainder, scaled by how bright the
+    /// sample is. A white-ish desktop (bright, nearly achromatic) gets a
+    /// flat white lift that lands the surface white-led, matching what the
+    /// painted source bakes for the same wallpaper; a colourful desktop
+    /// keeps its hue and gets no lift (that is the glass); a dark desktop
+    /// gets neither (dark glass is dark on purpose). A stale or stand-in
+    /// sample — the rotating-desktop case that made the live source the
+    /// default — can only push a surface toward the white the bars already
+    /// are, never toward grey: the failure mode is the pre-Clear look, not
+    /// a new one.
+    ///
+    /// The ramp tops out at 0.90 because `DesktopTintSampler.ceilings`
+    /// clamps every channel at 0.91: a genuinely white desktop can never
+    /// sample brighter, so the ceiling must sit below the clamp or full
+    /// white would never reach a full lift.
+    static let liveLiftRamp = (floor: 0.75, ceiling: 0.90)
+
+    /// The chroma spread at which a sample counts as fully colourful. The
+    /// sampler retains 0.70 of the wallpaper's chroma, so a desktop with a
+    /// 0.17 raw channel spread — a clearly tinted pastel — reaches 1.0 here;
+    /// off-whites and greys sit near zero. One constant feeds both shares so
+    /// the lift and the lively tint can never both engage at full strength.
+    static let liveLiftChromaGate = 0.12
+
+    /// Lift ceilings per surface, solved against the assumed material below.
+    /// The canvas already carries its 0.45 carrier, so it needs less; the
+    /// rails carry none and need more. Both land the modeled composite at or
+    /// above 0.95 over a white desktop — see `modeledLiveLuminance`.
+    static let liveLiftCoverage = (canvas: 0.40, rail: 0.56)
+
+    /// What the light `.sidebar` material is assumed to produce over a bright
+    /// desktop. Live vibrancy has no stable pixels to measure offline (the
+    /// same epistemics as `SidebarBackdropView.liveTint`), so this is the
+    /// conservative bound the lift ceilings are solved against: Safari's
+    /// frost over a white desktop reads a few counts below white, and 0.90
+    /// assumes worse than that. A material that resolves brighter only lands
+    /// the composite closer to white.
+    static let assumedLiveMaterialLuminance = 0.90
+
+    /// The colourful share of the sample, in [0, 1]. Scales the lively live
+    /// tint so an achromatic sample — a white desktop clamped to 0.91 grey,
+    /// or the 0.42 grey fallback — paints no grey over the material. What
+    /// the lively-tint round asked for was the desktop's *hue* concentrated,
+    /// and a grey sample has none to concentrate.
+    static func liveTintChromaShare(_ tint: DesktopTintComponents) -> Double {
+        min(1, max(0, tint.chromaSpread / liveLiftChromaGate))
+    }
+
+    /// The white lift over the live material, light appearance only.
+    static func liveWhiteLift(ceiling: Double, tint: DesktopTintComponents) -> Double {
+        let range = liveLiftRamp.ceiling - liveLiftRamp.floor
+        let brightness = min(1, max(0, (tint.luminance - liveLiftRamp.floor) / range))
+        return ceiling * brightness * (1 - liveTintChromaShare(tint))
+    }
+
+    /// The live composite the lift ceilings were solved against: lift over
+    /// material, under the Clear-scaled veil. Deterministic algebra for the
+    /// tests, exactly like `modeledBackdropLuminance` is for the painted path.
+    static func modeledLiveLuminance(
+        veil: GlassBackdropWash,
+        carrier: Double,
+        lift: Double
+    ) -> Double {
+        let material = assumedLiveMaterialLuminance
+        let lifted = lift + (1 - lift) * material
+        let carried = carrier + (1 - carrier) * lifted
+        return veil.baseOpacity + veil.desktopTransmission * carried
+    }
+
     /// White over the already-frosted workspace canvas. Light deliberately
     /// gets no second semantic material: that layer re-greyed the canvas and
     /// attenuated the desktop twice. Forty percent keeps the inset plane bright
@@ -411,21 +499,23 @@ enum LightGlassFrost {
 
 /// The opaque themes' share of the shared material ground.
 ///
-/// Safari's window ground is material in every mode; only the content card
-/// changes. Solid and Tinted used to paint a flat plate instead, which is why
-/// the window's edge read as a box in two of the three themes. They keep the
-/// colour they already had — light #FFFFFF, dark #1E1E1E — and gain the
-/// remainder as behind-window material.
+/// The Safari-ground experiment made every theme's ground material ("only the
+/// content card changes"). For Tinted — the living theme — that holds. For
+/// Solid it is withdrawn: the tenth of behind-window material meant the white
+/// ground was white only when the desktop behind the window happened to be,
+/// and Michael's fourth round of the grey report drew the line — "the
+/// background/canvas of the app should always be either white or glass
+/// (never gray)." Solid is the white-or-near-black plate again, which also
+/// stops a live vibrancy view compositing under an opaque theme.
 enum OpaqueThemeGround {
     /// Dark Solid/Tinted keep `windowBackgroundColor`'s own value (30/255),
     /// NOT `GlassBackdropWash.darkVeil` (#0D0D0D): the point is that the
     /// surface does not change colour, only gains transmission.
     static let darkPlate = (red: 30.0 / 255, green: 30.0 / 255, blue: 30.0 / 255)
 
-    /// Solid keeps almost all of its plate. A tenth of the material is enough
-    /// for the window edge to read as a pane rather than a card, and no
-    /// wallpaper feature survives 0.88 coverage over a 28pt blur.
-    static let solidCoverage = (light: 0.88, dark: 0.90)
+    /// Full plate, both appearances. Was 0.88/0.90 — the pane-edge share the
+    /// paragraph above withdraws.
+    static let solidCoverage = (light: 1.0, dark: 1.0)
 
     /// Tinted is the living theme, so it gives up more: a fifth of the
     /// surface is material, and the flowing gradient composites over that.
@@ -1495,7 +1585,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     static func opaqueGround(theme: WorkspaceBackdropMode, isDark: Bool) -> GlassBackdropWash {
         guard theme != .glass else { return workspace(isDark: isDark) }
         let coverage = OpaqueThemeGround.coverage(theme: theme, isDark: isDark)
-        let spread = 0.04
+        // A full plate has no transmission to gradient over: the ±spread
+        // collapses as coverage reaches 1 so Solid cannot leak a corner of
+        // material through `min`/`max` clamping (light's bottom corner and
+        // dark's top corner both used to open 0.04 at coverage 1).
+        let spread = min(0.04, 1 - coverage)
         // Light carries more white at the lit corner; dark carries less
         // near-black there — both read as light from above.
         let plate = OpaqueThemeGround.darkPlate

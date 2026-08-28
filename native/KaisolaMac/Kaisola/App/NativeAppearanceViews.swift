@@ -74,10 +74,15 @@ enum GlassWarmth {
     static let blue = 112.0 / 255
 
     /// Reference coverage from which the dark value is derived.
-    /// 0.029 (was 0.04): scaled down with the 2026-08-04 chroma cut so the
-    /// declared amber stays the same *proportion* of the surface's colour —
-    /// the ratio the hue-invariance correction depends on.
-    static let opacity = 0.029
+    /// 0.04 → 0.029 with the 2026-08-04 chroma cut, 0.029 → 0.04 with the
+    /// 2026-08-28 lively-tint re-raise: the amber scales WITH
+    /// `DesktopBackdropRenderer.desktopChromaShare` in **both** directions so
+    /// the declared warmth stays the same *proportion* of the surface's
+    /// colour — the ratio the hue-invariance correction depends on. Bounded
+    /// by `testGlassWarmthIsADeclaredAmber` (hard < 0.08 ceiling, > 0.02
+    /// floor; the exact pin moves with this constant on purpose) and by the
+    /// derived dark coverage's 0.004 floor, which 0.04 clears at 0.00565.
+    static let opacity = 0.04
 
     /// Coverage per appearance. Light Glass is explicitly neutral white, so
     /// the amber is absent there; dark keeps the scaled warmth that prevents a
@@ -113,13 +118,18 @@ enum GlassWarmth {
 struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
     let carrierWhiteCoverage: Double
-    /// Tint coverage (dark, light) laid over *live* vibrancy only. The light
-    /// half may be zero because live vibrancy already carries the desktop hue;
-    /// dark retains its small sampled lift. The painted wallpaper already is
-    /// the hue and must not be tinted twice.
+    /// Ceiling for the light live-path white lift — see
+    /// `LightGlassFrost.liveWhiteLift`. Zero opts a surface out entirely
+    /// (the opaque themes' ground, which keeps its own declared coverage).
+    let liveWhiteLiftCeiling: Double
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. Both
+    /// halves are small sampled lifts — dark 0.15, light 0.12 since the
+    /// 2026-08-28 lively-tint round (light spent a year at zero after the
+    /// white-rail pass) — that reinforce the desktop's own hue over the
+    /// material. The painted wallpaper already is the hue and must not be
+    /// tinted twice, which is why this never applies in `.wallpaper` mode.
     ///
-    /// See `SidebarBackdropView` for why the dark half of the pair is so much
-    /// smaller than the light one.
+    /// See `SidebarBackdropView.liveTint` for the receipts on both values.
     var liveTint: (dark: Double, light: Double)?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -130,11 +140,13 @@ struct DesktopGlassLayer: View {
         liveMaterial: NSVisualEffectView.Material,
         liveTint: (dark: Double, light: Double)? = nil,
         carrierWhiteCoverage: Double = LightGlassFrost.carrierWhiteCoverage,
+        liveWhiteLiftCeiling: Double = LightGlassFrost.liveLiftCoverage.canvas,
         settings: NativePreviewSettings = .shared
     ) {
         self.liveMaterial = liveMaterial
         self.liveTint = liveTint
         self.carrierWhiteCoverage = carrierWhiteCoverage
+        self.liveWhiteLiftCeiling = liveWhiteLiftCeiling
         self.settings = settings
     }
 
@@ -198,7 +210,16 @@ struct DesktopGlassLayer: View {
                 if let liveTint, Self.appliesSampledLiveTint(isDark: isDark) {
                     let tint = Self.resolvedLiveTint(desktop.painting.tint, isDark: isDark)
                     let tintColor = Color(red: tint.red, green: tint.green, blue: tint.blue)
-                    let coverage = isDark ? liveTint.dark : liveTint.light
+                    // Light scales by the sample's colourful share: the tint
+                    // exists to concentrate the desktop's hue, and a grey
+                    // sample — a white desktop clamped at the sampler's 0.91
+                    // ceiling, or the 0.42 fallback — has none, so painting
+                    // it would only grey the material. Dark keeps its shipped
+                    // coverage untouched (its transmission receipts are
+                    // pinned by `testLiveGlassPassesFarMoreOfTheMaterialInDarkThanItDid`).
+                    let coverage = isDark
+                        ? liveTint.dark
+                        : liveTint.light * LightGlassFrost.liveTintChromaShare(tint)
                     LinearGradient(
                         colors: [
                             tintColor.opacity(coverage),
@@ -207,6 +228,19 @@ struct DesktopGlassLayer: View {
                         startPoint: .top,
                         endPoint: .bottom
                     )
+                }
+                if !isDark {
+                    // The live path's white floor — see `LightGlassFrost
+                    // .liveWhiteLift`. Sits under the carrier so the modeled
+                    // algebra reads veil ∘ carrier ∘ lift ∘ material.
+                    let lift = LightGlassFrost.liveWhiteLift(
+                        ceiling: liveWhiteLiftCeiling,
+                        tint: desktop.painting.tint
+                    )
+                    if lift > 0 {
+                        Color.white.opacity(lift)
+                            .allowsHitTesting(false)
+                    }
                 }
             }
             if !isDark {
@@ -1271,15 +1305,33 @@ struct SidebarBackdropView: View {
     /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
     /// the material behind the window contributes 67% more than it did.
     ///
-    /// Dark keeps the sampled tint at 0.15. Light's explicit overlay is zero
-    /// because AppKit vibrancy now preserves the live desktop's own chroma;
-    /// adding its average again would tint the material twice.
+    /// Dark keeps the sampled tint at 0.15. Light was taken to exactly zero
+    /// by the white-rail pass (its old 0.26 tinted the material twice, and
+    /// the strict-neutrality contract wanted nothing the app adds); the
+    /// 2026-08-28 lively-tint round gives it back a smaller half — **0.12**,
+    /// deliberately junior to dark's 0.15 — for "make the live tint much
+    /// more lively/active": on a colourful desktop the light rails visibly
+    /// carry the desktop's own sampled hue again instead of white over bare
+    /// vibrancy. The tint is the wallpaper's averaged colour, so this is
+    /// still inside the white-rail contract's letter ("the only chroma on a
+    /// rail is whatever the desktop itself contributes") — what returns is
+    /// concentration, not a colour of the app's own.
+    ///
+    /// What bounds it: the veil above is untouched, so 0.54 of whatever sits
+    /// beneath it still reaches the eye — the pre-change transmission figure
+    /// exactly; within that, twelve percent is now the sampled hue laid over
+    /// the material (moving material share 0.54 × 0.88 = 0.475). Worst case
+    /// for ink is a near-black desktop, whose tint floors at 0.07
+    /// (`DesktopTintSampler.floors`): the modelled rail stays near 0.85
+    /// luminance, far above the 0.75 worst patch `KaisolaInk`'s light floors
+    /// were solved on. Pinned, both halves, by
+    /// `testLiveGlassPassesFarMoreOfTheMaterialInDarkThanItDid`.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The
     /// numbers above are compositing algebra over the two declared coverages,
     /// which is exactly as much as is knowable without a screenshot.)
-    static let liveTint = (dark: 0.15, light: 0.0)
+    static let liveTint = (dark: 0.15, light: 0.12)
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -1299,7 +1351,8 @@ struct SidebarBackdropView: View {
                     DesktopGlassLayer(
                         liveMaterial: Self.sharedGlassMaterial,
                         liveTint: Self.liveTint,
-                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage,
+                        liveWhiteLiftCeiling: LightGlassFrost.liveLiftCoverage.rail
                     )
                     GlassBackdropWash
                         .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
@@ -1318,30 +1371,22 @@ struct SidebarBackdropView: View {
                 }
             }
         case .solid:
-            // The rails are ground, and the ground is material in every theme
-            // now: the same coverage as the Solid canvas, because the rails
-            // and the canvas are one surface in the opaque themes and a
-            // separation step here would draw a seam at the divider. No edge
-            // cast, same as glass: colour on a rail belongs to Tinted alone.
+            // The rails are ground, and the Solid ground is a plate again —
+            // Michael, 2026-08-28: "the background/canvas of the app should
+            // always be either white or glass (never gray)." The tenth of
+            // behind-window material greyed the white rail whenever the
+            // desktop behind the window wasn't white, and it kept live
+            // vibrancy compositing under an opaque theme. Same coverage as
+            // the Solid canvas still: the rails and the canvas are one
+            // surface in the opaque themes and a separation step here would
+            // draw a seam at the divider. No edge cast, same as glass:
+            // colour on a rail belongs to Tinted alone.
             if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
             } else {
-                ZStack {
-                    DesktopGlassLayer(
-                        liveMaterial: Self.sharedGlassMaterial,
-                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
-                    )
-                    GlassBackdropWash
-                        .opaqueRailGround(appearance: .solid, isDark: colorScheme == .dark)
-                        .veil
-                    if accessibilityContrast == .increased {
-                        Color(nsColor: .controlBackgroundColor)
-                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
-                                theme: .system,
-                                isDark: colorScheme == .dark
-                            ))
-                    }
-                }
+                GlassBackdropWash
+                    .opaqueRailGround(appearance: .solid, isDark: colorScheme == .dark)
+                    .veil
             }
         case .tinted:
             // Both appearances mirror per placement now. Dark used to hardcode
@@ -1356,7 +1401,10 @@ struct SidebarBackdropView: View {
                 ZStack {
                     DesktopGlassLayer(
                         liveMaterial: Self.sharedGlassMaterial,
-                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage,
+                        // The lift is a glass-surface floor; Tinted's rail is
+                        // an opaque theme whose own coverage does the covering.
+                        liveWhiteLiftCeiling: 0
                     )
                     GlassBackdropWash
                         .opaqueRailGround(appearance: .tinted, isDark: colorScheme == .dark)
@@ -1443,16 +1491,19 @@ struct WorkspaceBackdropView: View {
             }
     }
 
-    /// The one ground every theme now sits on: the same behind-window
-    /// material Glass uses, honouring `glassBackdropSource` and the painted
-    /// fallback through the one existing code path. `carrierWhiteCoverage` is
-    /// zero because the opaque themes' own veil does all the covering, and
-    /// stacking the light-Glass carrier under it would push Solid back to
-    /// fully opaque.
+    /// Tinted's ground material — the same behind-window material Glass
+    /// uses, honouring `glassBackdropSource` and the painted fallback through
+    /// the one existing code path. Solid stopped sitting on it when it went
+    /// back to a plate; Tinted keeps its fifth of material because Tinted is
+    /// the living theme and its flowing gradient wants ground that moves.
+    /// `carrierWhiteCoverage` and the live white lift are both zero: the
+    /// theme's own declared coverage does all the covering, and the lift is
+    /// a glass-surface floor, not an opaque-theme one.
     private var groundMaterial: some View {
         DesktopGlassLayer(
             liveMaterial: .underWindowBackground,
-            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage,
+            liveWhiteLiftCeiling: 0
         )
     }
 
@@ -1460,30 +1511,21 @@ struct WorkspaceBackdropView: View {
     private var backdrop: some View {
         switch mode {
         case .system:
-            // Solid keeps the colour it always had — `windowBackgroundColor`
-            // resolves to #FFFFFF light / #1E1E1E dark — but a tenth of the
-            // surface now arrives as behind-window material, the way Safari's
-            // window ground is material in every mode. What Solid promises is
-            // about the *content*: the chrome card and pane cards stay fully
-            // opaque, so nothing behind the window ever reaches the surface
-            // work sits on. Reduce Transparency remains the true
-            // zero-sampling path.
+            // Solid is a plate again: white #FFFFFF light, `windowBackground`'s
+            // near-black dark, nothing else. The Safari-ground experiment laid
+            // a tenth of behind-window material under the plate, and that
+            // tenth is exactly what Michael reported — "the background/canvas
+            // of the app should always be either white or glass (never
+            // gray)": over any desktop that wasn't white, the material share
+            // greyed the white ground. The plate also stops a live vibrancy
+            // view compositing under an opaque theme. Reduce Transparency
+            // keeps the system-resolved plate.
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
             } else {
-                ZStack {
-                    groundMaterial
-                    GlassBackdropWash
-                        .opaqueGround(theme: .system, isDark: colorScheme == .dark)
-                        .veil
-                    if accessibilityContrast == .increased {
-                        Color(nsColor: .windowBackgroundColor)
-                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
-                                theme: .system,
-                                isDark: colorScheme == .dark
-                            ))
-                    }
-                }
+                GlassBackdropWash
+                    .opaqueGround(theme: .system, isDark: colorScheme == .dark)
+                    .veil
             }
         case .glass:
             if reduceTransparency {

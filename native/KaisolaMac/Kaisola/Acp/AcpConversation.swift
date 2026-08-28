@@ -300,6 +300,21 @@ final class AcpConversation: ObservableObject {
     /// made before the connect lives in `rememberedModeID`, and the restore
     /// handshake is what applies it.
     private var pendingUserModeSelection: String?
+    /// The reasoning-effort value this agent last ran under, persisted per
+    /// AGENT id (claude-code, codex, custom ids) rather than per chat: the
+    /// effort selector is a preference about the agent, and a relaunch must
+    /// not quietly reset a deliberate "max" back to the adapter's default.
+    /// Restored at `start` only when the adapter's effort option still
+    /// offers the remembered value, through the same transactional
+    /// config-set path the chip uses.
+    private var rememberedEffortValue: String?
+    /// Armed at the end of each connect's config handshake, mirroring
+    /// `remembersAdapterModeSwitches`: confirmed option sets update the
+    /// effort memory only while armed, so `session/load` replaying a
+    /// historical `config_option_update` (or an adapter naming its boot
+    /// default) cannot wipe the remembered choice before the restore
+    /// handshake has applied it.
+    private var remembersAdapterEffortChanges = false
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
@@ -558,6 +573,11 @@ final class AcpConversation: ObservableObject {
     /// option id. Saturation cancels the turn once, which makes AcpClient
     /// resolve every active permission as cancelled without growing a backlog.
     static let maximumPendingAutomaticPermissionResolutions = 64
+    /// Placeholder agent identity for constructions that carry no registry
+    /// agent id (previews, tests). Per-agent persistence — the remembered
+    /// effort level — is disabled under this id so unrelated conversations
+    /// can never share one preference slot.
+    static let unkeyedAgentID = "unknown-agent"
 
     init(
         title: String,
@@ -566,7 +586,7 @@ final class AcpConversation: ObservableObject {
         containment: CustomAdapterContainment? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
-        transcriptAgentID: String = "unknown-agent",
+        transcriptAgentID: String = AcpConversation.unkeyedAgentID,
         transcriptAgentName: String? = nil,
         transcriptModelID: String? = nil,
         providerContext: AcpProviderLaunchContext? = nil,
@@ -636,6 +656,12 @@ final class AcpConversation: ObservableObject {
             Self.loadPersistedBooleanConfigValues(for: $0)
         } ?? [:]
         self.rememberedModeID = draftKey.flatMap { Self.loadPersistedModeID(for: $0) }
+        // Effort memory is keyed by agent id. The placeholder id used by
+        // agent-less constructions (previews, tests) never reads or writes
+        // the shared preference.
+        self.rememberedEffortValue = transcriptAgentID == Self.unkeyedAgentID
+            ? nil
+            : Self.loadPersistedEffortValue(for: transcriptAgentID)
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count
         self.usage = initialUsage
@@ -661,6 +687,7 @@ final class AcpConversation: ObservableObject {
         providerStartupFailure = nil
         pendingModelFallback = nil
         remembersAdapterModeSwitches = false
+        remembersAdapterEffortChanges = false
         pendingUserModeSelection = nil
         invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
@@ -768,7 +795,40 @@ final class AcpConversation: ObservableObject {
                     restorationFailure = "Couldn’t restore \(option.name) to \(desiredValue ? "On" : "Off"). \(detail)"
                 }
             }
+            // The reasoning effort is a per-agent decision, not per-process
+            // state: restarting the app (or the adapter) must not reset it.
+            // Restore only a value the adapter's effort option still offers,
+            // through the same transactional config-set path the chip uses.
+            // A refusal keeps the adapter's own value on screen and realigns
+            // the memory to it — mirroring the permission-mode rollback — so
+            // the refused value is not replayed on every launch; an adapter
+            // that accepts but normalizes to another supported value realigns
+            // the memory the same way.
+            if let remembered = rememberedEffortValue,
+               let effort = AcpComposerMetrics.effortOption(confirmedOptions),
+               effort.currentValue != remembered,
+               effort.choices.contains(where: { $0.value == remembered }) {
+                do {
+                    confirmedOptions = try await client.setConfigOption(
+                        id: effort.id,
+                        value: .select(remembered)
+                    )
+                    if let confirmedValue = AcpComposerMetrics
+                        .effortOption(confirmedOptions)?.currentValue,
+                        confirmedValue != remembered {
+                        rememberEffort(confirmedValue)
+                    }
+                } catch {
+                    rememberEffort(effort.currentValue)
+                }
+            }
             applyConfirmedConfigOptions(confirmedOptions)
+            // Only from here on are confirmed option sets decisions worth
+            // remembering (mirrors `remembersAdapterModeSwitches` above). The
+            // connect's own apply stays unarmed: an adapter's boot default is
+            // history, not a decision, and recording it would overwrite the
+            // remembered choice on agents that were never asked to change.
+            remembersAdapterEffortChanges = true
             supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = pendingModelFallback.map {
@@ -1284,6 +1344,18 @@ final class AcpConversation: ObservableObject {
 
     private func applyConfirmedConfigOptions(_ options: [AcpConfigOption]) {
         configOptions = options
+        // Adapter-confirmed effort values update the per-agent memory: a chip
+        // selection, an adapter-side normalization, and an effort implied by a
+        // model switch are all the effort in force. Only once armed, though —
+        // connect-time announcements (load replay, boot defaults) are history,
+        // not decisions, and must not wipe the memory before the restore
+        // handshake applies it. An option set without an effort option leaves
+        // the memory alone rather than erasing the preference.
+        if remembersAdapterEffortChanges,
+           let effort = AcpComposerMetrics.effortOption(options),
+           let value = effort.currentValue {
+            rememberEffort(value)
+        }
         var booleans: [String: Bool] = [:]
         for option in options {
             if let value = option.booleanValue { booleans[option.id] = value }
@@ -1870,6 +1942,35 @@ final class AcpConversation: ObservableObject {
             return
         }
         UserDefaults.standard.set(id, forKey: key)
+    }
+
+    /// The remembered reasoning-effort value is a per-AGENT preference: every
+    /// chat of the same agent shares it, and a new session starts from it.
+    static func persistedEffortDefaultsKeys(for agentID: String) -> [String] {
+        ["agentEffortLevel.\(agentID)"]
+    }
+
+    static func loadPersistedEffortValue(
+        for agentID: String,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        guard let key = persistedEffortDefaultsKeys(for: agentID).first,
+              let value = defaults.string(forKey: key),
+              !value.isEmpty, value.utf8.count <= 256 else { return nil }
+        return value
+    }
+
+    /// Remember (or forget, for an agent-less construction) the effort value
+    /// this agent runs under.
+    private func rememberEffort(_ value: String?) {
+        rememberedEffortValue = value
+        guard transcriptAgentID != Self.unkeyedAgentID,
+              let key = Self.persistedEffortDefaultsKeys(for: transcriptAgentID).first else { return }
+        guard let value, !value.isEmpty, value.utf8.count <= 256 else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        UserDefaults.standard.set(value, forKey: key)
     }
 
     static func loadPersistedBooleanConfigValues(

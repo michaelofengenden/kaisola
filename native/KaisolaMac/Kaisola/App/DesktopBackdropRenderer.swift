@@ -1241,8 +1241,26 @@ extension DesktopBackdropRenderer {
     /// proportionally larger against the cut chroma and the hue-invariance
     /// correction stops accounting for it. Texture is untouched — the blur
     /// and local-contrast constants do not move.
-    static let desktopChromaShare: Double = 0.118
-    static let darkDesktopChromaShare: Double = 0.166
+    ///
+    /// 2026-08-28 reverses that step — "make the live tint much more
+    /// lively/active" — and the same four constants move back UP together by
+    /// the same factor: shares 0.118 → 0.162 and 0.166 → 0.228,
+    /// `okSaturationCeiling` 0.20 → 0.24, `GlassWarmth` 0.029 → 0.04. These
+    /// are exactly the round-8 receipted values (the ones "chosen so the
+    /// average colourfulness over the hue family is what the shipped pipeline
+    /// already delivered"), so every measurement above still describes them.
+    /// Raising the shares re-verified the bound the halving attempt broke:
+    /// `testGlassIsTheSameMaterialWhateverHueTheWallpaperIs` holds its dark
+    /// surface spread inside 1.12 (amber removed, 1.09) at these values, and
+    /// the drift `toneSolveIterations` guards against moves the SAFE way here
+    /// — the saturation fixed point converges faster at higher targets, not
+    /// slower. The worst-patch contrast floors are chroma-blind by
+    /// construction (the solve re-settles offset and gain after saturation
+    /// moves) and stay green. Texture, veils and the light lift-only
+    /// luminance behaviour do not move: liveliness is bought with chroma
+    /// alone.
+    static let desktopChromaShare: Double = 0.162
+    static let darkDesktopChromaShare: Double = 0.228
 
     static func desktopChromaShare(isDark: Bool) -> Double {
         isDark ? darkDesktopChromaShare : desktopChromaShare
@@ -1311,7 +1329,14 @@ extension DesktopBackdropRenderer {
         return weighted / weight
     }
 
-    static let okSaturationCeiling: Double = 0.20
+    /// 0.24 again (2026-08-28): restored with the chroma re-raise, having been
+    /// cut to 0.20 in the same 2026-08-04 step as the shares. The ceiling is
+    /// what `GlassColour.vivid` actually receives on a strongly coloured
+    /// desktop (1.8 × the dark share saturates it), so leaving it cut would
+    /// have silently capped the very step the shares took. 0.24 is the
+    /// round-8 receipted value; the 27-combination legibility sweep
+    /// (`testEveryGlassSettingCombinationStaysLegible`) bounds it.
+    static let okSaturationCeiling: Double = 0.24
     /// And a ceiling on the filter input itself, for the same reason from the
     /// other side.
     static let toneSaturationCeiling: Double = 3.0
@@ -1523,6 +1548,19 @@ struct DesktopTintComponents: Equatable, Sendable {
     let red: Double
     let green: Double
     let blue: Double
+
+    /// Rec. 709 luma of the sampled tint — the live path's only brightness
+    /// signal about the desktop. `DesktopTintSampler.ceilings` clamps every
+    /// channel at 0.91, so this saturates there for genuinely white desktops;
+    /// `LightGlassFrost.liveLiftRamp` is solved against that clamp.
+    var luminance: Double { red * 0.2126 + green * 0.7152 + blue * 0.0722 }
+
+    /// Max minus min channel: zero for any grey (including the fallback and a
+    /// ceiling-clamped white), and the sampler's 0.70 chroma retention already
+    /// applied — `LightGlassFrost.liveLiftChromaGate` is stated post-retention.
+    var chromaSpread: Double {
+        max(red, max(green, blue)) - min(red, min(green, blue))
+    }
 }
 
 enum DesktopTintSampler {

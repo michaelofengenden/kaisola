@@ -2090,18 +2090,129 @@ final class NativePreviewSettingsTests: XCTestCase {
         }
     }
 
-    /// The window ground is material in every theme, the way Safari's is: no
-    /// theme's ground is fully opaque, and the three stay strictly ordered —
-    /// Glass shows the most desktop, Tinted gives up a fifth, Solid a tenth.
-    func testEveryThemeSitsOnTheSameMaterialGround() {
+    /// Glass shows the most desktop, Tinted gives up a fifth and stays
+    /// material (it is the living theme), and Solid is the plate again —
+    /// Michael, 2026-08-28, fourth round of the grey report: "the
+    /// background/canvas of the app should always be either white or glass
+    /// (never gray)." The tenth of behind-window material meant Solid's white
+    /// ground was white only when the desktop behind the window happened to
+    /// be. The ordering still holds; Solid's end of it is now exactly 1.
+    func testSolidIsAPlateAndTheLivingThemesStayMaterial() {
         for isDark in [false, true] {
             let glass = OpaqueThemeGround.coverage(theme: .glass, isDark: isDark)
             let tinted = OpaqueThemeGround.coverage(theme: .tinted, isDark: isDark)
             let solid = OpaqueThemeGround.coverage(theme: .system, isDark: isDark)
             XCTAssertLessThan(glass, tinted, "isDark \(isDark): the themes lost their ordering")
             XCTAssertLessThan(tinted, solid, "isDark \(isDark): the themes lost their ordering")
-            XCTAssertLessThan(solid, 1.0, "isDark \(isDark): Solid went back to a flat plate")
+            XCTAssertEqual(
+                solid,
+                1.0,
+                "isDark \(isDark): Solid regained a material share and can read grey again"
+            )
+            // The full plate is full at every corner: the gradient's ±spread
+            // collapses at coverage 1 instead of clamping a leak open (light's
+            // bottom corner and dark's top corner both used to open 0.04).
+            let plate = GlassBackdropWash.opaqueGround(theme: .system, isDark: isDark)
+            XCTAssertEqual(plate.topOpacity, 1, "isDark \(isDark)")
+            XCTAssertEqual(plate.baseOpacity, 1, "isDark \(isDark)")
+            XCTAssertEqual(plate.bottomOpacity, 1, "isDark \(isDark)")
+            // Tinted keeps its light-from-above spread — the collapse is a
+            // property of a full plate, not of the opaque grounds generally.
+            let living = GlassBackdropWash.opaqueGround(theme: .tinted, isDark: isDark)
+            XCTAssertNotEqual(
+                living.topOpacity,
+                living.bottomOpacity,
+                "isDark \(isDark): Tinted's ground went flat"
+            )
         }
+    }
+
+    /// The live path's white floor: a white-ish desktop lands the glass
+    /// white-led, a colourful one keeps its hue and gets no lift, a dark one
+    /// gets nothing, and the grey no-desktop fallback gets neither the lift
+    /// nor the lively tint. One chroma constant feeds both shares, so the
+    /// two treatments are complementary by construction.
+    func testLiveWhiteLiftLandsWhiteOnWhiteishDesktopsOnly() {
+        // A genuinely white desktop samples at the sampler's 0.91 ceiling.
+        let white = DesktopTintComponents(red: 0.91, green: 0.91, blue: 0.91)
+        XCTAssertEqual(LightGlassFrost.liveTintChromaShare(white), 0)
+        XCTAssertEqual(
+            LightGlassFrost.liveWhiteLift(
+                ceiling: LightGlassFrost.liveLiftCoverage.rail,
+                tint: white
+            ),
+            LightGlassFrost.liveLiftCoverage.rail,
+            accuracy: 1e-9,
+            "a white desktop must reach the full lift"
+        )
+
+        // A clearly tinted desktop: full lively tint, zero lift.
+        let colorful = DesktopTintComponents(red: 0.35, green: 0.62, blue: 0.30)
+        XCTAssertEqual(LightGlassFrost.liveTintChromaShare(colorful), 1)
+        XCTAssertEqual(LightGlassFrost.liveWhiteLift(ceiling: 1, tint: colorful), 0)
+
+        // The 0.42 grey fallback — Kaisola knows nothing about the desktop —
+        // must invent neither white nor grey: below the ramp AND achromatic.
+        let fallback = DesktopTintSampler.fallback
+        XCTAssertEqual(LightGlassFrost.liveWhiteLift(ceiling: 1, tint: fallback), 0)
+        XCTAssertEqual(LightGlassFrost.liveTintChromaShare(fallback), 0)
+
+        // An off-white desktop takes a partial lift, and brightness moves it
+        // monotonically at fixed chroma.
+        let warmWhite = DesktopTintComponents(red: 0.88, green: 0.86, blue: 0.83)
+        let partial = LightGlassFrost.liveWhiteLift(ceiling: 1, tint: warmWhite)
+        XCTAssertGreaterThan(partial, 0)
+        XCTAssertLessThan(partial, 1)
+        let dimmer = DesktopTintComponents(red: 0.80, green: 0.80, blue: 0.80)
+        let brighter = DesktopTintComponents(red: 0.88, green: 0.88, blue: 0.88)
+        XCTAssertLessThan(
+            LightGlassFrost.liveWhiteLift(ceiling: 1, tint: dimmer),
+            LightGlassFrost.liveWhiteLift(ceiling: 1, tint: brighter)
+        )
+    }
+
+    /// The lift ceilings are solved so a white desktop through Clear live
+    /// glass reads white-led on both surfaces — the same neighbourhood the
+    /// painted source bakes for a white wallpaper — against the declared
+    /// conservative material bound. The unlifted rail figure is kept as the
+    /// measurement of the defect this floor closes.
+    func testLiveLiftCeilingsLandWhiteLedThroughClearGlass() {
+        let white = DesktopTintComponents(red: 0.91, green: 0.91, blue: 0.91)
+        let clearWorkspace = GlassBackdropWash.workspace(isDark: false, clarity: .clear)
+        let clearRail = GlassBackdropWash.sidebar(isDark: false, clarity: .clear)
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.modeledLiveLuminance(
+                veil: clearWorkspace,
+                carrier: LightGlassFrost.carrierWhiteCoverage,
+                lift: LightGlassFrost.liveWhiteLift(
+                    ceiling: LightGlassFrost.liveLiftCoverage.canvas,
+                    tint: white
+                )
+            ),
+            0.95,
+            "the canvas stops short of white over a white desktop"
+        )
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.modeledLiveLuminance(
+                veil: clearRail,
+                carrier: LightGlassFrost.railCarrierWhiteCoverage,
+                lift: LightGlassFrost.liveWhiteLift(
+                    ceiling: LightGlassFrost.liveLiftCoverage.rail,
+                    tint: white
+                )
+            ),
+            0.95,
+            "the rails stop short of white over a white desktop"
+        )
+        XCTAssertLessThan(
+            LightGlassFrost.modeledLiveLuminance(
+                veil: clearRail,
+                carrier: LightGlassFrost.railCarrierWhiteCoverage,
+                lift: 0
+            ),
+            0.92,
+            "the unlifted rail no longer demonstrates the grey being fixed"
+        )
     }
 
     /// The opaque themes keep the colour they always had — light #FFFFFF,
@@ -5000,16 +5111,30 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light keeps the live material's chroma and uses only the single
-        // white veil to frost it. No second carrier consumes the
-        // transmission; the white-rail pass moved the pin from 0.70 to 0.54,
-        // still a majority share for the desktop.
-        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
-        let lightAfterCarrier = transmission(
+        // Light gained back a smaller tint than dark's in the 2026-08-28
+        // lively-tint round ("make the live tint much more lively/active").
+        // The white-rail pass had taken it to exactly zero; 0.12 is the
+        // deliberate new value, junior to dark's 0.15 so the white-rail
+        // hierarchy holds. Both equalities below are pins on deliberate
+        // values, not floors.
+        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0.12, accuracy: 0.0001)
+        XCTAssertLessThan(
+            SidebarBackdropView.liveTint.light,
+            SidebarBackdropView.liveTint.dark,
+            "the light live tint outgrew dark's — the white-rail hierarchy inverted"
+        )
+        let lightVeil = GlassBackdropWash.sidebar(isDark: false).baseOpacity
+        // The veil is untouched: 0.54 of whatever sits beneath it still
+        // arrives, exactly the pre-change figure. Liveliness is bought UNDER
+        // the veil — twelve percent of the underlay is now the desktop's own
+        // sampled hue laid over the material — never by thinning or
+        // thickening the veil itself.
+        XCTAssertEqual(1 - lightVeil, 0.54, accuracy: 0.0001)
+        let lightMaterialShare = transmission(
             tint: SidebarBackdropView.liveTint.light,
-            veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
+            veil: lightVeil
         ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
-        XCTAssertEqual(lightAfterCarrier, 0.54, accuracy: 0.0001)
+        XCTAssertEqual(lightMaterialShare, 0.4752, accuracy: 0.0001)
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -5348,11 +5473,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         // floor exists to catch a layer scaled to nothing, not to pin the
         // target — but the underlay's ~0.87 ceiling is where the two collide,
         // so that ceiling is asserted here, next to the floor it protects.
+        // At the 2026-08-28 re-raise (reference 0.04) the dark amber sits at
+        // 0.00565 — the floor has real margin again; at the 0.029 era it was
+        // 0.00409 and one more white-rail round would have collided.
         XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.004)
         XCTAssertLessThanOrEqual(
             LightGlassFrost.backdropLuminance,
             0.87,
-            "past 0.87 the dark amber (0.029 × 0.12 / backdropLuminance) falls through its 0.004 floor — whiten the rails another way"
+            "past 0.87 the dark amber (0.04 × 0.12 / backdropLuminance) approaches its 0.004 floor — whiten the rails another way"
         )
         XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity)
     }
@@ -5478,7 +5606,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         // the neutrality invariant exists to prevent. Stated on the reference
         // coverage from which the dark one is derived; see
         // `testGlassWarmthCoverageTracksTheSurfaceItLandsOn`.
-        XCTAssertEqual(GlassWarmth.opacity, 0.029, accuracy: 0.0001)
+        // 0.04 → 0.029 with the 2026-08-04 chroma cut, back to 0.04 with the
+        // 2026-08-28 lively-tint re-raise: the amber scales WITH
+        // `desktopChromaShare` in both directions, because the hue-invariance
+        // correction depends on their ratio. The < 0.08 ceiling and > 0.02
+        // floor do not move.
+        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
         XCTAssertLessThan(GlassWarmth.opacity, 0.08)
         XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }

@@ -196,10 +196,55 @@ struct KeychainAuthSecurityOperations: @unchecked Sendable {
     )
 }
 
+/// Once-per-install bookkeeping for the legacy-keychain protection refresh.
+///
+/// A legacy (file-based) keychain item keeps the access control recorded when
+/// it was CREATED, forever: `SecItemUpdate` rewrites the value but never the
+/// creator's ACL or partition. Items created by pre-Developer-ID builds are
+/// therefore keyed to one exact binary (a cdhash), and every Sparkle update
+/// re-triggers the "Kaisola wants to access your saved sign-in" prompt — the
+/// lived "sign in again after every update". The refresh deletes and
+/// re-creates the item once, so the CURRENT app — whose Developer ID
+/// designated requirement is stable across updates — becomes the recorded
+/// creator and later updates read silently. The marker keeps that a one-time
+/// migration instead of a delete/re-add on every launch.
+struct KeychainAuthLegacyRefreshMarker: @unchecked Sendable {
+    let needsRefresh: (String) -> Bool
+    let markRefreshed: (String) -> Void
+
+    static func defaultsKey(service: String, key: String) -> String {
+        "firebase-auth.legacy-acl-refresh-v1.\(service).\(key)"
+    }
+
+    static func userDefaults(
+        service: String,
+        defaults: UserDefaults = .standard
+    ) -> KeychainAuthLegacyRefreshMarker {
+        KeychainAuthLegacyRefreshMarker(
+            needsRefresh: { key in
+                !defaults.bool(forKey: defaultsKey(service: service, key: key))
+            },
+            markRefreshed: { key in
+                defaults.set(true, forKey: defaultsKey(service: service, key: key))
+            }
+        )
+    }
+
+    /// No refresh ever — for stores whose tests pin unrelated invariants.
+    static let disabled = KeychainAuthLegacyRefreshMarker(
+        needsRefresh: { _ in false },
+        markRefreshed: { _ in }
+    )
+}
+
 final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     private let service: String
     private let interactionPolicy: KeychainAuthInteractionPolicy
     private let securityOperations: KeychainAuthSecurityOperations
+    private let legacyRefreshMarker: KeychainAuthLegacyRefreshMarker
+    /// Reentrancy latch: the refresh's failure fallback goes back through the
+    /// ordinary write path, which must not restart the refresh it came from.
+    private var legacyRefreshInFlight = false
     /// The data-protection keychain needs an application-identifier
     /// entitlement on macOS; a build signed without one gets
     /// errSecMissingEntitlement on EVERY operation — which shipped as
@@ -236,11 +281,14 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     init(
         service: String = KeychainAuthSecureStore.defaultService(),
         interactionPolicy: KeychainAuthInteractionPolicy = .allowUserInteraction,
-        securityOperations: KeychainAuthSecurityOperations = .live
+        securityOperations: KeychainAuthSecurityOperations = .live,
+        legacyRefreshMarker: KeychainAuthLegacyRefreshMarker? = nil
     ) {
         self.service = service
         self.interactionPolicy = interactionPolicy
         self.securityOperations = securityOperations
+        self.legacyRefreshMarker = legacyRefreshMarker
+            ?? .userDefaults(service: service)
     }
 
     func data(for key: String) throws -> Data? {
@@ -268,6 +316,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             guard status == errSecSuccess, let data = result as? Data else {
                 throw KeychainStoreError(status: status)
             }
+            if mode == .legacy { refreshLegacyItemIfNeeded(for: key, data: data) }
             return data
         }
     }
@@ -320,7 +369,14 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
                 query as CFDictionary,
                 attributes as CFDictionary
             )
-            if updateStatus == errSecSuccess { return mode }
+            if updateStatus == errSecSuccess {
+                // The update rewrote the VALUE but kept the item's original
+                // creator ACL/partition. If that creator was a pre-Developer-ID
+                // binary, refresh the item's protection once so this and every
+                // later build reads it silently.
+                if mode == .legacy { refreshLegacyItemIfNeeded(for: key, data: data) }
+                return mode
+            }
             if updateStatus == errSecMissingEntitlement {
                 guard let retryMode = fallbackState.retryMode(
                     afterMissingEntitlementIn: mode
@@ -349,7 +405,42 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             guard addStatus == errSecSuccess else {
                 throw KeychainStoreError(status: addStatus)
             }
+            // A fresh legacy add is already owned by the current app's stable
+            // signed identity; nothing is left to refresh for this key.
+            if mode == .legacy { legacyRefreshMarker.markRefreshed(key) }
             return mode
+        }
+    }
+
+    /// One-time protection refresh for a legacy item this process can read.
+    ///
+    /// `SecItemUpdate` can never fix a stale ACL — only re-creation records the
+    /// current app as the item's creator. The value is held in memory across
+    /// the delete + add, and the marker is set only when the re-add provably
+    /// landed, so a failure leaves the next launch to retry rather than losing
+    /// the only copy of the credential. Best-effort by design: the caller's
+    /// read or write has already succeeded and must not fail retroactively.
+    /// Headless stores (`failIfInteractionRequired`) never mutate items they
+    /// were only asked to observe.
+    private func refreshLegacyItemIfNeeded(for key: String, data: Data) {
+        guard interactionPolicy == .allowUserInteraction,
+              legacyRefreshMarker.needsRefresh(key),
+              !legacyRefreshInFlight else { return }
+        legacyRefreshInFlight = true
+        defer { legacyRefreshInFlight = false }
+        let deleteStatus = securityOperations.delete(legacyQuery(for: key) as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else { return }
+        var addQuery = legacyQuery(for: key)
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let addStatus = securityOperations.add(addQuery as CFDictionary, nil)
+        if addStatus == errSecSuccess {
+            legacyRefreshMarker.markRefreshed(key)
+        } else {
+            // Put the credential back through the ordinary write path so the
+            // deleted original cannot become a silent sign-out; the marker
+            // stays unset so a later launch retries the refresh.
+            try? set(data, for: key)
         }
     }
 

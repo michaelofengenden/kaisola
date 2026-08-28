@@ -5177,11 +5177,14 @@ enum NativeWorkspaceChrome {
     /// rail, and the density passes had walked the default back below legible;
     /// 248 → 290 in v0.1.125, again by request, matching the width Michael
     /// pins the Files rail to; 290 → 245 on 2026-08-26, again by request —
-    /// the double-click reset should land "1-2cm less wide" than it did.
+    /// the double-click reset should land "1-2cm less wide" than it did;
+    /// 245 → 196 on 2026-08-28, once more by request, "at least 20% less
+    /// wide" — 196 is exactly that, and it is also the Files rail's own
+    /// default, so a window whose two rails are both reset is symmetric.
     /// Users who dragged their rail keep their width — a drag persists
     /// (`NativePreviewSettings.projectRailWidth`), so this constant sizes
     /// fresh windows and the divider's double-click reset.
-    static let projectSidebarIdealWidth: CGFloat = 245
+    static let projectSidebarIdealWidth: CGFloat = 196
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

@@ -358,6 +358,14 @@ enum QuietRailMetrics {
     /// project's mark ends — the nesting reads, it is simply no longer two full
     /// slots. `QuietRowBudget` holds the arithmetic and a test holds the
     /// character count.
+    ///
+    /// 2026-08-28 narrows the rail much harder, 245 → 196 by request. The
+    /// indent deliberately does NOT absorb it this time: buying the title
+    /// lane back would cost the 28pt step its second mark-width, and the
+    /// two-slot hierarchy is a design contract
+    /// (`testSessionsSitClearlyDeeperThanTheirProjectRow`) rather than spare
+    /// change. The title lane takes the narrowing instead, and the character
+    /// floors below are re-derived from what the 196pt lane actually draws.
     static let sessionIndent: CGFloat = 36
     /// The project lane's cadence: compact projects, the active header, and
     /// the Add Project footer all measure 32pt.
@@ -530,7 +538,14 @@ enum QuietRowBudget {
     /// session-lane densening (title 13 → 12, mark 16 → 14, gap 8 → 7): the
     /// smaller font and wider lane draw ~31 characters at rest, and 18 sat
     /// only three above the half-lane floor.
-    static let ambiguousTitleCharacters = 20
+    ///
+    /// 20 → 12 with the 2026-08-28 narrowing (245 → 196, by request). This
+    /// constant tracks the lane in both directions: the 196pt lane is 92.5pt
+    /// and draws 14 characters of a real title, so a 20-character window was
+    /// calling pairs identical that the rail visibly tells apart. 12 sits
+    /// under the measurement, the way it did at 210pt, and stays above the
+    /// half-lane floor that stops it flagging every shared word.
+    static let ambiguousTitleCharacters = 12
 
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;

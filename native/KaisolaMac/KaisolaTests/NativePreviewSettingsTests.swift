@@ -6741,7 +6741,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 196)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -7227,9 +7227,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
         // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125, 290 → 245 on
-        // 2026-08-26: the double-click reset should land "1-2cm less wide",
-        // by request.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        // 2026-08-26, 245 → 196 on 2026-08-28: each by request, the last
+        // one "at least 20% less wide" (245 × 0.8 = 196 exactly).
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 196)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

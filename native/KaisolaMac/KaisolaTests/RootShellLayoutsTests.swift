@@ -299,6 +299,39 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.shiftedOrigins(standardMinXs: []), [])
     }
 
+    func testTrafficLightsStayEvenlySpacedThroughAPartialRelayout() {
+        // v0.1.147's uneven red button. AppKit returns the buttons to stock one
+        // at a time, so a frame-change notification can land with close back at
+        // 7 while minimize and zoom still hold 40 and 60. The delta form spread
+        // that read out unevenly:
+        let skewed = WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [7, 40, 60])
+        XCTAssertEqual(skewed, [20, 53, 73])
+        XCTAssertNotEqual(
+            skewed[1] - skewed[0],
+            skewed[2] - skewed[1],
+            "this is the reported defect: the gaps disagree"
+        )
+
+        // Rebuilding from the remembered stock gaps cannot express that, no
+        // matter which partial state the read caught.
+        let stockGaps = WorkspaceTrafficLights.gaps(between: [7, 27, 47])
+        XCTAssertEqual(stockGaps, [20, 20])
+        XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: stockGaps), [20, 40, 60])
+
+        for partial in [[7, 40, 60], [20, 27, 47], [7, 27, 60], [20, 40, 60]] {
+            let repaired = WorkspaceTrafficLights.origins(gaps: stockGaps)
+            XCTAssertEqual(
+                repaired,
+                [20, 40, 60],
+                "a read of \(partial) must still land the standard gaps"
+            )
+            XCTAssertEqual(repaired[1] - repaired[0], repaired[2] - repaired[1])
+        }
+
+        XCTAssertEqual(WorkspaceTrafficLights.gaps(between: [7]), [])
+        XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: []), [20])
+    }
+
     // MARK: - Retained shell behaviors
 
     func testCollapsedSidebarMovesSessionIdentityPastWindowControls() {

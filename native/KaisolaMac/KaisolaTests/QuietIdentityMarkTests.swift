@@ -887,7 +887,8 @@ final class QuietIdentityMarkTests: XCTestCase {
             timeLabelWidth: timeWidth,
             showsReveal: false
         )
-        XCTAssertGreaterThan(available, 100, "the title lane lost its share of the row again")
+        // 100 → 90 with the 2026-08-28 narrowing: 196pt draws a 92.5pt lane.
+        XCTAssertGreaterThan(available, 90, "the title lane lost its share of the row again")
 
         // Stated the way the complaint was: how much of a real title is legible.
         let sample = "Audit Kaisola Sidebar parity"
@@ -897,9 +898,15 @@ final class QuietIdentityMarkTests: XCTestCase {
             let width = (candidate as NSString).size(withAttributes: [.font: titleFont]).width
             if width <= available { visible = count } else { break }
         }
+        // 20 → 14 with the 2026-08-28 narrowing (245 → 196, by request).
+        // This is the price of the narrower rail, stated rather than hidden:
+        // "Audit Kaisola Sidebar parity" reads as "Audit Kaisola…" instead of
+        // "Audit Kaisola Sideba…". The floor stays a floor — it is what stops
+        // a future density pass spending the lane again — it is simply set at
+        // what the requested width actually draws.
         XCTAssertGreaterThanOrEqual(
             visible,
-            20,
+            14,
             "only \(visible) characters survive at "
                 + "\(NativeWorkspaceChrome.projectSidebarIdealWidth)pt"
         )
@@ -911,7 +918,8 @@ final class QuietIdentityMarkTests: XCTestCase {
                 timeLabelWidth: timeWidth,
                 showsReveal: true
             ),
-            80
+            // 80 → 68 with the narrowing; the reveal lane measures 71.5pt.
+            68
         )
     }
 
@@ -1047,19 +1055,24 @@ final class QuietIdentityMarkTests: XCTestCase {
         // The measured v1.1.4 lane, from the bug report this budget was built
         // for. Not derived — recorded.
         let shippedInV114: CGFloat = 56
+        // 1.75× → 1.6×: the 196pt lane is 92.5pt, still well clear of the
+        // 56pt that started this budget, but the 2026-08-28 narrowing spends
+        // part of the margin v0.1.125 had banked. What this still guards is
+        // the original defect — the indent quietly eating the title lane —
+        // which is why it is a ratio against the recorded bug and not a
+        // literal that gets re-typed at every width.
         XCTAssertGreaterThan(
             now,
-            shippedInV114 * 1.75,
+            shippedInV114 * 1.6,
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the resting width sits at 245 as of 2026-08-26, by request —
-        // the double-click reset lands "1-2cm less wide" than v0.1.125's
-        // 290. The density era's "under every width since v1.1.5" pin is
-        // retired with the density default itself; what this release still
-        // owes is that the rail stays inside its own bounds and the title
-        // lane it buys is real.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        // …and the resting width sits at 196 as of 2026-08-28, by request —
+        // "at least 20% less wide" than the 245 that 2026-08-26 set, which is
+        // 196 on the nose and matches the Files rail's own default. What this
+        // release still owes is that the rail stays inside its own bounds and
+        // the title lane it buys is real.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 196)
     }
 
     // MARK: - Header "+" containment

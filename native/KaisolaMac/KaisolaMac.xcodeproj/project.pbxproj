@@ -325,6 +325,7 @@
 		EB574B84578D2F2C9608D94E /* CompanionProjectionBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53F710A393B9F0B30F9D2F91 /* CompanionProjectionBuilderTests.swift */; };
 		EBD24B42377F41E7D46E8E94 /* AppModelTerminalRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */; };
 		EC2DA4A5EEE7309740A3F8FF /* CompanionCommandRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A6971FB4400D5FB64CC8D8C /* CompanionCommandRouter.swift */; };
+		EC7545E268F119BA153A9C2E /* TintFlowField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 487523F1CFE9C55C12610154 /* TintFlowField.swift */; };
 		EE3A241AFCCC6C58D0648592 /* TerminalDocumentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */; };
 		EF5C4926C6A1A69767C3ECB2 /* BrowserCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D651B2D78C5F94B243E1DC2 /* BrowserCardView.swift */; };
 		F17344ADF8D1552B4E8CA59B /* TerminalAccessibilityAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1F794A610279AFCEC8CB0B0 /* TerminalAccessibilityAdapter.swift */; };
@@ -471,6 +472,7 @@
 		47544E136A1B0FEEC9D16378 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		481C565423F2C82B8F330468 /* CompanionDeviceRosterStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionDeviceRosterStore.swift; sourceTree = "<group>"; };
 		4847C0EA490C12B1F64A4B5C /* AccountSignInController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInController.swift; sourceTree = "<group>"; };
+		487523F1CFE9C55C12610154 /* TintFlowField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TintFlowField.swift; sourceTree = "<group>"; };
 		48B188286E91EA94C628221F /* TerminalFileLinkResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalFileLinkResolver.swift; sourceTree = "<group>"; };
 		496E90C9073FF30527C9C128 /* ApiKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeyStore.swift; sourceTree = "<group>"; };
 		4A75B9CDDB712B8E40FD295E /* AppModelBookkeepingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeepingTests.swift; sourceTree = "<group>"; };
@@ -1036,6 +1038,7 @@
 				F07359E5FCD9B5DF4E23DE50 /* PlanUsageSnapshotStore.swift */,
 				FB62A4685780F0E38D2120A0 /* ProjectAccountStore.swift */,
 				FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */,
+				487523F1CFE9C55C12610154 /* TintFlowField.swift */,
 				81A1444F9C5905630D1DC018 /* ToastCenter.swift */,
 				C88BF5404563C22955EE7B51 /* UsageCenter.swift */,
 				83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */,
@@ -1611,6 +1614,7 @@
 				08170963E8934AB8ED6F50AB /* TerminalSurfaceCache.swift in Sources */,
 				50E4AD9DC49C82B758116FCF /* TerminalTheme.swift in Sources */,
 				111953CC1CF47CB697278109 /* TerminalTranscriptView.swift in Sources */,
+				EC7545E268F119BA153A9C2E /* TintFlowField.swift in Sources */,
 				B9E42D4C5DC974E0AAFA2D99 /* ToastCenter.swift in Sources */,
 				209D362D9279CD14816E2F5E /* ToastOverlayView.swift in Sources */,
 				360C9587987ABD66B7ECFA59 /* UnifiedSessionCardState.swift in Sources */,

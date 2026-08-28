@@ -681,329 +681,215 @@ enum TintFlowComposition {
             max(0, coverageScale),
             heaviest > 0 ? maximumDarkStopCoverage / heaviest : 0
         )
-        let anchor: TintRGB
-        let companion: TintRGB
-        if let ends = palette.darkEnds() {
-            anchor = ends.anchor
-            companion = ends.companion
-        } else {
-            let revalued = DesktopTintSampler.revalued(
-                tint,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: true)
-            )
-            anchor = TintRGB(red: revalued.red, green: revalued.green, blue: revalued.blue)
-            let rotated = TintFlowMotion.companion(
-                red: revalued.red,
-                green: revalued.green,
-                blue: revalued.blue
-            )
-            companion = TintRGB(red: rotated.red, green: rotated.green, blue: rotated.blue)
-        }
+        let ends = darkEndColours(palette: palette, tint: tint)
         return [
             TintFlowStop(
-                red: anchor.red,
-                green: anchor.green,
-                blue: anchor.blue,
+                red: ends.anchor.red,
+                green: ends.anchor.green,
+                blue: ends.anchor.blue,
                 opacity: min(1, coverage.top * scale),
                 location: 0
             ),
             TintFlowStop(
-                red: companion.red,
-                green: companion.green,
-                blue: companion.blue,
+                red: ends.companion.red,
+                green: ends.companion.green,
+                blue: ends.companion.blue,
                 opacity: min(1, coverage.bottom * scale),
                 location: 1
             ),
         ]
     }
-}
 
-/// The Core Animation host for the flowing tint.
-///
-/// A `CAGradientLayer` whose endpoints drift on an autoreversing render-server
-/// animation. The app's only work is configuring the layer; while the surface
-/// sits on screen the process schedules nothing, which is what lets a
-/// permanently-moving backdrop coexist with the painted-still energy rules.
-struct FlowingTintGradientView: NSViewRepresentable {
-    let stops: [TintFlowStop]
-    let startPoint: CGPoint
-    let endPoint: CGPoint
-    let animated: Bool
-    var breathing: Bool = false
-    var breathDepth: Double = 1
-
-    func makeNSView(context: Context) -> FlowingTintGradientHostView {
-        let view = FlowingTintGradientHostView()
-        view.apply(
-            stops: stops,
-            startPoint: startPoint,
-            endPoint: endPoint,
-            animated: animated,
-            breathing: breathing,
-            breathDepth: breathDepth
+    /// The dark sweep's two source colours, shared with the flow layers so
+    /// the current and the ripple are always siblings of the sweep they
+    /// cross, never a second accent family.
+    static func darkEndColours(
+        palette: TintPalette,
+        tint: DesktopTintComponents
+    ) -> (anchor: TintRGB, companion: TintRGB) {
+        if let ends = palette.darkEnds() { return ends }
+        let revalued = DesktopTintSampler.revalued(
+            tint,
+            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
         )
-        return view
-    }
-
-    func updateNSView(_ view: FlowingTintGradientHostView, context: Context) {
-        view.apply(
-            stops: stops,
-            startPoint: startPoint,
-            endPoint: endPoint,
-            animated: animated,
-            breathing: breathing,
-            breathDepth: breathDepth
+        let anchor = TintRGB(red: revalued.red, green: revalued.green, blue: revalued.blue)
+        let rotated = TintFlowMotion.companion(
+            red: revalued.red,
+            green: revalued.green,
+            blue: revalued.blue
         )
-    }
-}
-
-final class FlowingTintGradientHostView: NSView {
-    private let gradient = CAGradientLayer()
-    private var appliedStops: [TintFlowStop] = []
-    private var appliedStart: CGPoint = .zero
-    private var appliedEnd: CGPoint = .zero
-    private var appliedAnimated: Bool?
-    private var appliedBreathing: Bool?
-    private var appliedBreathDepth: Double?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        gradient.type = .axial
-        layer?.addSublayer(gradient)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        gradient.frame = bounds
-        CATransaction.commit()
-    }
-
-    /// Re-arms the drift when the view lands in a window. An animation added
-    /// while the layer was windowless is silently dropped by AppKit, and a
-    /// Space switch can strip it the same way; re-applying on attach is what
-    /// keeps a long-lived sidebar flowing after either. The same attach point
-    /// follows the window's occlusion, so a fully covered or minimized Tinted
-    /// window spends nothing on its drift. Selector-based observation so the
-    /// registration dies with the view instead of needing a deinit.
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        NotificationCenter.default.removeObserver(
-            self,
-            name: NSWindow.didChangeOcclusionStateNotification,
-            object: nil
-        )
-        if let window {
-            windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowOcclusionStateDidChange(_:)),
-                name: NSWindow.didChangeOcclusionStateNotification,
-                object: window
-            )
-        }
-        guard window != nil, appliedAnimated == true || appliedBreathing == true else { return }
-        let restoreBreathing = appliedBreathing == true
-        let restoreBreathDepth = appliedBreathDepth ?? 1
-        appliedAnimated = nil
-        appliedBreathing = nil
-        appliedBreathDepth = nil
-        apply(
-            stops: appliedStops,
-            startPoint: appliedStart,
-            endPoint: appliedEnd,
-            animated: true,
-            breathing: restoreBreathing,
-            breathDepth: restoreBreathDepth
+        return (
+            anchor: anchor,
+            companion: TintRGB(red: rotated.red, green: rotated.green, blue: rotated.blue)
         )
     }
 
-    func apply(
-        stops: [TintFlowStop],
-        startPoint: CGPoint,
-        endPoint: CGPoint,
-        animated: Bool,
-        breathing: Bool = false,
-        breathDepth: Double = 1
-    ) {
-        let colorsChanged = stops != appliedStops
-        let geometryChanged = startPoint != appliedStart || endPoint != appliedEnd
-        let motionChanged = animated != appliedAnimated
-        // Depth only matters while the breath is actually running: an
-        // intensity change with the living tint off is a colour-only change,
-        // and treating it as a breathing change would restart the drift and
-        // visibly snap its phase — exactly what the fast path below protects.
-        let breathingChanged = breathing != appliedBreathing
-            || (breathing && breathDepth != appliedBreathDepth)
-        guard colorsChanged || geometryChanged || motionChanged || breathingChanged else { return }
-        appliedStops = stops
-        appliedStart = startPoint
-        appliedEnd = endPoint
-        appliedAnimated = animated
-        appliedBreathing = breathing
-        appliedBreathDepth = breathDepth
+    // MARK: - The flow layers
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        gradient.colors = stops.map(\.cgColor)
-        gradient.locations = stops.map { NSNumber(value: $0.location) }
-        gradient.startPoint = startPoint
-        gradient.endPoint = endPoint
-        gradient.frame = bounds
-        // Turning the breath off must restore the model values deterministically
-        // — both the opacity it fades and the transform its swell scales.
-        gradient.opacity = 1
-        gradient.transform = CATransform3DIdentity
-        CATransaction.commit()
+    /// Peak coverage of the cross-current band and the ripple bloom, before
+    /// the composition scale. Accents over the ground swell, deliberately
+    /// junior to its stops: the swell carries the theme's colour, the flow
+    /// layers carry its *change*.
+    static let currentCoverage = (light: 0.18, dark: 0.16)
+    static let rippleCoverage = (light: 0.13, dark: 0.13)
+    /// The ripple's mid stop: how much of the bloom's peak is left at the
+    /// shoulder before the fade to clear.
+    static let rippleShoulderShare: Double = 0.45
+    static let rippleShoulderLocation: Double = 0.55
 
-        // A colour-only change (a wallpaper rotation resampling the dark tint)
-        // updates the stops under the transaction above and leaves the drift
-        // alone: removing and re-adding it would snap the endpoints back to
-        // phase zero, visibly, every few minutes on a rotating desktop.
-        guard geometryChanged || motionChanged || breathingChanged else { return }
-        gradient.removeAnimation(forKey: Self.startAnimationKey)
-        gradient.removeAnimation(forKey: Self.endAnimationKey)
-        gradient.removeAnimation(forKey: Self.breathAnimationKey)
-        gradient.removeAnimation(forKey: Self.swellAnimationKey)
-        guard animated else { return }
-        let travel = TintFlowMotion.endpoints(start: startPoint, end: endPoint)
-        gradient.add(
-            Self.drift(
-                keyPath: "startPoint",
-                from: travel.startFrom,
-                to: travel.startTo
+    /// Every light flow colour is lifted to at least this weighted encoded
+    /// luminance before it paints. Compositing is convex per channel, so a
+    /// layer whose own luminance clears this floor can never pull the canvas
+    /// below it — which is what lets the current and the ripple stack over
+    /// the sweep at any coverage and any intensity without re-opening the
+    /// ink solve: the worst sustained patch stays the sweep's own, and that
+    /// patch is pinned against the 0.75 the light ink ladder was solved on
+    /// in `testTintFieldFlowLayersHoldTheInkStoryByConstruction`.
+    static let lightFlowLuminanceFloor: Double = 0.78
+
+    /// The dark mirror: no flow colour may exceed the dark canvas's own
+    /// modelled worst patch — the anchor's top-edge coverage of the peak
+    /// value over the near-black ground, with an achromatic sample taking
+    /// the whole peak. A layer capped under that patch can shift its hue but
+    /// can never brighten it, so the dark ink story is exactly the sweep's.
+    static var darkFlowLuminanceCeiling: Double {
+        let ground = OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: true)
+        let top = DesktopTintSampler.canvasTintCoverage(isDark: true).top
+        return ground * (1 - top) + DesktopTintSampler.canvasTintPeak(isDark: true) * top
+    }
+
+    /// The light canvas's modelled worst sustained patch at an intensity:
+    /// the heaviest sweep stop, at the deepest colour any palette can emit
+    /// (the desktop clamp box at its worst hue — every named stop is
+    /// brighter), over the modelled Tinted ground. The receipt asserts this
+    /// stays at or above the 0.75 the light ink floors were solved on.
+    static func lightModeledWorstPatch(intensity: TintIntensity) -> Double {
+        let ground = OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: false)
+        let heaviest = TintPalette.allCases
+            .compactMap(\.fixedLight)
+            .map { max($0.coolCoverage, max($0.neutralCoverage, $0.pearlCoverage)) }
+            .max() ?? 0
+        let coverage = min(1, heaviest * intensity.coverageMultiplier)
+        // The clamp box's darkest reachable colour is hue-independent in its
+        // minimum channel; its luminance bottoms out at the blue-led hue.
+        let boxWorst = (0..<360).map { degrees in
+            TintFlowMotion.weightedLuminance(TintFlowMotion.rgb(
+                hue: Double(degrees) / 360,
+                saturation: TintPalette.desktopSaturation,
+                brightness: TintPalette.desktopBrightness
+            ))
+        }.min() ?? 1
+        let namedWorst = TintPalette.allCases
+            .compactMap(\.fixedLight)
+            .flatMap { [$0.cool, $0.neutral, $0.pearl] }
+            .map(TintFlowMotion.weightedLuminance)
+            .min() ?? 1
+        let deepest = min(boxWorst, namedWorst)
+        return ground * (1 - coverage) + deepest * coverage
+    }
+
+    /// The cross-current: a broad band of the palette's settled end crossing
+    /// the sweep's diagonal — clear at both edges, the colour mid-band, so
+    /// it reads as a current moving through the field rather than a stripe
+    /// laid on it. Light lifts the colour to the flow floor; the band's
+    /// travel lives in `TintFlowMotion.currentLocations`.
+    static func lightCurrent(
+        palette: TintPalette,
+        desktop: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
+        let colour = TintFlowMotion.luminanceFloored(
+            palette.light(desktop: desktop).pearl,
+            floor: lightFlowLuminanceFloor
+        )
+        return bandStops(
+            colour: colour,
+            peak: min(1, currentCoverage.light * max(0, coverageScale))
+        )
+    }
+
+    static func darkCurrent(
+        palette: TintPalette,
+        tint: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
+        let colour = TintFlowMotion.luminanceCapped(
+            darkEndColours(palette: palette, tint: tint).companion,
+            ceiling: darkFlowLuminanceCeiling
+        )
+        return bandStops(
+            colour: colour,
+            peak: min(1, currentCoverage.dark * max(0, coverageScale))
+        )
+    }
+
+    /// The ripple: a radial bloom of the palette's leading end, full at its
+    /// centre, a soft shoulder, then clear — the fine scale of the field,
+    /// wandering on `TintFlowMotion`'s two glide periods.
+    static func lightRipple(
+        palette: TintPalette,
+        desktop: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
+        let colour = TintFlowMotion.luminanceFloored(
+            palette.light(desktop: desktop).cool,
+            floor: lightFlowLuminanceFloor
+        )
+        return bloomStops(
+            colour: colour,
+            peak: min(1, rippleCoverage.light * max(0, coverageScale))
+        )
+    }
+
+    static func darkRipple(
+        palette: TintPalette,
+        tint: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
+        let colour = TintFlowMotion.luminanceCapped(
+            darkEndColours(palette: palette, tint: tint).anchor,
+            ceiling: darkFlowLuminanceCeiling
+        )
+        return bloomStops(
+            colour: colour,
+            peak: min(1, rippleCoverage.dark * max(0, coverageScale))
+        )
+    }
+
+    /// Clear → colour → clear, the transparent ends sharing the band's own
+    /// colour so the fade is a coverage ramp, never a fade through grey.
+    private static func bandStops(colour: TintRGB, peak: Double) -> [TintFlowStop] {
+        [
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: 0, location: 0
             ),
-            forKey: Self.startAnimationKey
-        )
-        gradient.add(
-            Self.drift(
-                keyPath: "endPoint",
-                from: travel.endFrom,
-                to: travel.endTo
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: peak, location: 0.5
             ),
-            forKey: Self.endAnimationKey
-        )
-        guard breathing else { return }
-        gradient.add(Self.breath(depth: breathDepth), forKey: Self.breathAnimationKey)
-        gradient.add(Self.swell(depth: breathDepth), forKey: Self.swellAnimationKey)
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: 0, location: 1
+            ),
+        ]
     }
 
-    @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow, window == self.window else {
-            return
-        }
-        windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
-    }
-
-    /// The drift pauses whenever its window is fully occluded, the way every
-    /// other at-rest motion in the app stops when nothing can see it. Layer
-    /// speed zero freezes the render-server animation in place; restoring
-    /// speed resumes it from the same phase.
-    func windowOcclusionChanged(visible: Bool) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        gradient.speed = visible ? 1 : 0
-        CATransaction.commit()
-    }
-
-    private static let startAnimationKey = "kaisola.tint-flow.start"
-    private static let endAnimationKey = "kaisola.tint-flow.end"
-    private static let breathAnimationKey = "kaisola.tint-flow.breath"
-    private static let swellAnimationKey = "kaisola.tint-flow.swell"
-
-    /// The breath's sharper-than-`easeInEaseOut` S curve: more dwell at the
-    /// extremes, a quicker transit between them, which is what lets a shallow
-    /// change register at all without raising its depth.
-    private static var breathTiming: CAMediaTimingFunction {
-        let points = TintFlowMotion.breathTimingControlPoints
-        return CAMediaTimingFunction(
-            controlPoints: points.0, points.1, points.2, points.3
-        )
-    }
-
-    /// The opt-in breath: whole-layer opacity easing between the floor and 1.
-    /// Same render-server ownership, frame-rate cap, occlusion freeze
-    /// (`gradient.speed`), and wall-clock phase lock as the drift. `depth`
-    /// deepens the swing for the Vivid/Bold intensities; the floor can never
-    /// drop below half opacity whatever the multiplier.
-    private static func breath(depth: Double = 1) -> CABasicAnimation {
-        let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = max(0.5, 1 - TintFlowMotion.breathAmplitude * max(0, depth))
-        animation.toValue = 1
-        animation.duration = TintFlowMotion.breathPeriod
-        animation.autoreverses = true
-        animation.repeatCount = .infinity
-        animation.timingFunction = breathTiming
-        animation.isRemovedOnCompletion = false
-        animation.timeOffset = CACurrentMediaTime()
-            .truncatingRemainder(dividingBy: TintFlowMotion.breathPeriod * 2)
-        animation.preferredFrameRateRange = CAFrameRateRange(
-            minimum: 5,
-            maximum: 15,
-            preferred: 10
-        )
-        return animation
-    }
-
-    /// The breath's paired swell: the whole field scaling a few percent about
-    /// its centre on its own, longer period. The scale never goes below 1, so
-    /// the layer only ever over-covers its bounds — clipping crops overflow
-    /// rather than exposing a gap. Same discipline as the breath in every
-    /// other respect.
-    private static func swell(depth: Double = 1) -> CABasicAnimation {
-        let animation = CABasicAnimation(keyPath: "transform.scale")
-        animation.fromValue = 1.0
-        animation.toValue = 1.0 + TintFlowMotion.breathScaleAmplitude * max(0, depth)
-        animation.duration = TintFlowMotion.breathScalePeriod
-        animation.autoreverses = true
-        animation.repeatCount = .infinity
-        animation.timingFunction = breathTiming
-        animation.isRemovedOnCompletion = false
-        animation.timeOffset = CACurrentMediaTime()
-            .truncatingRemainder(dividingBy: TintFlowMotion.breathScalePeriod * 2)
-        animation.preferredFrameRateRange = CAFrameRateRange(
-            minimum: 5,
-            maximum: 15,
-            preferred: 10
-        )
-        return animation
-    }
-
-    private static func drift(
-        keyPath: String,
-        from: CGPoint,
-        to: CGPoint
-    ) -> CABasicAnimation {
-        let animation = CABasicAnimation(keyPath: keyPath)
-        animation.fromValue = NSValue(point: from)
-        animation.toValue = NSValue(point: to)
-        animation.duration = TintFlowMotion.period
-        animation.autoreverses = true
-        animation.repeatCount = .infinity
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        animation.isRemovedOnCompletion = false
-        // Every surface anchors its phase to the same wall clock, so the
-        // project rail, file rail, and canvas — nearly identical gradients —
-        // drift together instead of showing a slowly walking step at their
-        // seams. The offset wraps at one full autoreverse round trip.
-        animation.timeOffset = CACurrentMediaTime()
-            .truncatingRemainder(dividingBy: TintFlowMotion.period * 2)
-        // Motion this slow needs single-digit frame rates; an uncapped
-        // animation would hold a ProMotion display off its idle refresh for
-        // sub-pixel movement.
-        animation.preferredFrameRateRange = CAFrameRateRange(
-            minimum: 5,
-            maximum: 15,
-            preferred: 10
-        )
-        return animation
+    private static func bloomStops(colour: TintRGB, peak: Double) -> [TintFlowStop] {
+        [
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: peak, location: 0
+            ),
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: peak * rippleShoulderShare, location: rippleShoulderLocation
+            ),
+            TintFlowStop(
+                red: colour.red, green: colour.green, blue: colour.blue,
+                opacity: 0, location: 1
+            ),
+        ]
     }
 }
 
@@ -1218,8 +1104,9 @@ final class ShimmerTextHostView: NSView {
     }
 }
 
-/// The shared Tinted backdrop: an opaque base, the flowing gradient, and the
-/// same increased-contrast overlay the other appearances honour.
+/// The shared Tinted backdrop: an opaque base, the flowing field — the
+/// palette sweep with its cross-current and ripple, see `TintFlowFieldView`
+/// — and the same increased-contrast overlay the other appearances honour.
 struct FlowingTintedBackdrop: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1246,24 +1133,48 @@ struct FlowingTintedBackdrop: View {
     var body: some View {
         let isDark = colorScheme == .dark
         let palette = settings.tintPalette
+        let tint = desktop.painting.tint
         // Intensity multiplies at composition time, the same seam the rail
         // share already uses, so the palette definitions stay untouched.
         let intensity = settings.tintIntensity
         let scale = coverageScale * intensity.coverageMultiplier
         // A screenshot must never catch a mid-drift frame: fixture processes
-        // pin the endpoints outright, which parks the layer at its given
-        // start/end deterministically. Reduce Motion pins the same way.
+        // pin the whole field outright, which parks every layer on its
+        // composed model values deterministically. Reduce Motion pins the
+        // same way — the richer three-layer palette stays, the motion goes.
         let pinned = TintFlowMotion.isPinned()
-        FlowingTintGradientView(
-            stops: isDark
+        TintFlowFieldView(
+            swellStops: isDark
                 ? TintFlowComposition.dark(
                     palette: palette,
-                    tint: desktop.painting.tint,
+                    tint: tint,
                     coverageScale: scale
                 )
                 : TintFlowComposition.light(
                     palette: palette,
-                    desktop: desktop.painting.tint,
+                    desktop: tint,
+                    coverageScale: scale
+                ),
+            currentStops: isDark
+                ? TintFlowComposition.darkCurrent(
+                    palette: palette,
+                    tint: tint,
+                    coverageScale: scale
+                )
+                : TintFlowComposition.lightCurrent(
+                    palette: palette,
+                    desktop: tint,
+                    coverageScale: scale
+                ),
+            rippleStops: isDark
+                ? TintFlowComposition.darkRipple(
+                    palette: palette,
+                    tint: tint,
+                    coverageScale: scale
+                )
+                : TintFlowComposition.lightRipple(
+                    palette: palette,
+                    desktop: tint,
                     coverageScale: scale
                 ),
             startPoint: TintFlowMotion.layerPoint(startPoint),

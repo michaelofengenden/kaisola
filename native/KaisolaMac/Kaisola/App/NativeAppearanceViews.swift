@@ -74,10 +74,15 @@ enum GlassWarmth {
     static let blue = 112.0 / 255
 
     /// Reference coverage from which the dark value is derived.
-    /// 0.029 (was 0.04): scaled down with the 2026-08-04 chroma cut so the
-    /// declared amber stays the same *proportion* of the surface's colour —
-    /// the ratio the hue-invariance correction depends on.
-    static let opacity = 0.029
+    /// 0.04 → 0.029 with the 2026-08-04 chroma cut, 0.029 → 0.04 with the
+    /// 2026-08-28 lively-tint re-raise: the amber scales WITH
+    /// `DesktopBackdropRenderer.desktopChromaShare` in **both** directions so
+    /// the declared warmth stays the same *proportion* of the surface's
+    /// colour — the ratio the hue-invariance correction depends on. Bounded
+    /// by `testGlassWarmthIsADeclaredAmber` (hard < 0.08 ceiling, > 0.02
+    /// floor; the exact pin moves with this constant on purpose) and by the
+    /// derived dark coverage's 0.004 floor, which 0.04 clears at 0.00565.
+    static let opacity = 0.04
 
     /// Coverage per appearance. Light Glass is explicitly neutral white, so
     /// the amber is absent there; dark keeps the scaled warmth that prevents a
@@ -113,13 +118,14 @@ enum GlassWarmth {
 struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
     let carrierWhiteCoverage: Double
-    /// Tint coverage (dark, light) laid over *live* vibrancy only. The light
-    /// half may be zero because live vibrancy already carries the desktop hue;
-    /// dark retains its small sampled lift. The painted wallpaper already is
-    /// the hue and must not be tinted twice.
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. Both
+    /// halves are small sampled lifts — dark 0.15, light 0.12 since the
+    /// 2026-08-28 lively-tint round (light spent a year at zero after the
+    /// white-rail pass) — that reinforce the desktop's own hue over the
+    /// material. The painted wallpaper already is the hue and must not be
+    /// tinted twice, which is why this never applies in `.wallpaper` mode.
     ///
-    /// See `SidebarBackdropView` for why the dark half of the pair is so much
-    /// smaller than the light one.
+    /// See `SidebarBackdropView.liveTint` for the receipts on both values.
     var liveTint: (dark: Double, light: Double)?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -1271,15 +1277,33 @@ struct SidebarBackdropView: View {
     /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
     /// the material behind the window contributes 67% more than it did.
     ///
-    /// Dark keeps the sampled tint at 0.15. Light's explicit overlay is zero
-    /// because AppKit vibrancy now preserves the live desktop's own chroma;
-    /// adding its average again would tint the material twice.
+    /// Dark keeps the sampled tint at 0.15. Light was taken to exactly zero
+    /// by the white-rail pass (its old 0.26 tinted the material twice, and
+    /// the strict-neutrality contract wanted nothing the app adds); the
+    /// 2026-08-28 lively-tint round gives it back a smaller half — **0.12**,
+    /// deliberately junior to dark's 0.15 — for "make the live tint much
+    /// more lively/active": on a colourful desktop the light rails visibly
+    /// carry the desktop's own sampled hue again instead of white over bare
+    /// vibrancy. The tint is the wallpaper's averaged colour, so this is
+    /// still inside the white-rail contract's letter ("the only chroma on a
+    /// rail is whatever the desktop itself contributes") — what returns is
+    /// concentration, not a colour of the app's own.
+    ///
+    /// What bounds it: the veil above is untouched, so 0.54 of whatever sits
+    /// beneath it still reaches the eye — the pre-change transmission figure
+    /// exactly; within that, twelve percent is now the sampled hue laid over
+    /// the material (moving material share 0.54 × 0.88 = 0.475). Worst case
+    /// for ink is a near-black desktop, whose tint floors at 0.07
+    /// (`DesktopTintSampler.floors`): the modelled rail stays near 0.85
+    /// luminance, far above the 0.75 worst patch `KaisolaInk`'s light floors
+    /// were solved on. Pinned, both halves, by
+    /// `testLiveGlassPassesFarMoreOfTheMaterialInDarkThanItDid`.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The
     /// numbers above are compositing algebra over the two declared coverages,
     /// which is exactly as much as is knowable without a screenshot.)
-    static let liveTint = (dark: 0.15, light: 0.0)
+    static let liveTint = (dark: 0.15, light: 0.12)
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency

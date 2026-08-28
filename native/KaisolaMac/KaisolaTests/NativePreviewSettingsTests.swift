@@ -5000,16 +5000,30 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light keeps the live material's chroma and uses only the single
-        // white veil to frost it. No second carrier consumes the
-        // transmission; the white-rail pass moved the pin from 0.70 to 0.54,
-        // still a majority share for the desktop.
-        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
-        let lightAfterCarrier = transmission(
+        // Light gained back a smaller tint than dark's in the 2026-08-28
+        // lively-tint round ("make the live tint much more lively/active").
+        // The white-rail pass had taken it to exactly zero; 0.12 is the
+        // deliberate new value, junior to dark's 0.15 so the white-rail
+        // hierarchy holds. Both equalities below are pins on deliberate
+        // values, not floors.
+        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0.12, accuracy: 0.0001)
+        XCTAssertLessThan(
+            SidebarBackdropView.liveTint.light,
+            SidebarBackdropView.liveTint.dark,
+            "the light live tint outgrew dark's — the white-rail hierarchy inverted"
+        )
+        let lightVeil = GlassBackdropWash.sidebar(isDark: false).baseOpacity
+        // The veil is untouched: 0.54 of whatever sits beneath it still
+        // arrives, exactly the pre-change figure. Liveliness is bought UNDER
+        // the veil — twelve percent of the underlay is now the desktop's own
+        // sampled hue laid over the material — never by thinning or
+        // thickening the veil itself.
+        XCTAssertEqual(1 - lightVeil, 0.54, accuracy: 0.0001)
+        let lightMaterialShare = transmission(
             tint: SidebarBackdropView.liveTint.light,
-            veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
+            veil: lightVeil
         ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
-        XCTAssertEqual(lightAfterCarrier, 0.54, accuracy: 0.0001)
+        XCTAssertEqual(lightMaterialShare, 0.4752, accuracy: 0.0001)
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -5348,11 +5362,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         // floor exists to catch a layer scaled to nothing, not to pin the
         // target — but the underlay's ~0.87 ceiling is where the two collide,
         // so that ceiling is asserted here, next to the floor it protects.
+        // At the 2026-08-28 re-raise (reference 0.04) the dark amber sits at
+        // 0.00565 — the floor has real margin again; at the 0.029 era it was
+        // 0.00409 and one more white-rail round would have collided.
         XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.004)
         XCTAssertLessThanOrEqual(
             LightGlassFrost.backdropLuminance,
             0.87,
-            "past 0.87 the dark amber (0.029 × 0.12 / backdropLuminance) falls through its 0.004 floor — whiten the rails another way"
+            "past 0.87 the dark amber (0.04 × 0.12 / backdropLuminance) approaches its 0.004 floor — whiten the rails another way"
         )
         XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity)
     }
@@ -5478,7 +5495,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         // the neutrality invariant exists to prevent. Stated on the reference
         // coverage from which the dark one is derived; see
         // `testGlassWarmthCoverageTracksTheSurfaceItLandsOn`.
-        XCTAssertEqual(GlassWarmth.opacity, 0.029, accuracy: 0.0001)
+        // 0.04 → 0.029 with the 2026-08-04 chroma cut, back to 0.04 with the
+        // 2026-08-28 lively-tint re-raise: the amber scales WITH
+        // `desktopChromaShare` in both directions, because the hue-invariance
+        // correction depends on their ratio. The < 0.08 ceiling and > 0.02
+        // floor do not move.
+        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
         XCTAssertLessThan(GlassWarmth.opacity, 0.08)
         XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }

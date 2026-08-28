@@ -1587,6 +1587,12 @@ enum QuietSelectionPill {
     /// Inset from the row's own edges, so the pill floats inside the column
     /// rather than reaching the sidebar's border.
     static let horizontalInset: CGFloat = 6
+    /// The faint neutral wash a resting row gains under the pointer — the
+    /// session tabs' hover language carried onto the source list (2026-08-28
+    /// decision 3). Quieter than the tabs' 0.06: the rail rows sit shoulder to
+    /// shoulder, so the wash only has to say "this row", not lift a control
+    /// off open glass.
+    static let hoverWashOpacity: Double = 0.05
     /// How much of the pill a split's *other* pane wears.
     ///
     /// Both panes are genuinely on screen, so both are marked — but only one
@@ -1596,6 +1602,25 @@ enum QuietSelectionPill {
     static let companionOpacity: Double = 0.55
 
     static func fillOpacity(dark: Bool) -> Double { dark ? darkFillOpacity : lightFillOpacity }
+
+    /// What a surface row paints behind itself, as one decision. Michael's
+    /// 2026-08-28 feedback on the previewed card rail — "I'd like there'd not
+    /// to be a double card situation for the lhs rail" — lands here: while the
+    /// shell preview is on, ONLY the selected row wears a fill (Finder's and
+    /// Safari's grammar), so a split's companion pane and every other resting
+    /// row are quiet text and icon inside the one rail card, answering the
+    /// pointer with the faint wash. With the preview off this is exactly the
+    /// shipped rail: selected pill, fainter companion pill, and no hover wash.
+    static func fill(
+        isSelected: Bool,
+        isOnScreen: Bool,
+        hovering: Bool,
+        preview: ShellPreviewVariant
+    ) -> QuietRowFill {
+        if isSelected { return .selectionPill }
+        if preview.isOn { return hovering ? .hoverWash : .none }
+        return isOnScreen ? .companionPill : .none
+    }
 
     /// The ink for a selected row's title and mark: the user's accent, stepped
     /// away from the pill it now sits on.
@@ -1622,9 +1647,20 @@ enum QuietSelectionPill {
     })
 }
 
+/// Every background a surface row can draw. `QuietSelectionPill.fill` is the
+/// one place that ranks them, so the preview-on quiet-row rule and the
+/// shipped companion-pill rule cannot drift between call sites.
+enum QuietRowFill: Equatable {
+    case selectionPill
+    case companionPill
+    case hoverWash
+    case none
+}
+
 /// The accent pill under the selected surface row.
 private struct QuietSelectionPillView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.shellPreview) private var shellPreview
 
     /// Sessions sit a clear step in from the column edge; a pill that still
     /// starts at that edge paints tens of points of colour to the left of
@@ -1632,8 +1668,30 @@ private struct QuietSelectionPillView: View {
     var leadingInset: CGFloat = QuietSelectionPill.horizontalInset
 
     var body: some View {
-        RoundedRectangle(cornerRadius: QuietSelectionPill.cornerRadius, style: .continuous)
+        // The tab silhouette at row scale: the shipped `cornerRadius` pill
+        // with the preview off or on pills, capsules when the preview asks
+        // for them, so the rail's selection and the session tabs speak one
+        // shape language.
+        ShellTabShape.shape(cornerRadius: QuietSelectionPill.cornerRadius, preview: shellPreview)
             .fill(Color.accentColor.opacity(QuietSelectionPill.fillOpacity(dark: colorScheme == .dark)))
+            .padding(.leading, leadingInset)
+            .padding(.trailing, QuietSelectionPill.horizontalInset)
+            .accessibilityHidden(true)
+    }
+}
+
+/// The rows' pointer answer while the shell preview is on: the same shape as
+/// the selection pill, in a faint neutral wash — the session tabs' hover fill
+/// at row scale. Never mounted with the preview off; the shipped rail has no
+/// hover wash.
+private struct QuietHoverWashView: View {
+    @Environment(\.shellPreview) private var shellPreview
+
+    var leadingInset: CGFloat = QuietSelectionPill.horizontalInset
+
+    var body: some View {
+        ShellTabShape.shape(cornerRadius: QuietSelectionPill.cornerRadius, preview: shellPreview)
+            .fill(Color.primary.opacity(QuietSelectionPill.hoverWashOpacity))
             .padding(.leading, leadingInset)
             .padding(.trailing, QuietSelectionPill.horizontalInset)
             .accessibilityHidden(true)
@@ -1657,6 +1715,8 @@ private struct QuietRowBody: View {
     var isOnScreen = false
     let showsReveal: Bool
     let reveal: () -> Void
+
+    @Environment(\.shellPreview) private var shellPreview
 
     var body: some View {
         // Spacing is 0 and every gap is explicit: a uniform `HStack` spacing
@@ -1690,20 +1750,32 @@ private struct QuietRowBody: View {
         .frame(height: QuietRailMetrics.sessionRowHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        // The rail's ONE fill, and only under the row on screen. `.isSelected`
-        // on the enclosing Button carries the same fact to assistive
-        // technology, so the pill is decoration and is hidden from it.
-        // The focused row wears the pill; a companion pane in a split wears a
-        // fainter one. A split used to mark only the focused surface, so the
-        // other pane — equally on screen — was indistinguishable from a closed
-        // session. The two states stay clearly ranked: colour and a full pill
-        // for the row you are typing in, a quiet fill for the one beside it.
+        // The rail's fills, decided by `QuietSelectionPill.fill` in one
+        // place. `.isSelected` on the enclosing Button carries the selection
+        // fact to assistive technology, so the pill is decoration and is
+        // hidden from it. Shipped grammar (preview off): the focused row
+        // wears the pill and a companion pane in a split wears a fainter one,
+        // because a split's other pane — equally on screen — must not read as
+        // a closed session. Preview grammar (2026-08-28 feedback): only the
+        // selected row is filled inside the rail card, everything else rests
+        // quiet, and hover answers with the tabs' faint wash. `showsReveal`
+        // is the row's hover flag.
         .background {
-            if isSelected {
+            switch QuietSelectionPill.fill(
+                isSelected: isSelected,
+                isOnScreen: isOnScreen,
+                hovering: showsReveal,
+                preview: shellPreview
+            ) {
+            case .selectionPill:
                 QuietSelectionPillView(leadingInset: pillLeadingInset)
-            } else if isOnScreen {
+            case .companionPill:
                 QuietSelectionPillView(leadingInset: pillLeadingInset)
                     .opacity(QuietSelectionPill.companionOpacity)
+            case .hoverWash:
+                QuietHoverWashView(leadingInset: pillLeadingInset)
+            case .none:
+                EmptyView()
             }
         }
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:

@@ -177,6 +177,7 @@ struct WorkspaceRailView: View {
 
     @EnvironmentObject private var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.shellPreview) private var shellPreview
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
@@ -297,9 +298,9 @@ struct WorkspaceRailView: View {
                                             WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                                         )
                                         : .clear,
-                                    in: RoundedRectangle(
+                                    in: ShellTabShape.shape(
                                         cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                                        style: .continuous
+                                        preview: shellPreview
                                     )
                                 )
                                 .contentShape(Rectangle())
@@ -325,14 +326,20 @@ struct WorkspaceRailView: View {
         // The persisted preference stays at least 164 pt, but the responsive
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
-        // One layer, flush to the window edges, exactly like the left project
-        // rail (see the "no chrome panel here" comment in `leftTreeLayout`).
-        // The rounded card, its stroke, and the 4pt float were the box overlay
-        // Michael asked to remove; the seam to the content is the resize
-        // divider's own hairline.
+        // Shell preview OFF (shipped): one layer, flush to the window edges,
+        // exactly like the left project rail — the rail paints its own glass
+        // and the seam to the content is the resize divider's hairline.
+        // Preview ON (2026-08-28 revision, decision 6): no backdrop of its
+        // own — the rail mounts inside the shared floating chrome card
+        // (`kaisolaChromePanel` in `RootShellView.detailArea`), which supplies
+        // the surface, the soft shadow, and the gutter of window glass around
+        // it. Painting the full-bleed rail glass here again would fill that
+        // gutter and turn the card back into a column.
         .background {
-            SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
-                .ignoresSafeArea()
+            if !shellPreview.isOn {
+                SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
+                    .ignoresSafeArea()
+            }
         }
         .task {
             tree.load(root)
@@ -1020,9 +1027,9 @@ struct WorkspaceRailView: View {
                         WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                     )
                     : .clear,
-                in: RoundedRectangle(
+                in: ShellTabShape.shape(
                     cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                    style: .continuous
+                    preview: shellPreview
                 )
             )
             .contentShape(Rectangle())

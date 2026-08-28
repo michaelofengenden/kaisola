@@ -385,6 +385,44 @@ final class FullHeightWorkspaceHostingView<Content: View>: NSHostingView<Content
     }
 }
 
+/// The workspace window's SwiftUI root: resolves the 2026-08-28 shell preview
+/// once per render — `KAISOLA_SHELL_PREVIEW_TABS` over the persisted setting
+/// — injects it as `\.shellPreview` for every preview-gated view in the
+/// window, and applies decision 4's real window shape.
+///
+/// Observing the settings object here is what makes the Settings picker apply
+/// live: the window is created once, but this view re-renders on every
+/// settings publish, so flipping the preview re-clips and re-injects without
+/// a relaunch.
+///
+/// The corner itself: the window already runs a transparent titlebar over a
+/// full-size, clear-backed content view, so clipping the root container at
+/// the shell's 30pt continuous corner makes the corner the window's own — the
+/// pixels outside the curve are genuinely transparent, not painted over the
+/// system corner. With the preview off the radius is zero: a bounds-rect clip
+/// that changes nothing, leaving the shipped system corner. Known preview
+/// limits, named honestly: full screen and split view still need their own
+/// fixture pass before the corner ships by default.
+struct ShellPreviewWindowRoot: View {
+    @ObservedObject var settings: NativePreviewSettings
+    let content: AnyView
+
+    var body: some View {
+        let preview = ShellPreviewVariant.resolved(
+            environment: ProcessInfo.processInfo.environment,
+            setting: settings.shellPreviewVariant
+        )
+        content
+            .clipShape(
+                RoundedRectangle(
+                    cornerRadius: preview.windowCornerRadius,
+                    style: .continuous
+                )
+            )
+            .environment(\.shellPreview, preview)
+    }
+}
+
 struct NativeFrameCadenceReport: Encodable, Equatable, Sendable {
     struct Thresholds: Encodable, Equatable, Sendable {
         let maximumDeadlineLossRateMsPerSecond: Double
@@ -1270,9 +1308,21 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = ["topbar", "topbar-attention", "new-session-topbar"].contains(visualSurface)
+            settings.navigationLayout = [
+                "topbar", "topbar-attention", "new-session-topbar",
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface)
                 ? .topBar
                 : .leftTree
+            // The two shell-revision surfaces exist to preview the redesign,
+            // so they default the preview on (pill tabs); every other fixture
+            // keeps the shipped shell and its existing baselines. The
+            // KAISOLA_SHELL_PREVIEW_TABS override — resolved at the window
+            // root — still outranks this, exactly as on a live install, so a
+            // capture run can force any surface into either state.
+            settings.shellPreviewVariant = [
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface) ? .pills : .off
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
@@ -1332,6 +1382,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
                 && visualSurface != "empty-workspace" && visualSurface != "new-session"
                 && visualSurface != "new-session-topbar"
+                && visualSurface != "topbar-mixed" && visualSurface != "topbar-mixed-narrow"
             settings.workspaceRailWidth = 196
             // Pin both ordinary and failure-boundary document widths. The
             // fixture settings object is non-persistent, so these values can
@@ -1472,7 +1523,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 model.setCompanionControlFixtureActive(true, for: terminal)
             } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
-            } else if ["mixed", "mixed-search", "mixed-density", "permission", "chat-thinking"].contains(visualSurface) {
+            } else if [
+                "mixed", "mixed-search", "mixed-density", "permission", "chat-thinking",
+                // The 2026-08-28 shell-revision previews: the same three mixed
+                // sessions (terminal, agent terminal, chat) under the merged
+                // session-tab bar, at the ordinary width and at a narrow one.
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface) {
                 model.loadVisualMixedSessionFixture(
                     workspace: workspace,
                     includePermission: visualSurface == "permission"
@@ -1763,11 +1820,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // resized to: the minimum, or the ideal for `settings-ideal`.
         let visualSettingsSize = SettingsWindowChrome.visualContentSize(surface: visualSurface)
 
+        // The shell-revision compression preview: the same merged-bar window,
+        // narrow enough that the inactive tabs visibly give up title width.
+        let visualWorkspaceWidth: CGFloat = visualSurface == "topbar-mixed-narrow" ? 820 : 1_360
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? 1_360 : 1_080)))),
+                width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? visualWorkspaceWidth : 1_080)))),
                 height: visualSettings ? visualSettingsSize.height : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -1808,7 +1868,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if visualSettings || visualOnboarding {
             window.contentView = NSHostingView(rootView: content)
         } else {
-            window.contentView = FullHeightWorkspaceHostingView(rootView: content)
+            // The workspace window's root rides `ShellPreviewWindowRoot`,
+            // which resolves the 2026-08-28 shell preview (env override over
+            // the persisted setting), injects it as `\.shellPreview` for
+            // every gated view below, and applies decision 4's real window
+            // shape while the preview is on. Settings and onboarding keep
+            // their system chrome.
+            window.contentView = FullHeightWorkspaceHostingView(
+                rootView: AnyView(
+                    ShellPreviewWindowRoot(settings: settings, content: content)
+                )
+            )
         }
         window.delegate = self
         window.makeKeyAndOrderFront(nil)

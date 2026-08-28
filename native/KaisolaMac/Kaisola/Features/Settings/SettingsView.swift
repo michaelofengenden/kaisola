@@ -728,6 +728,20 @@ struct SettingsView: View {
                         .menuIndicator(.hidden)
                         .accessibilityLabel("Theme")
                     }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Shell preview",
+                        detail: "Experimental: try the next shell — merged tab bar, card rails, rounder window — live",
+                        symbol: "macwindow.and.cursorarrow"
+                    ) {
+                        Menu {
+                            ForEach(ShellPreviewVariant.allCases) { variant in
+                                Button(variant.title) { settings.shellPreviewVariant = variant }
+                            }
+                        } label: { SettingsChoiceLabel(settings.shellPreviewVariant.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Shell preview")
+                    }
                     if settings.theme == .tinted {
                         SettingsDivider()
                         SettingsRow(
@@ -1545,7 +1559,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var searchTerms: [String] {
         switch self {
         case .general:
-            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency", "Tinted", "Living tint", "breathing", "Tint intensity", "Vivid", "Bold"]
+            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency", "Tinted", "Living tint", "breathing", "Tint intensity", "Vivid", "Bold", "Shell preview", "experimental shell", "tab bar"]
         case .terminal:
             ["Font", "Font Size", "Theme", "Palette", "Copy on Select", "Option as Meta", "Scrollback", "Shell"]
         case .companion:

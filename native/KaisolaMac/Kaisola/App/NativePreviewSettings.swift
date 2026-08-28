@@ -809,6 +809,15 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(navigationLayout.rawValue, forKey: Keys.layout) }
     }
 
+    /// The 2026-08-28 shell revision behind a runtime switch: Off ships
+    /// exactly the current shell; the on states render the merged session-tab
+    /// bar, the card rails, and the 30pt window corner with pill or capsule
+    /// tabs, live, no relaunch. `KAISOLA_SHELL_PREVIEW_TABS` still outranks
+    /// this for fixture processes — see `ShellPreviewVariant.resolved`.
+    @Published var shellPreviewVariant: ShellPreviewVariant {
+        didSet { persist(shellPreviewVariant.rawValue, forKey: Keys.shellPreview) }
+    }
+
     @Published var appearance: AppearanceMode {
         didSet {
             persist(appearance.rawValue, forKey: Keys.appearance)
@@ -1259,6 +1268,7 @@ final class NativePreviewSettings: ObservableObject {
 
     private enum Keys {
         static let layout = "navigationLayout"
+        static let shellPreview = "shellPreviewVariant"
         static let appearance = "appearanceMode"
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
@@ -1303,6 +1313,11 @@ final class NativePreviewSettings: ObservableObject {
         self.defaults = defaults
         self.persistsChanges = persistsChanges
         navigationLayout = defaults.string(forKey: Keys.layout).flatMap(NavigationLayout.init) ?? .leftTree
+        // Off unless the user chose otherwise; an unknown stored value (a
+        // future variant this build does not know) falls back to the shipped
+        // shell rather than guessing.
+        shellPreviewVariant = defaults.string(forKey: Keys.shellPreview)
+            .flatMap(ShellPreviewVariant.init) ?? .off
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass

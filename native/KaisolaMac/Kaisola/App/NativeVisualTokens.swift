@@ -634,7 +634,7 @@ extension TintPalette {
         cool: TintRGB(178, 186, 196),
         neutral: TintRGB(224, 219, 212),
         pearl: TintRGB(196, 189, 180),
-        coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+        coolCoverage: 0.34, neutralCoverage: 0.24, pearlCoverage: 0.34,
         neutralLocation: 0.54
     )
 
@@ -643,27 +643,32 @@ extension TintPalette {
     /// Coverages are shared across the table: only the sources change per
     /// palette, so every palette's luminance envelope — and therefore the ink
     /// ladder measured against the worst patch — stays where Meadow put it.
+    /// 0.34/0.24 is the lively-flow round's step up from 0.30/0.22 —
+    /// "stronger gradient" needs the canvas visibly painted — and it sits at
+    /// the exact top of the pastel box the visibility receipts pin, with the
+    /// worst-patch floor re-solved in
+    /// `testTintFieldFlowLayersHoldTheInkStoryByConstruction`.
     var fixedLight: TintPaletteLight? {
         switch self {
         case .meadow: TintPaletteLight(
             cool: TintRGB(165, 203, 178),
             neutral: TintRGB(233, 221, 207),
             pearl: TintRGB(203, 185, 226),
-            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            coolCoverage: 0.34, neutralCoverage: 0.24, pearlCoverage: 0.34,
             neutralLocation: 0.54
         )
         case .dusk: TintPaletteLight(
             cool: TintRGB(216, 191, 172),
             neutral: TintRGB(233, 213, 198),
             pearl: TintRGB(217, 175, 192),
-            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            coolCoverage: 0.34, neutralCoverage: 0.24, pearlCoverage: 0.34,
             neutralLocation: 0.54
         )
         case .harbor: TintPaletteLight(
             cool: TintRGB(171, 196, 218),
             neutral: TintRGB(230, 222, 208),
             pearl: TintRGB(175, 213, 203),
-            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            coolCoverage: 0.34, neutralCoverage: 0.24, pearlCoverage: 0.34,
             neutralLocation: 0.54
         )
         case .graphite: Self.graphiteLight
@@ -719,8 +724,13 @@ extension TintPalette {
     }
 
     /// How much chroma the palette keeps in dark. Graphite is grey by
-    /// definition and would stop being itself at the shared value.
-    var darkSaturation: Double { self == .graphite ? 0.10 : 0.30 }
+    /// definition and would stop being itself at the shared value. 0.36 is
+    /// the lively-flow round's raise from 0.30: at a fixed peak, more
+    /// saturation only *lowers* the off-hue channels, so the dark canvas
+    /// gains colour without gaining a single count of luminance — the one
+    /// direction dark could safely get stronger, since its worst patch was
+    /// already at the secondary-ink line.
+    var darkSaturation: Double { self == .graphite ? 0.10 : 0.36 }
 
     /// The dark stop pair: the palette's two light ends taken to the dark
     /// canvas peak at the palette's own saturation. Hue is the only thing
@@ -764,19 +774,22 @@ enum TintIntensity: String, CaseIterable, Identifiable, Sendable {
     var detail: String {
         switch self {
         case .standard: "The composition as designed"
-        case .vivid: "The same palette, half again as present"
+        case .vivid: "The same palette, a third again as present"
         case .bold: "The gradient at full voice"
         }
     }
 
     /// Multiplier on every stop's coverage. Bounded well under saturation:
-    /// the heaviest shipped stop is 0.30, so even Bold's product (0.57)
+    /// the heaviest shipped stop is 0.34, so even Bold's product (0.561)
     /// stays a translucent tint over the material ground, never a plate.
+    /// The rungs came down from 1.45/1.9 when the base rose from 0.30 —
+    /// Bold lands within a count of where it always did (0.561 against
+    /// 0.57), so the ladder's ceiling did not move; the *resting* voice did.
     var coverageMultiplier: Double {
         switch self {
         case .standard: 1.0
-        case .vivid: 1.45
-        case .bold: 1.9
+        case .vivid: 1.35
+        case .bold: 1.65
         }
     }
 
@@ -799,10 +812,11 @@ enum TintIntensity: String, CaseIterable, Identifiable, Sendable {
 /// composition quantized to within a few counts of white — the Tinted fixture
 /// was pixel-for-pixel the Glass fixture — and Michael asked for "a flowing
 /// gradient tint", which first of all requires a gradient one can see. Thirty
-/// percent keeps the sources pastel while the sweep finally reads as colour
-/// crossing the surface. The numbers live in `TintPalette.meadow.fixedLight`
-/// now; this shim only forwards them so long-standing call sites keep
-/// compiling.
+/// percent kept the sources pastel while the sweep finally read as colour
+/// crossing the surface; the 2026-08-28 lively-flow round ("stronger
+/// gradient, more lively") took the table to thirty-four. The numbers live
+/// in `TintPalette.meadow.fixedLight` now; this shim only forwards them so
+/// long-standing call sites keep compiling.
 enum LightTintedGradient {
     private static var meadow: TintPaletteLight { TintPalette.meadow.fixedLight! }
 
@@ -819,24 +833,83 @@ enum LightTintedGradient {
     static var neutralColor: Color { neutral.color }
 }
 
-/// The Tinted surfaces' slow drift — what makes the gradient *flow*.
+/// The Tinted surfaces' layered flow — what makes the gradient a *sea state*
+/// rather than a wash.
 ///
-/// The motion is a Core Animation autoreversing drift of the gradient's
-/// endpoints, chosen over any SwiftUI timeline because the render server owns
-/// the whole animation: zero main-thread wakeups, zero invalidation traffic,
-/// and the glass-era energy rules (painted stills, no per-frame app work)
-/// unchanged.
-/// The period is deliberately far below attention speed — the surface should
-/// never be *seen moving*, only found elsewhere when the eye returns — and
-/// Reduce Motion pins the endpoints outright.
+/// The 2026-08-28 lively-flow round (Michael: "stronger gradient, more
+/// lively, more flow change — imagine water or wind flowing", with Refik
+/// Anadol's Bosphorus as the reference) rebuilt the single drifting sweep
+/// into three fields at three time scales: the ground swell (the palette
+/// sweep, drifting *and* folding its midpoint), a cross-current (a broad
+/// band of the companion hue travelling the opposite diagonal), and a
+/// ripple (a radial bloom wandering the surface). Their periods are chosen
+/// mutually non-harmonic, so the superposition never phase-locks into a
+/// loop anyone can spot.
+///
+/// Every motion here is a Core Animation autoreversing animation, chosen
+/// over any SwiftUI timeline because the render server owns the whole
+/// field: zero main-thread wakeups, zero invalidation traffic, and the
+/// glass-era energy rules (painted stills, no per-frame app work)
+/// unchanged. Each period is deliberately far below attention speed — the
+/// surface should never be *seen moving*, only found elsewhere when the eye
+/// returns — and Reduce Motion pins the whole field outright.
 enum TintFlowMotion {
-    /// One full drift in each direction, in seconds. Twenty-six seconds is
-    /// glacial on purpose: at this period the endpoint travels under a point
-    /// per second on a full-height window.
-    static let period: TimeInterval = 26
+    /// One full endpoint drift in each direction, in seconds. Forty-four
+    /// seconds is slower than the 26 the single-sweep era shipped: with the
+    /// fold and the cross-current carrying the visible flow, the endpoint
+    /// drift goes back to being the tide under them.
+    static let period: TimeInterval = 44
     /// How far each endpoint wanders, as a fraction of the unit square. The
-    /// sweep stays diagonal throughout; only its anchoring breathes.
-    static let drift: Double = 0.18
+    /// sweep stays diagonal throughout; only its anchoring breathes. 0.22 —
+    /// up from the wash era's 0.18 — still under the 0.25 where the whole
+    /// sweep would visibly swing.
+    static let drift: Double = 0.22
+
+    /// The fold: the sweep's interior stop travelling along the gradient
+    /// axis, so the colour bands genuinely traverse and bunch instead of
+    /// only rocking with the endpoints. ±0.14 about the palette's declared
+    /// midpoint (light's 0.54 folds between 0.40 and 0.68).
+    static let foldPeriod: TimeInterval = 33
+    static let foldTravel: Double = 0.14
+    /// A two-stop sweep (dark) has no interior stop to fold, so its fold
+    /// compresses the ends inward instead: [0, 1] ↔ [0.12, 0.88], the
+    /// crossing tightening and relaxing like a swell steepening.
+    static let foldInset: Double = 0.12
+    /// Folded interior stops never reach the ends: a stop parked on 0 or 1
+    /// would collapse a colour band to a hard edge.
+    static let foldInteriorBounds: ClosedRange<Double> = 0.05...0.95
+
+    /// The cross-current: a broad band of colour on the crossed diagonal,
+    /// travelling from three-tenths to seven-tenths of its axis. One full
+    /// crossing per fifty-nine seconds is two-thirds of a percent of the
+    /// surface per second — found when the eye returns, never watchable.
+    static let currentPeriod: TimeInterval = 59
+    static let currentTravel: Double = 0.20
+    /// The current's own endpoints shear a little on a separate period, so
+    /// the band's angle works against its travel instead of riding it.
+    static let currentShearPeriod: TimeInterval = 39
+    static let currentShearDrift: Double = 0.10
+
+    /// The ripple: a radial bloom whose centre and radius handle glide on
+    /// two different periods, which is what makes its path a crossing
+    /// pattern rather than a shuttle. The two travels are diagonal lines in
+    /// the unit square; 27 against 21 seconds never realigns in a visible
+    /// window.
+    static let ripplePeriod: TimeInterval = 27
+    static let rippleRadiusPeriod: TimeInterval = 21
+    static let rippleCenterFrom = CGPoint(x: 0.30, y: 0.35)
+    static let rippleCenterTo = CGPoint(x: 0.70, y: 0.62)
+    static let rippleRadiusFrom = CGPoint(x: 0.80, y: 0.88)
+    static let rippleRadiusTo = CGPoint(x: 1.00, y: 0.98)
+
+    /// Every period the field runs, for the non-harmonic receipt: no pair may
+    /// sit near an integer ratio or two motions phase-lock into a metronome.
+    static var fieldPeriods: [TimeInterval] {
+        [
+            period, foldPeriod, currentPeriod, currentShearPeriod,
+            ripplePeriod, rippleRadiusPeriod, breathPeriod, breathScalePeriod,
+        ]
+    }
 
     /// Opt-in breath: the whole tint fading and returning. Nineteen seconds,
     /// and a sixth of the layer's opacity rather than a twelfth: at 0.08 the
@@ -883,10 +956,13 @@ enum TintFlowMotion {
     }
 
     /// Where the drifting endpoints travel between, for one placement.
-    /// Pure, so the geometry is a test rather than a screenshot.
+    /// Pure, so the geometry is a test rather than a screenshot. The ground
+    /// swell drifts by the default `drift`; the cross-current passes its own
+    /// smaller `currentShearDrift`.
     static func endpoints(
         start: CGPoint,
-        end: CGPoint
+        end: CGPoint,
+        drift: Double = TintFlowMotion.drift
     ) -> (startFrom: CGPoint, startTo: CGPoint, endFrom: CGPoint, endTo: CGPoint) {
         let dx = (end.x - start.x) * drift
         let dy = (end.y - start.y) * drift
@@ -898,6 +974,78 @@ enum TintFlowMotion {
             endFrom: CGPoint(x: end.x - dx, y: end.y - dy),
             endTo: end
         )
+    }
+
+    /// The fold at one phase in [−1, 1]. Interior stops travel ±`foldTravel`
+    /// along the axis, clamped inside `foldInteriorBounds`; a two-stop sweep
+    /// (dark) instead compresses its ends inward by up to `foldInset` on the
+    /// positive half, so both appearances fold through one code path and the
+    /// negative extreme of either is a composition the theme already shipped.
+    /// Phase 0 is exactly the composed locations, which is what the layer
+    /// parks on when Reduce Motion or a fixture pins the field.
+    static func foldedLocations(_ base: [Double], phase: Double) -> [Double] {
+        let phase = min(1, max(-1, phase))
+        guard base.count > 2 else {
+            guard let first = base.first, let last = base.last, base.count == 2 else {
+                return base
+            }
+            let inset = max(0, phase) * foldInset
+            return [first + inset, last - inset]
+        }
+        return base.enumerated().map { index, location in
+            guard index > 0, index < base.count - 1 else { return location }
+            let folded = location + phase * foldTravel
+            return min(
+                foldInteriorBounds.upperBound,
+                max(foldInteriorBounds.lowerBound, folded)
+            )
+        }
+    }
+
+    /// The cross-current's axis: the sweep's diagonal reflected, so the band
+    /// always runs against the ground swell whatever placement mirroring the
+    /// rails have applied. For the canvas's topLeading → bottomTrailing this
+    /// is topTrailing → bottomLeading.
+    static func crossAxis(
+        start: CGPoint,
+        end: CGPoint
+    ) -> (start: CGPoint, end: CGPoint) {
+        (
+            start: CGPoint(x: end.x, y: start.y),
+            end: CGPoint(x: start.x, y: end.y)
+        )
+    }
+
+    /// The cross-current's stop locations at one phase in [−1, 1]: a broad
+    /// band whose centre travels `currentTravel` either side of the midpoint.
+    /// Phase 0 — the park — holds the band exactly mid-surface.
+    static func currentLocations(phase: Double) -> [Double] {
+        [0, 0.5 + min(1, max(-1, phase)) * currentTravel, 1]
+    }
+
+    /// Halfway between two travel extremes — the model value the ripple parks
+    /// on, and the centre its glide autoreverses about.
+    static func midpoint(_ a: CGPoint, _ b: CGPoint) -> CGPoint {
+        CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+    }
+
+    /// The autoreversing phase in [−1, 1] a period-`period` animation holds at
+    /// wall-clock `time`, before easing. Pure — this is the model the
+    /// time-variation receipts sample, not something the render server reads.
+    /// `animated: false` is the Reduce Motion / fixture park: phase 0 at any
+    /// time, which is exactly the composed model values.
+    static func fieldPhase(
+        at time: TimeInterval,
+        period: TimeInterval,
+        animated: Bool = true
+    ) -> Double {
+        guard animated, period > 0 else { return 0 }
+        let cycle = time.truncatingRemainder(dividingBy: period * 2)
+        let normalized = cycle / period
+        // 0 → 1 over the first period, back to 0 over the second, mapped to
+        // [−1, 1] so phase 0 is the midpoint of the travel, not an extreme.
+        let triangle = normalized <= 1 ? normalized : 2 - normalized
+        return triangle * 2 - 1
     }
 
     /// The dark companion hue: the sampled desktop tint rotated far enough
@@ -968,6 +1116,47 @@ enum TintFlowMotion {
             brightness: source.brightness
         )
         return (rotated.red, rotated.green, rotated.blue)
+    }
+
+    /// The Rec. 709 weighting over encoded channels — the same arithmetic
+    /// every modelled surface receipt in this file family uses, stated once
+    /// so the flow layers' floor and ceiling use exactly it.
+    static func weightedLuminance(_ colour: TintRGB) -> Double {
+        0.2126 * colour.red + 0.7152 * colour.green + 0.0722 * colour.blue
+    }
+
+    /// The colour lifted toward white until it reaches `floor` luminance —
+    /// hue direction kept, chroma reduced, which is what "pastel" already
+    /// means. Deep hues take a bigger lift by construction; a colour already
+    /// at or above the floor comes back untouched. This is how a light flow
+    /// layer becomes safe to stack at any coverage: compositing is convex
+    /// per channel, so a layer whose own luminance clears the floor can
+    /// never pull a brighter surface below it.
+    static func luminanceFloored(_ colour: TintRGB, floor: Double) -> TintRGB {
+        let luminance = weightedLuminance(colour)
+        guard luminance < floor, luminance < 1 else { return colour }
+        let lift = (floor - luminance) / (1 - luminance)
+        return TintRGB(
+            red: colour.red + (1 - colour.red) * lift,
+            green: colour.green + (1 - colour.green) * lift,
+            blue: colour.blue + (1 - colour.blue) * lift
+        )
+    }
+
+    /// The colour scaled toward black until it sits at `ceiling` luminance —
+    /// hue and saturation kept, brightness reduced. The dark mirror of
+    /// `luminanceFloored`: a dark flow layer capped under the dark canvas's
+    /// solved worst patch can never brighten that patch, whatever coverage
+    /// it stacks at.
+    static func luminanceCapped(_ colour: TintRGB, ceiling: Double) -> TintRGB {
+        let luminance = weightedLuminance(colour)
+        guard luminance > ceiling, luminance > 0 else { return colour }
+        let scale = ceiling / luminance
+        return TintRGB(
+            red: colour.red * scale,
+            green: colour.green * scale,
+            blue: colour.blue * scale
+        )
     }
 }
 

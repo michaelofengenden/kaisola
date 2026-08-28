@@ -1196,7 +1196,10 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         // The shipped composition stays pinned exactly: Meadow is a gentle
         // sage crossing a lilac pearl through a warm midpoint, and the tinted
-        // fixture baseline depends on these numbers byte for byte.
+        // fixture baseline depends on these numbers byte for byte. The
+        // coverages moved 0.30/0.22 → 0.34/0.24 in the 2026-08-28
+        // lively-flow round — "stronger gradient" — to the exact top of the
+        // pastel box this test pins; the sources did not move at all.
         guard let meadow = TintPalette.meadow.fixedLight else {
             return XCTFail("Meadow lost its fixed light table")
         }
@@ -1212,7 +1215,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             cool: TintRGB(165, 203, 178),
             neutral: TintRGB(233, 221, 207),
             pearl: TintRGB(203, 185, 226),
-            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            coolCoverage: 0.34, neutralCoverage: 0.24, pearlCoverage: 0.34,
             neutralLocation: 0.54
         ))
     }
@@ -1326,6 +1329,11 @@ final class NativePreviewSettingsTests: XCTestCase {
         // The clamp fixes saturation and brightness and keeps only the hue,
         // so the box metrics are the same constants for *every* wallpaper —
         // which is the whole reason light is finally allowed to sample it.
+        // The exact values moved with the lively-flow coverage step
+        // (0.30/0.22 → 0.34/0.24): the box itself — saturation and
+        // brightness — did not move, so these are the same pastel sources at
+        // the stronger coverage: departure 255·0.34·0.376, spread
+        // 255·0.34·0.176, and the neutral pair at 0.24.
         for degrees in 0..<360 {
             let source = TintFlowMotion.rgb(
                 hue: Double(degrees) / 360,
@@ -1340,12 +1348,12 @@ final class NativePreviewSettingsTests: XCTestCase {
                 (light.pearl, light.pearlCoverage),
             ] {
                 let canvas = metrics(composite(colour, coverage: coverage))
-                XCTAssertEqual(canvas.departure, 28.8, accuracy: 1.0, "hue \(degrees)°")
-                XCTAssertEqual(canvas.spread, 13.5, accuracy: 1.0, "hue \(degrees)°")
+                XCTAssertEqual(canvas.departure, 32.6, accuracy: 1.0, "hue \(degrees)°")
+                XCTAssertEqual(canvas.spread, 15.3, accuracy: 1.0, "hue \(degrees)°")
             }
             let neutral = metrics(composite(light.neutral, coverage: light.neutralCoverage))
-            XCTAssertEqual(neutral.departure, 10.7, accuracy: 1.0, "hue \(degrees)°")
-            XCTAssertEqual(neutral.spread, 5.0, accuracy: 1.0, "hue \(degrees)°")
+            XCTAssertEqual(neutral.departure, 11.6, accuracy: 1.0, "hue \(degrees)°")
+            XCTAssertEqual(neutral.spread, 5.5, accuracy: 1.0, "hue \(degrees)°")
         }
 
         // A grey wallpaper has no hue to keep: Graphite is what "no hue,
@@ -2336,6 +2344,477 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"]))
         XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_RESOURCE_WORKLOAD": "x"]))
         XCTAssertFalse(TintFlowMotion.isPinned(environment: [:]))
+    }
+
+    /// The field's whole time signature: every period is glacial, every
+    /// period is distinct, and no pair sits near an integer ratio — two
+    /// motions phase-locking is a metronome, and a visible loop is exactly
+    /// what layering three time scales exists to avoid.
+    func testTintFieldPeriodsAreGlacialDistinctAndMutuallyNonHarmonic() {
+        let periods = TintFlowMotion.fieldPeriods
+        XCTAssertEqual(periods.count, 8, "a field motion fell out of the declared set")
+        XCTAssertEqual(Set(periods).count, periods.count, "two motions share a period")
+        for period in periods {
+            XCTAssertGreaterThanOrEqual(period, 19, "a field motion became watchable")
+            XCTAssertLessThanOrEqual(period, 90, "a field motion slowed past ever being found")
+        }
+        for (index, first) in periods.enumerated() {
+            for second in periods.dropFirst(index + 1) {
+                let ratio = max(first, second) / min(first, second)
+                XCTAssertGreaterThan(
+                    abs(ratio - ratio.rounded()), 0.05,
+                    "periods \(first)s and \(second)s phase-lock near an integer ratio"
+                )
+            }
+        }
+    }
+
+    /// The field's geometry, held as arithmetic: the fold travels and parks
+    /// on the composed midpoint, the cross axis is the sweep's diagonal
+    /// reflected, the band's travel stays mid-surface, and the ripple's two
+    /// glides keep the bloom inside the unit square and never collapse it.
+    func testTintFieldGeometryFoldsTravelsAndCrossesInsideTheSurface() {
+        // The fold: phase 0 is exactly the composed locations — the Reduce
+        // Motion / fixture park — and ±1 are the travel extremes.
+        let light = [0, 0.54, 1.0]
+        XCTAssertEqual(TintFlowMotion.foldedLocations(light, phase: 0), light)
+        XCTAssertEqual(
+            TintFlowMotion.foldedLocations(light, phase: 1)[1],
+            0.54 + TintFlowMotion.foldTravel,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            TintFlowMotion.foldedLocations(light, phase: -1)[1],
+            0.54 - TintFlowMotion.foldTravel,
+            accuracy: 1e-9
+        )
+        // Ends never move on a three-stop sweep, and an interior stop can
+        // never fold onto an end and collapse a colour band to a hard edge.
+        let extreme = TintFlowMotion.foldedLocations([0, 0.93, 1.0], phase: 1)
+        XCTAssertEqual(extreme[0], 0)
+        XCTAssertEqual(extreme[2], 1)
+        XCTAssertLessThanOrEqual(extreme[1], TintFlowMotion.foldInteriorBounds.upperBound)
+        // A two-stop sweep (dark) folds by compressing inward on the
+        // positive half only, so its park and its negative extreme are the
+        // crossing the theme always shipped.
+        XCTAssertEqual(TintFlowMotion.foldedLocations([0, 1], phase: -1), [0, 1])
+        XCTAssertEqual(TintFlowMotion.foldedLocations([0, 1], phase: 0), [0, 1])
+        XCTAssertEqual(
+            TintFlowMotion.foldedLocations([0, 1], phase: 1),
+            [TintFlowMotion.foldInset, 1 - TintFlowMotion.foldInset]
+        )
+
+        // The cross axis is the sweep's diagonal reflected — the crossed
+        // diagonal on the unit square — and reflecting twice comes home, so
+        // the rails' placement mirroring passes through unchanged.
+        let cross = TintFlowMotion.crossAxis(
+            start: CGPoint(x: 0, y: 1),
+            end: CGPoint(x: 1, y: 0)
+        )
+        XCTAssertEqual(cross.start, CGPoint(x: 1, y: 1))
+        XCTAssertEqual(cross.end, CGPoint(x: 0, y: 0))
+        let home = TintFlowMotion.crossAxis(start: cross.start, end: cross.end)
+        XCTAssertEqual(home.start, CGPoint(x: 0, y: 1))
+        XCTAssertEqual(home.end, CGPoint(x: 1, y: 0))
+
+        // The band's centre travels the middle of the surface and parks on
+        // its midpoint.
+        XCTAssertEqual(TintFlowMotion.currentLocations(phase: 0), [0, 0.5, 1])
+        XCTAssertEqual(
+            TintFlowMotion.currentLocations(phase: -1)[1],
+            0.5 - TintFlowMotion.currentTravel,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            TintFlowMotion.currentLocations(phase: 1)[1],
+            0.5 + TintFlowMotion.currentTravel,
+            accuracy: 1e-9
+        )
+
+        // The ripple stays inside the unit square, and the smallest radius
+        // over every combination of the two glide extremes is still a bloom,
+        // not a dot.
+        for point in [
+            TintFlowMotion.rippleCenterFrom, TintFlowMotion.rippleCenterTo,
+            TintFlowMotion.rippleRadiusFrom, TintFlowMotion.rippleRadiusTo,
+        ] {
+            XCTAssertGreaterThanOrEqual(point.x, 0)
+            XCTAssertLessThanOrEqual(point.x, 1)
+            XCTAssertGreaterThanOrEqual(point.y, 0)
+            XCTAssertLessThanOrEqual(point.y, 1)
+        }
+        var smallestRadius = Double.infinity
+        for center in [TintFlowMotion.rippleCenterFrom, TintFlowMotion.rippleCenterTo] {
+            for handle in [TintFlowMotion.rippleRadiusFrom, TintFlowMotion.rippleRadiusTo] {
+                smallestRadius = min(
+                    smallestRadius,
+                    Double(hypot(handle.x - center.x, handle.y - center.y))
+                )
+            }
+        }
+        XCTAssertGreaterThanOrEqual(
+            smallestRadius, 0.15,
+            "the bloom collapses to a dot at a glide extreme"
+        )
+
+        // The current's shear reuses the endpoint geometry at its own,
+        // deliberately smaller drift.
+        XCTAssertLessThan(TintFlowMotion.currentShearDrift, TintFlowMotion.drift)
+        let shear = TintFlowMotion.endpoints(
+            start: CGPoint(x: 1, y: 1),
+            end: CGPoint(x: 0, y: 0),
+            drift: TintFlowMotion.currentShearDrift
+        )
+        XCTAssertEqual(
+            shear.startTo.x,
+            1 - TintFlowMotion.currentShearDrift,
+            accuracy: 1e-9
+        )
+    }
+
+    /// The field genuinely moves — the model at t and t+Δ differs by a real,
+    /// bounded amount — and the pin freezes it: `animated: false` holds
+    /// phase zero at every time, which is the Reduce Motion and fixture
+    /// park. Sampled on the band's centre, the fastest-travelling landmark.
+    func testTintFieldTimeVariationIsBoundedNonZeroAndPinnable() {
+        for origin in [0.0, 7.3, 100.9, 1234.5] {
+            let now = TintFlowMotion.currentLocations(
+                phase: TintFlowMotion.fieldPhase(
+                    at: origin,
+                    period: TintFlowMotion.currentPeriod
+                )
+            )[1]
+            let later = TintFlowMotion.currentLocations(
+                phase: TintFlowMotion.fieldPhase(
+                    at: origin + 1,
+                    period: TintFlowMotion.currentPeriod
+                )
+            )[1]
+            let step = abs(later - now)
+            XCTAssertGreaterThan(step, 0, "the band stopped travelling at t=\(origin)")
+            // The triangle wave's fastest advance is 2/period of phase per
+            // second, so the band can never cross more than about a percent
+            // of the surface in a second. Anything faster is watchable.
+            XCTAssertLessThanOrEqual(
+                step,
+                2 * TintFlowMotion.currentTravel / TintFlowMotion.currentPeriod + 1e-9,
+                "the band moved faster than its declared pace at t=\(origin)"
+            )
+        }
+
+        // Phase stays inside [−1, 1] at any time, so the travels above are
+        // the whole travel — no phase can throw a stop outside its bounds.
+        for time in stride(from: 0.0, through: 240, by: 7.9) {
+            let phase = TintFlowMotion.fieldPhase(at: time, period: TintFlowMotion.foldPeriod)
+            XCTAssertGreaterThanOrEqual(phase, -1)
+            XCTAssertLessThanOrEqual(phase, 1)
+        }
+
+        // The pin: no time moves anything.
+        for time in [0.0, 13.7, 400.2] {
+            XCTAssertEqual(
+                TintFlowMotion.fieldPhase(
+                    at: time,
+                    period: TintFlowMotion.currentPeriod,
+                    animated: false
+                ),
+                0
+            )
+        }
+    }
+
+    /// The lively-flow re-solve of the tinted ink story. Light: the sweep
+    /// rose to 0.34 stops and two flow layers stack over it, so the worst
+    /// sustained patch is re-derived — heaviest stop × intensity, deepest
+    /// colour any palette can emit, over the modelled Tinted ground — and
+    /// held at or above the 0.75 the light `KaisolaInk` floors were solved
+    /// on. The flow layers cannot deepen that patch: every light flow colour
+    /// is lifted to the 0.78 floor before it paints, and per-channel
+    /// compositing is convex, so a layer above the floor can never pull a
+    /// surface below it. Dark is the mirror — flow colours are capped under
+    /// the dark canvas's own modelled worst patch, so stacking them shifts
+    /// hue, never brightness, and the dark ink story stays exactly the
+    /// sweep's.
+    func testTintFieldFlowLayersHoldTheInkStoryByConstruction() {
+        for intensity in TintIntensity.allCases {
+            XCTAssertGreaterThanOrEqual(
+                TintFlowComposition.lightModeledWorstPatch(intensity: intensity),
+                0.75,
+                "\(intensity.title): the light sweep dipped below the patch the ink ladder was solved on"
+            )
+        }
+        XCTAssertGreaterThanOrEqual(TintFlowComposition.lightFlowLuminanceFloor, 0.78 - 1e-9)
+        XCTAssertLessThan(
+            TintFlowComposition.lightFlowLuminanceFloor,
+            OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: false),
+            "a flow layer may tint the canvas, never lighten it past its own ground"
+        )
+        // The dark ceiling is the canvas's modelled worst patch — anchor
+        // coverage of the peak over the near-black ground — and stays in the
+        // band the dark ink was measured against.
+        let ceiling = TintFlowComposition.darkFlowLuminanceCeiling
+        XCTAssertGreaterThanOrEqual(ceiling, 0.20)
+        XCTAssertLessThanOrEqual(ceiling, 0.26)
+
+        let desktopSamples = [
+            DesktopTintSampler.fallback,
+            DesktopTintComponents(red: 0.05, green: 0.20, blue: 0.95),
+            DesktopTintComponents(red: 0.95, green: 0.10, blue: 0.10),
+            DesktopTintComponents(red: 0.10, green: 0.80, blue: 0.20),
+        ]
+        for palette in TintPalette.allCases {
+            for sample in desktopSamples {
+                for stops in [
+                    TintFlowComposition.lightCurrent(
+                        palette: palette, desktop: sample, coverageScale: 1
+                    ),
+                    TintFlowComposition.lightRipple(
+                        palette: palette, desktop: sample, coverageScale: 1
+                    ),
+                ] {
+                    for stop in stops {
+                        XCTAssertGreaterThanOrEqual(
+                            TintFlowMotion.weightedLuminance(TintRGB(
+                                red: stop.red, green: stop.green, blue: stop.blue
+                            )),
+                            TintFlowComposition.lightFlowLuminanceFloor - 1e-9,
+                            "\(palette.title): a light flow colour dipped under the floor"
+                        )
+                    }
+                }
+                for stops in [
+                    TintFlowComposition.darkCurrent(
+                        palette: palette, tint: sample, coverageScale: 1
+                    ),
+                    TintFlowComposition.darkRipple(
+                        palette: palette, tint: sample, coverageScale: 1
+                    ),
+                ] {
+                    for stop in stops {
+                        XCTAssertLessThanOrEqual(
+                            TintFlowMotion.weightedLuminance(TintRGB(
+                                red: stop.red, green: stop.green, blue: stop.blue
+                            )),
+                            ceiling + 1e-9,
+                            "\(palette.title): a dark flow colour outshines the canvas's worst patch"
+                        )
+                    }
+                }
+            }
+        }
+
+        // The layers keep their shapes and their seniority: the band is
+        // clear at both edges and peaks mid-band, the bloom is full at its
+        // centre and clear at the rim, and both stay junior to every sweep
+        // stop — the sweep carries the colour, the flow carries the change.
+        let fallback = DesktopTintSampler.fallback
+        let band = TintFlowComposition.lightCurrent(
+            palette: .meadow, desktop: fallback, coverageScale: 1
+        )
+        XCTAssertEqual(band.map(\.location), [0, 0.5, 1])
+        XCTAssertEqual(band[0].opacity, 0)
+        XCTAssertEqual(band[2].opacity, 0)
+        XCTAssertEqual(
+            band[1].opacity,
+            TintFlowComposition.currentCoverage.light,
+            accuracy: 1e-9
+        )
+        let bloom = TintFlowComposition.lightRipple(
+            palette: .meadow, desktop: fallback, coverageScale: 1
+        )
+        XCTAssertEqual(
+            bloom.map(\.location),
+            [0, TintFlowComposition.rippleShoulderLocation, 1]
+        )
+        XCTAssertEqual(
+            bloom[0].opacity,
+            TintFlowComposition.rippleCoverage.light,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            bloom[1].opacity,
+            TintFlowComposition.rippleCoverage.light * TintFlowComposition.rippleShoulderShare,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(bloom[2].opacity, 0)
+        let lightestSweepStop = TintPalette.allCases
+            .compactMap(\.fixedLight)
+            .map { min($0.coolCoverage, min($0.neutralCoverage, $0.pearlCoverage)) }
+            .min() ?? 0
+        for coverage in [
+            TintFlowComposition.currentCoverage.light,
+            TintFlowComposition.currentCoverage.dark,
+            TintFlowComposition.rippleCoverage.light,
+            TintFlowComposition.rippleCoverage.dark,
+        ] {
+            XCTAssertGreaterThan(coverage, 0.05, "a flow layer thinned into noise")
+            XCTAssertLessThan(
+                coverage, lightestSweepStop,
+                "a flow layer outweighs a sweep stop and becomes the theme"
+            )
+        }
+
+        // Intensity passes through the flow layers exactly as it does the
+        // sweep, saturating per stop.
+        let scaled = TintFlowComposition.lightCurrent(
+            palette: .meadow, desktop: fallback, coverageScale: 2
+        )
+        XCTAssertEqual(
+            scaled[1].opacity,
+            min(1, TintFlowComposition.currentCoverage.light * 2),
+            accuracy: 1e-9
+        )
+        let saturated = TintFlowComposition.darkRipple(
+            palette: .meadow, tint: fallback, coverageScale: 50
+        )
+        XCTAssertEqual(saturated[0].opacity, 1)
+
+        // The floor and cap helpers are exact: a floored colour measures the
+        // floor, a capped colour the ceiling, and colours already inside
+        // come back untouched.
+        let deep = TintRGB(red: 0.10, green: 0.20, blue: 0.90)
+        XCTAssertEqual(
+            TintFlowMotion.weightedLuminance(
+                TintFlowMotion.luminanceFloored(deep, floor: 0.78)
+            ),
+            0.78,
+            accuracy: 1e-6
+        )
+        let bright = TintRGB(red: 0.9, green: 0.9, blue: 0.2)
+        XCTAssertEqual(
+            TintFlowMotion.weightedLuminance(
+                TintFlowMotion.luminanceCapped(bright, ceiling: 0.24)
+            ),
+            0.24,
+            accuracy: 1e-6
+        )
+        XCTAssertEqual(TintFlowMotion.luminanceFloored(bright, floor: 0.5), bright)
+        XCTAssertEqual(TintFlowMotion.luminanceCapped(deep, ceiling: 0.5), deep)
+    }
+
+    /// The field's Core Animation contract, held without a screen: arming
+    /// attaches exactly the declared animations — autoreversing, infinite,
+    /// frame-capped to single digits at their declared periods — the
+    /// occlusion gate freezes the container's one shared clock, and the
+    /// pinned / Reduce Motion path attaches nothing at all while still
+    /// composing the full three-layer palette.
+    func testTintFlowFieldHostArmsCalmAnimationsAndFreezesWithOcclusion() {
+        let host = TintFlowFieldHostView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 300)
+        )
+        let fallback = DesktopTintSampler.fallback
+        let swell = TintFlowComposition.light(
+            palette: .meadow, desktop: fallback, coverageScale: 1
+        )
+        let band = TintFlowComposition.lightCurrent(
+            palette: .meadow, desktop: fallback, coverageScale: 1
+        )
+        let bloom = TintFlowComposition.lightRipple(
+            palette: .meadow, desktop: fallback, coverageScale: 1
+        )
+        let start = CGPoint(x: 0, y: 1)
+        let end = CGPoint(x: 1, y: 0)
+
+        // Pinned first: the park arms nothing.
+        host.apply(
+            swellStops: swell, currentStops: band, rippleStops: bloom,
+            startPoint: start, endPoint: end, animated: false
+        )
+        XCTAssertTrue(host.animationsForTesting().isEmpty, "a pinned field is a still")
+
+        // Armed, with the opt-in breath: every declared key at its declared
+        // period, all render-server owned, all under the single-digit cap.
+        host.apply(
+            swellStops: swell, currentStops: band, rippleStops: bloom,
+            startPoint: start, endPoint: end,
+            animated: true, breathing: true, breathDepth: 1
+        )
+        let animations = host.animationsForTesting()
+        let expected: [String: TimeInterval] = [
+            TintFlowFieldHostView.swellStartKey: TintFlowMotion.period,
+            TintFlowFieldHostView.swellEndKey: TintFlowMotion.period,
+            TintFlowFieldHostView.swellFoldKey: TintFlowMotion.foldPeriod,
+            TintFlowFieldHostView.currentStartKey: TintFlowMotion.currentShearPeriod,
+            TintFlowFieldHostView.currentEndKey: TintFlowMotion.currentShearPeriod,
+            TintFlowFieldHostView.currentTravelKey: TintFlowMotion.currentPeriod,
+            TintFlowFieldHostView.rippleCenterKey: TintFlowMotion.ripplePeriod,
+            TintFlowFieldHostView.rippleRadiusKey: TintFlowMotion.rippleRadiusPeriod,
+            TintFlowFieldHostView.breathKey: TintFlowMotion.breathPeriod,
+            TintFlowFieldHostView.breathSwellKey: TintFlowMotion.breathScalePeriod,
+        ]
+        XCTAssertEqual(Set(animations.keys), Set(expected.keys))
+        for (key, period) in expected {
+            guard let animation = animations[key] as? CABasicAnimation else {
+                XCTFail("\(key) is not the declared basic animation")
+                continue
+            }
+            XCTAssertEqual(animation.duration, period, accuracy: 1e-9, key)
+            XCTAssertTrue(animation.autoreverses, key)
+            XCTAssertEqual(animation.repeatCount, .infinity, key)
+            XCTAssertFalse(animation.isRemovedOnCompletion, key)
+            XCTAssertLessThanOrEqual(
+                animation.preferredFrameRateRange.maximum, 15,
+                "\(key) would hold a ProMotion display off its idle refresh"
+            )
+        }
+
+        // Without the breath, the field still flows — the breath pair is the
+        // only opt-in.
+        host.apply(
+            swellStops: swell, currentStops: band, rippleStops: bloom,
+            startPoint: start, endPoint: end,
+            animated: true, breathing: false, breathDepth: 1
+        )
+        let unbreathing = host.animationsForTesting()
+        XCTAssertNil(unbreathing[TintFlowFieldHostView.breathKey])
+        XCTAssertNil(unbreathing[TintFlowFieldHostView.breathSwellKey])
+        XCTAssertEqual(unbreathing.count, expected.count - 2)
+
+        // A shape change — light's three stops becoming dark's two on an
+        // appearance flip — re-arms the fold with the new stop count. A
+        // stale three-element locations animation on a two-stop model is
+        // undefined interpolation, which is exactly what the colour-only
+        // fast path must not preserve.
+        let darkSwell = TintFlowComposition.dark(
+            palette: .meadow, tint: fallback, coverageScale: 1
+        )
+        let darkBand = TintFlowComposition.darkCurrent(
+            palette: .meadow, tint: fallback, coverageScale: 1
+        )
+        let darkBloom = TintFlowComposition.darkRipple(
+            palette: .meadow, tint: fallback, coverageScale: 1
+        )
+        host.apply(
+            swellStops: darkSwell, currentStops: darkBand, rippleStops: darkBloom,
+            startPoint: start, endPoint: end,
+            animated: true, breathing: false, breathDepth: 1
+        )
+        guard
+            let fold = host.animationsForTesting()[TintFlowFieldHostView.swellFoldKey]
+                as? CABasicAnimation,
+            let foldFrom = fold.fromValue as? [NSNumber]
+        else {
+            return XCTFail("the appearance flip lost the fold animation")
+        }
+        XCTAssertEqual(
+            foldFrom.count, darkSwell.count,
+            "the fold still interpolates the previous appearance's stop count"
+        )
+
+        // Occlusion freezes the one shared clock; visibility restores it.
+        host.windowOcclusionChanged(visible: false)
+        XCTAssertEqual(host.fieldSpeedForTesting, 0)
+        host.windowOcclusionChanged(visible: true)
+        XCTAssertEqual(host.fieldSpeedForTesting, 1)
+        XCTAssertEqual(TintFlowFieldHostView.layerSpeed(visible: false), 0)
+        XCTAssertEqual(TintFlowFieldHostView.layerSpeed(visible: true), 1)
+
+        // Reduce Motion arriving strips the field back to a still.
+        host.apply(
+            swellStops: swell, currentStops: band, rippleStops: bloom,
+            startPoint: start, endPoint: end, animated: false
+        )
+        XCTAssertTrue(host.animationsForTesting().isEmpty)
     }
 
     /// Increased Contrast has to be a *visible* step up from the ordinary veil

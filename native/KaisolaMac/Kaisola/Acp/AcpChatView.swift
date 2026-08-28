@@ -3272,15 +3272,30 @@ extension NSImage {
 /// used, deliberately without the "/ 1,000k" denominator: the limit read as a
 /// wall you were about to hit, and the number that matters is what the session
 /// has actually spent.
-struct AcpChatOverflowMenu: View {
+struct AcpChatOverflowMenu<LeadingSections: View>: View {
     @ObservedObject var conversation: AcpConversation
     @ObservedObject private var previewSettings = NativePreviewSettings.shared
+
+    /// The pane header's removed account button lives here now (2026-08-28,
+    /// "we can remove … the account button"): RootShellView injects the
+    /// account-and-model sections at the top of this one overflow, so
+    /// switching either stays a single click's travel from where it was.
+    private let leadingSections: () -> LeadingSections
 
     @State private var restoreTarget: AcpConversation.TurnCheckpoint?
     @State private var isExportingTranscript = false
 
+    init(
+        conversation: AcpConversation,
+        @ViewBuilder leadingSections: @escaping () -> LeadingSections
+    ) {
+        self.conversation = conversation
+        self.leadingSections = leadingSections
+    }
+
     var body: some View {
         Menu {
+            leadingSections()
             Menu("Chat Zoom") {
                 ForEach(AgentChatTextSize.allCases) { size in
                     Button {
@@ -3402,5 +3417,11 @@ struct AcpChatOverflowMenu: View {
                 )
             }
         }
+    }
+}
+
+extension AcpChatOverflowMenu where LeadingSections == EmptyView {
+    init(conversation: AcpConversation) {
+        self.init(conversation: conversation) { EmptyView() }
     }
 }

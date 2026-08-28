@@ -189,14 +189,19 @@ final class QuietSplitSelectionTests: XCTestCase {
         XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: "term-2"))
     }
 
-    /// The companion treatment has to be visibly weaker than the selected one,
-    /// or a split reads as two equally-focused rows.
-    func testACompanionPaneIsMarkedButRanksBelowTheSelectedRow() {
-        XCTAssertGreaterThan(QuietSelectionPill.companionOpacity, 0)
-        XCTAssertLessThan(
-            QuietSelectionPill.companionOpacity,
-            1,
-            "a companion pane must not wear the same pill as the focused row"
+    /// Graduated 2026-08-28 ("not … a double card situation for the lhs
+    /// rail"): a split's companion pane rests quiet — only the selected row
+    /// wears a fill, and the split's other pane is ordinary text inside the
+    /// rail rather than a second, fainter pill.
+    func testACompanionPaneRestsQuietWhileOnlyTheSelectedRowWearsTheFill() {
+        XCTAssertEqual(
+            QuietSelectionPill.fill(isSelected: true, isOnScreen: true, hovering: false),
+            .selectionPill
+        )
+        XCTAssertEqual(
+            QuietSelectionPill.fill(isSelected: false, isOnScreen: true, hovering: false),
+            QuietRowFill.none,
+            "a companion pane must not wear a pill of its own"
         )
     }
 }

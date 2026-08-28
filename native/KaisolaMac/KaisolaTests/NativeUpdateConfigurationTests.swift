@@ -150,51 +150,29 @@ final class NativeUpdateConfigurationTests: XCTestCase {
         XCTAssertFalse(center.isInstallingUpdate)
     }
 
-    func testWorkspaceSettingsCheckRunsOnlyAfterTheSheetDismisses() {
-        let coordinator = SettingsSheetUpdateCoordinator()
-        var events: [String] = []
-
-        coordinator.request(.check) {
-            events.append("dismiss")
-        }
-
-        XCTAssertEqual(events, ["dismiss"])
-        XCTAssertEqual(coordinator.pendingAction, .check)
-
-        coordinator.performAfterDismissal(
-            check: { events.append("check") },
-            install: { events.append("install") }
+    /// The Settings takeover is an overlay, not a sheet, so Sparkle actions
+    /// no longer need the old dismissal coordinator: nothing about the
+    /// takeover trips the install gate's blocking-presentation check, and
+    /// the footer's update badge rides the same two published axes.
+    func testFooterUpdateBadgeFollowsPendingUpdateState() {
+        XCTAssertEqual(
+            FooterUpdateBadge.resolve(pendingVersion: nil, isInstalling: false),
+            .hidden,
+            "nothing to install, no affordance"
         )
-        coordinator.performAfterDismissal(
-            check: { events.append("duplicate-check") },
-            install: { events.append("duplicate-install") }
+        XCTAssertEqual(
+            FooterUpdateBadge.resolve(pendingVersion: "2.0.1", isInstalling: false),
+            .ready(version: "2.0.1")
         )
-
-        XCTAssertEqual(events, ["dismiss", "check"])
-        XCTAssertNil(coordinator.pendingAction)
-    }
-
-    func testWorkspaceSettingsInstallRunsOnlyAfterTheSheetDismisses() {
-        let coordinator = SettingsSheetUpdateCoordinator()
-        var events: [String] = []
-
-        coordinator.request(.install) {
-            events.append("dismiss")
-        }
-        coordinator.request(.check) {
-            events.append("second-dismiss")
-        }
-
-        XCTAssertEqual(events, ["dismiss"])
-        XCTAssertEqual(coordinator.pendingAction, .install)
-
-        coordinator.performAfterDismissal(
-            check: { events.append("check") },
-            install: { events.append("install") }
+        XCTAssertEqual(
+            FooterUpdateBadge.resolve(pendingVersion: "2.0.1", isInstalling: true),
+            .installing,
+            "once installation starts the badge must stop inviting clicks"
         )
-
-        XCTAssertEqual(events, ["dismiss", "install"])
-        XCTAssertNil(coordinator.pendingAction)
+        XCTAssertTrue(
+            FooterUpdateBadge.ready(version: "2.0.1").help.contains("2.0.1"),
+            "the tooltip names the version"
+        )
     }
 
     func testProductionInstallGateDetectsAnyApplicationSheet() {

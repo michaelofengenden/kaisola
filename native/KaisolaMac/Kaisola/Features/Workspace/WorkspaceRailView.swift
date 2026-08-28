@@ -177,7 +177,6 @@ struct WorkspaceRailView: View {
 
     @EnvironmentObject private var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.shellPreview) private var shellPreview
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
@@ -299,8 +298,7 @@ struct WorkspaceRailView: View {
                                         )
                                         : .clear,
                                     in: ShellTabShape.shape(
-                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                                        preview: shellPreview
+                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                                     )
                                 )
                                 .contentShape(Rectangle())
@@ -326,20 +324,15 @@ struct WorkspaceRailView: View {
         // The persisted preference stays at least 164 pt, but the responsive
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
-        // Shell preview OFF (shipped): one layer, flush to the window edges,
-        // exactly like the left project rail — the rail paints its own glass
-        // and the seam to the content is the resize divider's hairline.
-        // Preview ON (2026-08-28 revision, decision 6): no backdrop of its
-        // own — the rail mounts inside the shared floating chrome card
-        // (`kaisolaChromePanel` in `RootShellView.detailArea`), which supplies
-        // the surface, the soft shadow, and the gutter of window glass around
-        // it. Painting the full-bleed rail glass here again would fill that
-        // gutter and turn the card back into a column.
+        // One flush full-height column, exactly like the left project rail —
+        // and, graduated 2026-08-28, the same SURFACE as the canvas: the rail
+        // mounts the canvas recipe (`WorkspaceBackdropView`), not the
+        // dedicated rail wash, so the boundary to the content carries no tone
+        // jump and the resize divider's hairline is the whole seam. (See the
+        // measured note on the project rail's background in RootShellView.)
         .background {
-            if !shellPreview.isOn {
-                SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
-                    .ignoresSafeArea()
-            }
+            WorkspaceBackdropView(mode: settings.workspaceBackdrop)
+                .ignoresSafeArea()
         }
         .task {
             tree.load(root)
@@ -1028,8 +1021,7 @@ struct WorkspaceRailView: View {
                     )
                     : .clear,
                 in: ShellTabShape.shape(
-                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
-                    preview: shellPreview
+                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                 )
             )
             .contentShape(Rectangle())

@@ -168,104 +168,29 @@ enum AcpBubble {
     }
 }
 
-/// Stroke coverage shared by the two horizontal tab families.
-enum SurfaceTabChrome {
-    static let projectSelectedStrokeOpacity = 0.38
-    static let sessionSelectedStrokeOpacity = 0.30
-    static let inactiveStrokeOpacity = 0.11
+/// The graduated shell's window shape. The 2026-08-28 revision shipped
+/// behind a runtime preview (`shellPreviewVariant`); Michael confirmed the
+/// pills variant and it graduated to THE shell, so the 30pt continuous
+/// corner is unconditional now. The workspace window runs a transparent
+/// titlebar over a full-size clear-backed content view, so clipping the root
+/// at this radius makes the corner genuinely the window's own — the pixels
+/// outside the curve are transparent, not painted over the system corner.
+enum ShellWindowChrome {
+    static let cornerRadius: CGFloat = KaisolaVisualSystem.shellRadius
 }
 
-/// The 2026-08-28 shell revision, as a runtime preview (feedback round two:
-/// "let me play around with a live preview version instead" of rendered
-/// images). Off is the shipped shell, exactly; the two on states render the
-/// merged 40pt session-tab bar, the card rails with quiet rows, the 30pt
-/// window corner, and the tab silhouette the case names — `paneRadius` pills
-/// that rhyme with the pane cards, or full capsules like Safari's tab groups.
-///
-/// The persisted choice lives in `NativePreviewSettings.shellPreviewVariant`;
-/// fixture processes may still force a variant with
-/// `KAISOLA_SHELL_PREVIEW_TABS=off|pills|capsules`, which outranks the
-/// setting. Views read the resolved value from `\.shellPreview`, injected at
-/// each workspace window's root, so flipping the Settings picker applies
-/// live.
-enum ShellPreviewVariant: String, CaseIterable, Identifiable {
-    case off
-    case pills
-    case capsules
-
-    var id: String { rawValue }
-
-    /// Whether the shell revision renders at all. Every preview-gated branch
-    /// keys off this, so "off" cannot half-apply.
-    var isOn: Bool { self != .off }
-
-    /// Settings picker labels; the row's detail line carries the
-    /// "experimental" caption.
-    var title: String {
-        switch self {
-        case .off: "Off"
-        case .pills: "New shell · pill tabs"
-        case .capsules: "New shell · capsule tabs"
-        }
-    }
-
-    /// Decision 4's real window shape — only under the preview. Off keeps the
-    /// system corner (a zero radius clips nothing visible), so the shipped
-    /// window is untouched until the preview asks for the 30pt shell corner.
-    var windowCornerRadius: CGFloat {
-        isOn ? KaisolaVisualSystem.shellRadius : 0
-    }
-
-    /// The env override wins whenever it parses; anything else — absent,
-    /// misspelt — defers to the persisted setting. `nonisolated` on purpose:
-    /// fixtures and tests resolve this off the main actor.
-    nonisolated static func resolved(
-        environment: [String: String],
-        setting: ShellPreviewVariant
-    ) -> ShellPreviewVariant {
-        if let forced = environment["KAISOLA_SHELL_PREVIEW_TABS"]
-            .flatMap(ShellPreviewVariant.init) {
-            return forced
-        }
-        return setting
-    }
-}
-
-private struct ShellPreviewEnvironmentKey: EnvironmentKey {
-    /// Off by default so a hierarchy nobody injected into — unit-test
-    /// renders, previews — is the shipped shell, never the experiment.
-    static let defaultValue = ShellPreviewVariant.off
-}
-
-extension EnvironmentValues {
-    /// The resolved shell-preview variant for this window. Injected once at
-    /// the workspace window's root from the observed settings object (env
-    /// override applied there), so every preview-gated view under it switches
-    /// live and from one source.
-    var shellPreview: ShellPreviewVariant {
-        get { self[ShellPreviewEnvironmentKey.self] }
-        set { self[ShellPreviewEnvironmentKey.self] = newValue }
-    }
-}
-
-/// The preview tabs' silhouette (and the rail selection fills that borrow
-/// their language).
+/// The session tabs' silhouette (and the rail selection fills that borrow
+/// their language). Graduated 2026-08-28: Michael — "I don't see much
+/// difference between pill and capsule tabs" — so the pills case is the one
+/// silhouette and the capsule variant is gone.
 enum ShellTabShape {
     /// The silhouette at the requested scale. Tabs pass `paneRadius`; the
     /// rail rows pass their own row-scale radius so a pill stays a row and
-    /// never becomes a lozenge. With the preview off this is the shipped
-    /// continuous rounded rectangle, identical to the pills case, so shared
-    /// call sites (the rail pills) render exactly as main does today.
+    /// never becomes a lozenge.
     static func shape(
-        cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius,
-        preview: ShellPreviewVariant
+        cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius
     ) -> AnyShape {
-        switch preview {
-        case .off, .pills:
-            AnyShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        case .capsules:
-            AnyShape(Capsule(style: .continuous))
-        }
+        AnyShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 
@@ -279,10 +204,9 @@ struct ShellTabCardBackground: View {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.shellPreview) private var shellPreview
 
     var body: some View {
-        let shape = ShellTabShape.shape(cornerRadius: cornerRadius, preview: shellPreview)
+        let shape = ShellTabShape.shape(cornerRadius: cornerRadius)
         Group {
             if reduceTransparency {
                 shape.fill(Color(nsColor: .controlBackgroundColor))
@@ -1928,204 +1852,72 @@ extension View {
     func kaisolaBarSurface() -> some View {
         modifier(KaisolaBarSurfaceModifier())
     }
+}
 
-    /// Safari's inset floating-card chrome. The window backdrop stays visible
-    /// in a gutter around the panel; the content rides a rounded material with
-    /// a hairline top-light edge. Reduce Transparency yields a clean solid.
-    /// A floating inset card for content that must be isolated from whatever is
-    /// behind the window — the detail canvas and its panels.
-    ///
-    /// Deliberately *not* used by the project sidebar or the Files rail: the
-    /// two rails are the ground and the detail content column is the card,
-    /// and nothing else is either. Navigation chrome has nothing to isolate,
-    /// and stacking this material over a rail backdrop hid the desktop that
-    /// backdrop exists to show — the exact box the flush-rail change removed.
-    func kaisolaChromePanel(
-        inset: CGFloat = KaisolaVisualSystem.chromeInset,
-        topInset: CGFloat? = nil
-    ) -> some View {
-        modifier(
-            KaisolaChromePanelModifier(
-                inset: inset,
-                topInset: topInset ?? inset
-            )
-        )
+/// One hover-and-press voice for the shell's chrome controls (2026-08-28
+/// graduation, "General UI buttons and clicking should be smooth"): a faint
+/// rounded wash eases in under the pointer, the press deepens it and settles
+/// the control a hair, and both transitions ride the shared `stateDuration`
+/// easing instead of flipping between states. Content-area semantics
+/// (transcript, terminal) deliberately do not adopt this.
+enum KaisolaChromeControlWash {
+    static let hoverOpacity: Double = 0.06
+    static let pressedOpacity: Double = 0.11
+    static let pressedScale: CGFloat = 0.97
+    /// `KaisolaVisualSystem.stateDuration` (140ms) — inside the 120–180ms
+    /// band a state change reads as an answer rather than a cut or a delay.
+    static var duration: Double { KaisolaVisualSystem.stateDuration }
+
+    static func washOpacity(hovering: Bool, pressed: Bool) -> Double {
+        if pressed { return pressedOpacity }
+        return hovering ? hoverOpacity : 0
     }
 }
 
-private struct KaisolaChromePanelModifier: ViewModifier {
-    let inset: CGFloat
-    let topInset: CGFloat
+/// The shared chrome button style: hover wash, eased press, Reduce Motion
+/// honored locally so the style is safe even in trees that never mounted
+/// `kaisolaReduceMotionFallback`.
+struct KaisolaChromeButtonStyle: ButtonStyle {
+    var cornerRadius: CGFloat = KaisolaVisualSystem.controlRadius
 
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.colorSchemeContrast) private var accessibilityContrast
-    @ObservedObject private var settings = NativePreviewSettings.shared
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(
-            cornerRadius: KaisolaVisualSystem.chromeRadius,
-            style: .continuous
-        )
-        return content
-            .clipShape(shape)
-            .background { panelFill(shape) }
-            .background { cardShadow(shape) }
-            .overlay { panelEdge(shape) }
-            .padding(.top, topInset)
-            .padding(.leading, inset)
-            .padding(.trailing, inset)
-            .padding(.bottom, inset)
+    func makeBody(configuration: Configuration) -> some View {
+        ChromeButtonBody(configuration: configuration, cornerRadius: cornerRadius)
     }
 
-    /// The card's float, drawn as a shadow-ring: an opaque shape, shadowed,
-    /// then masked out of its own interior. It composites once and the render
-    /// server caches it — no per-frame work and no offscreen pass over the
-    /// live material the `.glass` fill sits on. The spill into the 6pt gutter
-    /// is the depth cue; it must never be animated, and never allowed to eat
-    /// clicks aimed at the divider corridors that share that gutter.
-    ///
-    /// The mask's rectangle is padded OUT past the card's own frame by the
-    /// shadow's full reach. A frame-bound `Rectangle()` here erased the
-    /// outward spill entirely and kept only the bounding-box corner notches —
-    /// four blurred wedges ending at hard 90° edges, which read as small grey
-    /// squares tucked behind every rounded corner (Michael's 2026-08-26
-    /// screenshot). The negative padding is what lets the shadow fade
-    /// continuously into the gutter the way the doc always claimed it did.
-    @ViewBuilder
-    private func cardShadow(_ shape: RoundedRectangle) -> some View {
-        if ChromeCardElevation.engages(
-            reduceTransparency: reduceTransparency,
-            increasedContrast: accessibilityContrast == .increased
-        ) {
-            shape
-                .fill(Color.black)
-                .shadow(
-                    color: .black.opacity(
-                        ChromeCardElevation.shadowOpacity(isDark: colorScheme == .dark)
-                    ),
-                    radius: ChromeCardElevation.shadowRadius,
-                    x: 0,
-                    y: ChromeCardElevation.shadowOffsetY
-                )
-                .compositingGroup()
-                .mask {
-                    Rectangle()
-                        .padding(-(
-                            ChromeCardElevation.shadowRadius * 2
-                                + ChromeCardElevation.shadowOffsetY
-                        ))
-                        .overlay { shape.fill(Color.black).blendMode(.destinationOut) }
-                        .compositingGroup()
-                }
-                .allowsHitTesting(false)
-        }
-    }
+    private struct ChromeButtonBody: View {
+        let configuration: ButtonStyle.Configuration
+        let cornerRadius: CGFloat
 
-    /// Dark appearance darkens the panel instead of lightening it.
-    ///
-    /// `.thinMaterial` is a *light-leaning* material: it lifts whatever is under
-    /// it toward white in both appearances. Over the detail column — which is
-    /// most of the window — that meant the one surface the glass work was solved
-    /// for was covered by something pulling the opposite way, so dark mode read
-    /// as washed grey rather than dark glass, and the composite the veil
-    /// constants were measured against never actually reached the screen. It is
-    /// a large part of why the glass did not look dark, and no amount of tuning
-    /// the bake underneath it would have shown.
-    ///
-    /// The replacement keeps the panel's real job — isolating content from the
-    /// backdrop so text keeps its floor — but does it with neutral black over a
-    /// thinner material, so the surface moves down instead of up and the backdrop
-    /// still shows through. Light appearance is unchanged: there `.thinMaterial`
-    /// already moves the surface the way it should go.
-    /// The panel isolates content from the backdrop, so what it should lay
-    /// down depends on what the card is asked to isolate. Every theme's
-    /// ground is material now — Solid and Tinted included — so the question
-    /// is no longer *whether* there is a backdrop but whether the card lets
-    /// it through. Solid's card stays fully opaque: that opacity is what
-    /// keeps Solid's promise ("nothing behind the window reaches the surface
-    /// your work sits on") now that the ground around the card is material.
-    /// Tinted's card stays clear so the tint-over-material shows through it,
-    /// and Glass keeps its frost.
-    @ViewBuilder
-    private func panelFill(_ shape: RoundedRectangle) -> some View {
-        if reduceTransparency {
-            shape.fill(Color(nsColor: .controlBackgroundColor))
-        } else {
-            switch settings.workspaceBackdrop {
-            case .system:
-                // The opaque fill is what makes the Solid card read as a
-                // *card* — its edge against the material gutter is the whole
-                // visible delta of the glass-ground change in Solid.
-                shape.fill(Color(nsColor: .windowBackgroundColor))
-            case .tinted:
-                // `WorkspaceBackdropView` already composites the solid surface
-                // and the desktop's hue over it. Anything added here would only
-                // grey down the tint this theme exists to show.
-                Color.clear
-            case .glass:
-                if colorScheme == .dark {
-                    ZStack {
-                        shape.fill(.ultraThinMaterial)
-                        shape.fill(Color.black.opacity(Self.darkPanelCoverage))
-                    }
-                } else {
-                    // The global workspace layer already owns the blur. A
-                    // second material here turned the otherwise-white canvas
-                    // grey and nearly erased its remaining depth, so the panel
-                    // is only an achromatic frost over that shared glass.
-                    shape.fill(Color.white.opacity(LightGlassFrost.panelWhiteCoverage))
-                }
-            }
-        }
-    }
+        @State private var hovering = false
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @Environment(\.isEnabled) private var isEnabled
 
-    /// How much neutral black the dark panel lays over its own thin material.
-    /// Chosen so the panel is at least as isolating as `.thinMaterial` was —
-    /// content legibility must not regress — while moving the surface down
-    /// rather than up.
-    static let darkPanelCoverage: Double = 0.34
-
-    /// The lit top edge is what sells a floating card. Reduce Transparency
-    /// and Increased Contrast both swap it for the flat semantic separator so
-    /// nothing reads as glass — the same `engages` decision that withholds
-    /// the shadow, so the card's whole accessibility posture is one switch.
-    @ViewBuilder
-    private func panelEdge(_ shape: RoundedRectangle) -> some View {
-        if !ChromeCardElevation.engages(
-            reduceTransparency: reduceTransparency,
-            increasedContrast: accessibilityContrast == .increased
-        ) {
-            shape.strokeBorder(
-                Color(nsColor: .separatorColor),
-                lineWidth: KaisolaVisualSystem.hairline
+        var body: some View {
+            let wash = KaisolaChromeControlWash.washOpacity(
+                hovering: hovering && isEnabled,
+                pressed: configuration.isPressed
             )
-        } else {
-            ZStack {
-                // The containment hairline closes the bottom and sides in
-                // light appearance, where the top-light gradient fades to a
-                // white 0.10 that vanishes against a near-white ground. Dark
-                // contributes zero and stays byte-identical.
-                shape.strokeBorder(
-                    Color.black.opacity(
-                        ChromeCardElevation.containmentOpacity(isDark: colorScheme == .dark)
-                    ),
-                    lineWidth: KaisolaVisualSystem.hairline
+            configuration.label
+                .background(
+                    Color.primary.opacity(wash),
+                    in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 )
-                shape.strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(colorScheme == .dark ? 0.15 : 0.52),
-                            Color.white.opacity(colorScheme == .dark ? 0.03 : 0.10),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ),
-                    lineWidth: KaisolaVisualSystem.hairline
+                .scaleEffect(
+                    configuration.isPressed && !reduceMotion
+                        ? KaisolaChromeControlWash.pressedScale
+                        : 1
                 )
-            }
+                .animation(
+                    reduceMotion ? nil : .easeOut(duration: KaisolaChromeControlWash.duration),
+                    value: wash
+                )
+                .onHover { hovering = $0 }
         }
     }
+}
+
+extension ButtonStyle where Self == KaisolaChromeButtonStyle {
+    static var kaisolaChrome: KaisolaChromeButtonStyle { KaisolaChromeButtonStyle() }
 }
 
 /// Groups nearby macOS 26 glass controls so the system can render and morph

@@ -371,12 +371,22 @@ struct SettingsView: View {
     /// The delegate uses this to preserve the selected tab when a live project
     /// switch rebuilds workspace-scoped Settings content.
     var sectionChanged: ((String) -> Void)? = nil
+    /// The workspace-takeover presentation (ChatGPT-style, 2026-08-28): set,
+    /// the navigation column leads with a "← Back to app" row and the content
+    /// header needs no Done button — the page sits over the running
+    /// workspace and this closure restores it.
+    var backToApp: (() -> Void)? = nil
+    /// Overrides the reserved top band. The takeover lives inside a workspace
+    /// window whose traffic lights sit in the sidebar's deeper top band, so
+    /// the standalone-window constant would leave the page too high.
+    var titleBarClearance: CGFloat? = nil
 
     /// The window presentation hands its title-bar band back to AppKit. The
-    /// in-workspace sheet has no window buttons to clear and would only be
-    /// paying for an empty strip.
+    /// in-workspace takeover clears the workspace window's own control band
+    /// via `titleBarClearance`.
     private var titleBarSafeArea: CGFloat {
-        dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
+        if let titleBarClearance { return titleBarClearance }
+        return dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
     }
 
     private var settingsSearchResults: [SettingsSection] {
@@ -432,12 +442,17 @@ struct SettingsView: View {
         // Usage could show one account and part of the next. These fill a laptop
         // display without pinning a larger one, and the account grid spends the
         // extra width on columns rather than margins.
+        //
+        // The workspace takeover declares no minimum of its own: it fills
+        // whatever the workspace window is, which can legitimately be
+        // narrower (760pt floor) than the fixture window's contract, and an
+        // 820pt minimum inside a 760pt window would clip the far column.
         .frame(
-            minWidth: SettingsWindowChrome.minimumContentSize.width,
-            idealWidth: SettingsWindowChrome.idealContentSize.width,
+            minWidth: backToApp == nil ? SettingsWindowChrome.minimumContentSize.width : nil,
+            idealWidth: backToApp == nil ? SettingsWindowChrome.idealContentSize.width : nil,
             maxWidth: .infinity,
-            minHeight: SettingsWindowChrome.minimumContentSize.height,
-            idealHeight: SettingsWindowChrome.idealContentSize.height,
+            minHeight: backToApp == nil ? SettingsWindowChrome.minimumContentSize.height : nil,
+            idealHeight: backToApp == nil ? SettingsWindowChrome.idealContentSize.height : nil,
             maxHeight: .infinity
         )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
@@ -491,31 +506,55 @@ struct SettingsView: View {
 
     private func settingsNavigation(showsBrand: Bool) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Group {
-                if showsBrand {
-                    HStack(spacing: 9) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 9)
-                                .fill(Color.accentColor.gradient)
-                            Image(systemName: "slider.horizontal.3")
-                                .foregroundStyle(.white)
-                                .accessibilityHidden(true)
-                        }
-                        .frame(width: 30, height: 30)
-                        Text("Settings").font(.headline)
+            if let backToApp {
+                // The takeover's first row, ChatGPT-style: the way home leads
+                // the column, above search and the sections.
+                Button(action: backToApp) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Back to app")
+                            .font(.callout.weight(.medium))
+                        Spacer(minLength: 0)
                     }
-                } else {
-                    Color.clear
-                        .frame(height: SettingsWindowChrome.identityMarkSize)
-                        .accessibilityHidden(true)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .padding(.horizontal, 11)
+                    .frame(height: 30)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.kaisolaChrome)
+                .help("Back to app (Esc)")
+                .accessibilityLabel("Back to app")
+                .accessibilityIdentifier("settings.backToApp")
+                .padding(.horizontal, SettingsWindowChrome.navigationOuterPadding)
+                .padding(.bottom, 12)
+            } else {
+                Group {
+                    if showsBrand {
+                        HStack(spacing: 9) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 9)
+                                    .fill(Color.accentColor.gradient)
+                                Image(systemName: "slider.horizontal.3")
+                                    .foregroundStyle(.white)
+                                    .accessibilityHidden(true)
+                            }
+                            .frame(width: 30, height: 30)
+                            Text("Settings").font(.headline)
+                        }
+                    } else {
+                        Color.clear
+                            .frame(height: SettingsWindowChrome.identityMarkSize)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
+                .padding(.bottom, 16)
+                // A mark and the window's own name: nothing here answers a click.
+                // Saying so keeps this row from claiming one near the controls even
+                // if it ever drifts back up the column.
+                .allowsHitTesting(false)
             }
-            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
-            .padding(.bottom, 16)
-            // A mark and the window's own name: nothing here answers a click.
-            // Saying so keeps this row from claiming one near the controls even
-            // if it ever drifts back up the column.
-            .allowsHitTesting(false)
 
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
@@ -649,7 +688,9 @@ struct SettingsView: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        // The shared chrome answer: rows ease a faint wash in under the
+        // pointer instead of flipping straight to the click.
+        .buttonStyle(KaisolaChromeButtonStyle(cornerRadius: 9))
         .frame(maxWidth: .infinity)
         .accessibilityAddTraits(selectedSection == section ? .isSelected : [])
     }
@@ -727,20 +768,6 @@ struct SettingsView: View {
                         } label: { SettingsChoiceLabel(settings.theme.title) }
                         .menuIndicator(.hidden)
                         .accessibilityLabel("Theme")
-                    }
-                    SettingsDivider()
-                    SettingsRow(
-                        title: "Shell preview",
-                        detail: "Experimental: try the next shell — merged tab bar, card rails, rounder window — live",
-                        symbol: "macwindow.and.cursorarrow"
-                    ) {
-                        Menu {
-                            ForEach(ShellPreviewVariant.allCases) { variant in
-                                Button(variant.title) { settings.shellPreviewVariant = variant }
-                            }
-                        } label: { SettingsChoiceLabel(settings.shellPreviewVariant.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Shell preview")
                     }
                     if settings.theme == .tinted {
                         SettingsDivider()

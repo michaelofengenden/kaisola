@@ -545,6 +545,15 @@ extension Notification.Name {
     static var kaisolaOpenProviderSettings: Notification.Name {
         Notification.Name("kaisola.openProviderSettings")
     }
+
+    /// The app delegate's route into the in-workspace Settings takeover (⌘,
+    /// and every Settings menu deep link). Window-scoped through
+    /// `object: AppModel`; an optional
+    /// `AcpProviderSettingsNotificationKey.sectionID` lands the page on a
+    /// section.
+    static var kaisolaOpenSettingsSurface: Notification.Name {
+        Notification.Name("kaisola.openSettingsSurface")
+    }
 }
 
 enum AcpProviderSettingsNotificationKey {

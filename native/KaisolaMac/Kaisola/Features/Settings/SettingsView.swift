@@ -677,13 +677,22 @@ struct SettingsView: View {
                 Text(section.title)
                 Spacer(minLength: 0)
             }
+            // System Settings fills the selected row with the accent itself
+            // and flips its content to white, rather than tinting the surface
+            // under otherwise-unchanged text. The 14% wash this replaces read
+            // as "slightly warmer row"; at a glance the sidebar did not say
+            // which pane you were on.
             .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-            .foregroundStyle(selectedSection == section ? Color.primary : .kaisolaSecondary)
+            .foregroundStyle(
+                selectedSection == section
+                    ? AnyShapeStyle(.white)
+                    : AnyShapeStyle(Color.kaisolaSecondary)
+            )
             .padding(.horizontal, 11)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                selectedSection == section ? Color.accentColor.opacity(0.14) : .clear,
+                selectedSection == section ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.clear),
                 in: RoundedRectangle(cornerRadius: 9)
             )
             .contentShape(Rectangle())
@@ -1717,7 +1726,16 @@ struct SettingsRow<Trailing: View>: View {
                 Text(detail).font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer(minLength: 16)
-            trailing
+            // The control takes its own width, never the row's leftovers.
+            //
+            // A `Menu` fills whatever it is offered, and with a `Spacer` on
+            // its leading side that is every point the label does not use —
+            // so a two-word choice rendered as a control running most of the
+            // pane ("all the menu options are elongated", 2026-08-28). System
+            // Settings sizes each control to its value and right-aligns it,
+            // which is what asking for the ideal size here does. Applied once
+            // for every row rather than at ~15 call sites that can each forget.
+            trailing.fixedSize()
         }
         .padding(.horizontal, 16)
         .frame(minHeight: 58)
@@ -1728,20 +1746,28 @@ struct SettingsDivider: View {
     var body: some View { Divider().padding(.leading, 50).opacity(0.55) }
 }
 
+/// A pop-up value in System Settings' grammar: the current choice, then the
+/// chevron, sized to the value and nothing more.
+///
+/// The filled 108pt-minimum plate this replaced is what made the rows read as
+/// a column of long boxes. Apple draws the value as plain text with an accent
+/// chevron beside it and lets the row's own card supply the surface, so the
+/// eye reads a list of settings rather than a stack of controls. `minWidth` is
+/// gone with the plate: a fixed floor under a right-aligned label only pushes
+/// short values away from their own chevron.
 private struct SettingsChoiceLabel: View {
     let title: String
     init(_ title: String) { self.title = title }
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Text(title).lineLimit(1)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.kaisolaTertiary)
+                .foregroundStyle(Color.accentColor)
         }
         .font(.callout)
-        .padding(.horizontal, 10)
-        .frame(minWidth: 108, minHeight: 30)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .frame(minHeight: 22)
+        .contentShape(Rectangle())
     }
 }
 

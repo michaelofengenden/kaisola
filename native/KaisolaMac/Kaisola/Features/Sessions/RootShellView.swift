@@ -3958,9 +3958,10 @@ enum InitialSidebarWidth {
     /// move again — matched exactly (±2 for the restoration round-trip), so a
     /// width the user dragged anywhere else stays exactly as found. 248
     /// joined the list with the v0.1.125 move to 290; 290 joined with the
-    /// 2026-08-26 move to 245. Dragged widths persist, so a user choice can
-    /// never sit in this band by accident.
-    static let previouslyForcedIdeals: [CGFloat] = [210, 248, 290]
+    /// 2026-08-26 move to 245; 245 joined with the 2026-08-28 move to 196.
+    /// Dragged widths persist, so a user choice can never sit in this band by
+    /// accident.
+    static let previouslyForcedIdeals: [CGFloat] = [210, 245, 248, 290]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3988,11 +3989,17 @@ enum InitialSidebarWidth {
     }
 
     /// The key generation moves whenever the flag's meaning changes: v2
-    /// recorded "this window was widened to 248", v3 "moved to 290", and each
-    /// bump revisits flagged windows exactly once to move them to the current
-    /// ideal (or to the user's own persisted width, which wins outright).
+    /// recorded "this window was widened to 248", v3 "moved to 290", v4 "moved
+    /// to 245", and v5 "narrowed to 196". Each bump revisits flagged windows
+    /// exactly once to move them to the current ideal (or to the user's own
+    /// persisted width, which wins outright).
+    ///
+    /// Bumping is not optional when the ideal moves: a window already flagged
+    /// under v4 reports `didForce`, so without a new generation the narrowing
+    /// would reach only windows that had never been opened — which is the
+    /// exact way the 2026-08-14 widening missed the windows it was asked for.
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v4.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v5.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {

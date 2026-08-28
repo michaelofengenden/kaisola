@@ -6675,15 +6675,25 @@ final class NativePreviewSettingsTests: XCTestCase {
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 290, didForce: true)
         )
 
+        // 245 joins them with the 2026-08-28 narrowing to 196.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 245, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 245, didForce: true)
+        )
+
         // The new key generation is what re-arms previously-forced windows;
         // it must actually be new.
         XCTAssertTrue(
-            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v4.")
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v5.")
         )
 
-        // Never against a restored or user-chosen width — including the ideal
-        // itself, so a second window does not re-run the override.
-        for width in [168.0, 240.0, 245.0, 300.0, 340.0] {
+        // Never against a restored or user-chosen width. 245 has left this
+        // list — it is a width the app placed and so the app's to move — and
+        // the current ideal cannot join it: 196 is inside AppKit's own default
+        // band, so "is this untouched?" already answers for it.
+        for width in [240.0, 268.0, 300.0, 340.0] {
             XCTAssertFalse(
                 InitialSidebarWidth.shouldForceInitialWidth(
                     currentWidth: width,
@@ -6742,10 +6752,34 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 196)
-        XCTAssertGreaterThan(
-            NativeWorkspaceChrome.projectSidebarIdealWidth,
-            InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
-            "the ideal is inside the default's tolerance, so the override would never fire"
+
+        // 196 sits INSIDE macOS's own default band (195 ± 10), which every
+        // earlier ideal sat outside. That is not a defect, but it does move
+        // where this applier earns its keep: forcing 196 over AppKit's ~195 is
+        // a one-point no-op, so the fresh-window path no longer does anything
+        // visible, and the migration path is the whole feature. A window
+        // carrying 245 from 2026-08-26 must therefore be recognised and moved,
+        // or the narrowing reaches only windows that never opened before.
+        XCTAssertTrue(
+            InitialSidebarWidth.isSystemDefault(NativeWorkspaceChrome.projectSidebarIdealWidth)
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.isPreviouslyForcedIdeal(245),
+            "the width 2026-08-26 forced must still be the app's to move"
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 245, didForce: false),
+            "a 245pt window from the previous release must narrow"
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 268, didForce: false),
+            "a width the user dragged is still left exactly as found"
+        )
+        // The generation must move with the ideal, or every already-flagged
+        // window reports `didForce` and never hears about the new width.
+        XCTAssertTrue(
+            InitialSidebarWidth.defaultsKey(restorationID: "w").contains(".v5."),
+            "the key generation has to bump when the ideal does"
         )
         XCTAssertGreaterThanOrEqual(
             NativeWorkspaceChrome.projectSidebarIdealWidth,

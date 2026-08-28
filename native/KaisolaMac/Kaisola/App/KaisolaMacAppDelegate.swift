@@ -1308,6 +1308,25 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 .flatMap(TintIntensity.init) ?? .standard
             settings.tintIntensity = fixtureTintIntensity
             NativePreviewSettings.shared.tintIntensity = fixtureTintIntensity
+            // Painted-glass evidence captures pin a wallpaper file and force
+            // the painted source, because the live material samples whatever
+            // desktop the host machine happens to show — not deterministic,
+            // same reason `.desktop` is banned above. Opt-in by env, so every
+            // existing baseline still runs the shipped live preset. Pinned on
+            // BOTH settings objects for the same reason the palette is: the
+            // glass views read `NativePreviewSettings.shared` directly.
+            if let fixtureWallpaper = ProcessInfo.processInfo
+                .environment["KAISOLA_NATIVE_VISUAL_GLASS_WALLPAPER"],
+                !fixtureWallpaper.isEmpty {
+                settings.glassWallpaper = fixtureWallpaper
+                NativePreviewSettings.shared.glassWallpaper = fixtureWallpaper
+            }
+            if let fixtureSource = ProcessInfo.processInfo
+                .environment["KAISOLA_NATIVE_VISUAL_GLASS_SOURCE"]
+                .flatMap(GlassBackdropSource.init) {
+                settings.glassBackdropSource = fixtureSource
+                NativePreviewSettings.shared.glassBackdropSource = fixtureSource
+            }
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"

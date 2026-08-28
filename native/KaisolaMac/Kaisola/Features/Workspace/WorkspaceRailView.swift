@@ -328,7 +328,8 @@ struct WorkspaceRailView: View {
         // and, graduated 2026-08-28, the same SURFACE as the canvas: the rail
         // mounts the canvas recipe (`WorkspaceBackdropView`), not the
         // dedicated rail wash, so the boundary to the content carries no tone
-        // jump and the resize divider's hairline is the whole seam.
+        // jump and the resize divider's hairline is the whole seam. (See the
+        // measured note on the project rail's background in RootShellView.)
         .background {
             WorkspaceBackdropView(mode: settings.workspaceBackdrop)
                 .ignoresSafeArea()

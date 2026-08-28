@@ -7102,17 +7102,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    /// The regression the flush-rail change fixed by hand: the two rails are
-    /// the ground and the detail content column is the card, and nothing else
-    /// is either. A source-level count, because nothing structural prevents a
-    /// future pass from quietly re-carding a rail.
-    func testOnlyTheDetailColumnWearsTheChromeCard() throws {
+    /// Edge to edge, graduated 2026-08-28: NOTHING wears the floating chrome
+    /// card anymore — the workspace fills its region and the rails are the
+    /// same canvas surface, so the modifier itself is retired. A source-level
+    /// count, because nothing structural prevents a future pass from quietly
+    /// re-carding a column.
+    func testNothingWearsTheRetiredChromeCard() throws {
         let sources = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("Kaisola", isDirectory: true)
         let expectations = [
-            ("Features/Sessions/RootShellView.swift", 1),
+            ("Features/Sessions/RootShellView.swift", 0),
             ("Features/Workspace/WorkspaceRailView.swift", 0),
             ("Features/Sessions/QuietProjectRail.swift", 0),
         ]
@@ -7125,7 +7126,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             XCTAssertEqual(
                 calls,
                 expected,
-                "\(path): only the detail column may wear the chrome card"
+                "\(path): the workspace is flush; no column wears a chrome card"
             )
         }
     }

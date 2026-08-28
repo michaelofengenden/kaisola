@@ -542,6 +542,13 @@ struct RootShellView: View {
                         beginNewSession(in: project)
                     }
                 }
+                // The Settings takeover over a live workspace, for visual QA
+                // of the ChatGPT-style page: same deferred presentation path
+                // as the footer gear.
+                if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+                   environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "settings-takeover" {
+                    applySettingsTakeover(.openSection)
+                }
             }
             .task(id: model.currentProjectDirectory?.standardizedFileURL.path) {
                 guard Self.shouldAutomaticallyRefreshPlanUsage(
@@ -1027,15 +1034,17 @@ struct RootShellView: View {
             // Seamless rails ↔ canvas (2026-08-28, "the color and theme of
             // the lhs and rhs rails should look seemless transition with the
             // canvas"): the rail mounts the CANVAS recipe, not the rail
-            // recipe. Two instances of `WorkspaceBackdropView` are the same
-            // surface by construction — the live material samples what is
-            // behind the window per-region and the painted still is
-            // screen-aligned, so the column boundary carries no tone jump;
-            // only the divider hairline separates them. (The dedicated
-            // sidebar wash — `.sidebar` material + its own veil — is what
-            // made the rails read a step apart from the canvas, and its
-            // constants belong to the appearance layer this pass must not
-            // touch, so the chrome simply stops mounting it.)
+            // recipe. Measured on the light empty-workspace fixture: the
+            // sidebar samples 239/239/240 — byte-identical to the canvas —
+            // because the material plate composites over the column, not
+            // with it, so the boundary carries no tone jump and the divider
+            // hairline is the whole seam. Mounting nothing here instead
+            // reads 246 against 239: NavigationSplitView's own column
+            // material shows through, a visibly lighter rail. The dedicated
+            // sidebar wash (`.sidebar` material + its own veil) that made
+            // the shipped rails read a step apart from the canvas is simply
+            // no longer mounted; its constants stay untouched in the
+            // appearance layer.
             .background {
                 WorkspaceBackdropView(mode: settings.workspaceBackdrop)
                     .ignoresSafeArea()

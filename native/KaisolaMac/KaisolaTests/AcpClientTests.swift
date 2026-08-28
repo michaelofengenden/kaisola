@@ -213,6 +213,46 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(roundTrip, conversation.rows)
     }
 
+    /// A remembered per-agent effort level is applied at connect through the
+    /// ordinary `session/set_config_option` path: the scripted adapter boots
+    /// at "low", the memory says "high", and the conversation must end the
+    /// handshake showing the adapter-confirmed "high" — not the boot value,
+    /// and not an optimistic value the adapter never confirmed.
+    @MainActor
+    func testRememberedEffortAppliesOnConnectThroughTheScriptedAdapter() async throws {
+        let agentID = "effort-connect-agent-\(UUID().uuidString)"
+        let effortKey = try XCTUnwrap(
+            AcpConversation.persistedEffortDefaultsKeys(for: agentID).first
+        )
+        defer { UserDefaults.standard.removeObject(forKey: effortKey) }
+        UserDefaults.standard.set("high", forKey: effortKey)
+
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Effort",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptAgentID: agentID,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        XCTAssertTrue(conversation.isConnected)
+        let effort = conversation.configOptions.first { $0.id == "reasoning_effort" }
+        XCTAssertEqual(effort?.currentValue, "high")
+        let requests = await transport.receivedConfigOptionRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.objectValue?["configId"]?.stringValue, "reasoning_effort")
+        XCTAssertEqual(requests.first?.objectValue?["value"]?.stringValue, "high")
+        XCTAssertEqual(
+            AcpConversation.loadPersistedEffortValue(for: agentID),
+            "high",
+            "a successful restore leaves the memory as it was"
+        )
+    }
+
     func testCustomAdapterLaunchUsesSeatbeltAndAProviderScopedEnvironment() throws {
         let fixture = try CustomContainmentFixture()
         let containment = CustomAdapterContainment(
@@ -4997,6 +5037,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var permissionResponses: [Int64: [JSONValue]] = [:]
     private var permissionErrors: [Int64: [JSONValue]] = [:]
     private var protocolResponses: [JSONValue] = []
+    private var configOptionRequests: [JSONValue] = []
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -5062,6 +5103,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         (permissionResponses[wireID]?.count ?? 0) + (permissionErrors[wireID]?.count ?? 0)
     }
     func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
+    func receivedConfigOptionRequests() -> [JSONValue] { configOptionRequests }
     func terminationCount() -> Int { terminations }
     func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
     func clientResponse(for id: Int64) -> JSONValue? { clientResponses[id] }
@@ -5336,6 +5378,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 reply(id: id, result: .object([:]))
             }
         case "session/set_config_option":
+            configOptionRequests.append(object["params"] ?? .null)
             reply(id: id, result: .object([
                 "configOptions": .array([
                     .object([

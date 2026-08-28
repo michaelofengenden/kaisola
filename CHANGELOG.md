@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.143 — 2026-08-28
+
+- Onboarding's update prompt now opens the Updates pane directly instead of leaving you to find it in Settings.
+- The weekly agent-dependency refresh script ships in the repo it runs from; its first commit had raced a merge and the scheduled job would have found nothing to run.
+
 ## 0.1.141 — 2026-08-27
 
 - White backgrounds finally read white. The light glass used to normalize every desktop down to a fixed pale grey before frosting, which kept text legible on dim wallpapers but turned a white background into a grey pane. That target is now a floor instead of a destination: dim desktops still get lifted so ink never lands on a dark surface, and anything brighter shines through at its own lightness — white like Messages, tinted by your wallpaper like Finder. Dark mode is unchanged.

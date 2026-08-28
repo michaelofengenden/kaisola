@@ -175,29 +175,93 @@ enum SurfaceTabChrome {
     static let inactiveStrokeOpacity = 0.11
 }
 
-/// The 2026-08-28 session-tab revision's one still-open visual call: whether
-/// the session tabs (and the rail selection fills that borrow their language)
-/// are `paneRadius` pills that rhyme with the pane cards, or full capsules
-/// like Safari's tab groups. Everything else about the tab design is
-/// confirmed; the silhouette renders in both variants for Michael's review,
-/// switched per-process by `KAISOLA_SHELL_PREVIEW_TABS=pills|capsules`.
-/// Pills are the default so an ordinary launch needs no environment at all.
-enum ShellTabShape {
-    enum Variant: String {
-        case pills
-        case capsules
+/// The 2026-08-28 shell revision, as a runtime preview (feedback round two:
+/// "let me play around with a live preview version instead" of rendered
+/// images). Off is the shipped shell, exactly; the two on states render the
+/// merged 40pt session-tab bar, the card rails with quiet rows, the 30pt
+/// window corner, and the tab silhouette the case names — `paneRadius` pills
+/// that rhyme with the pane cards, or full capsules like Safari's tab groups.
+///
+/// The persisted choice lives in `NativePreviewSettings.shellPreviewVariant`;
+/// fixture processes may still force a variant with
+/// `KAISOLA_SHELL_PREVIEW_TABS=off|pills|capsules`, which outranks the
+/// setting. Views read the resolved value from `\.shellPreview`, injected at
+/// each workspace window's root, so flipping the Settings picker applies
+/// live.
+enum ShellPreviewVariant: String, CaseIterable, Identifiable {
+    case off
+    case pills
+    case capsules
+
+    var id: String { rawValue }
+
+    /// Whether the shell revision renders at all. Every preview-gated branch
+    /// keys off this, so "off" cannot half-apply.
+    var isOn: Bool { self != .off }
+
+    /// Settings picker labels; the row's detail line carries the
+    /// "experimental" caption.
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .pills: "New shell · pill tabs"
+        case .capsules: "New shell · capsule tabs"
+        }
     }
 
-    static let variant: Variant = ProcessInfo.processInfo
-        .environment["KAISOLA_SHELL_PREVIEW_TABS"]
-        .flatMap(Variant.init) ?? .pills
+    /// Decision 4's real window shape — only under the preview. Off keeps the
+    /// system corner (a zero radius clips nothing visible), so the shipped
+    /// window is untouched until the preview asks for the 30pt shell corner.
+    var windowCornerRadius: CGFloat {
+        isOn ? KaisolaVisualSystem.shellRadius : 0
+    }
 
+    /// The env override wins whenever it parses; anything else — absent,
+    /// misspelt — defers to the persisted setting. `nonisolated` on purpose:
+    /// fixtures and tests resolve this off the main actor.
+    nonisolated static func resolved(
+        environment: [String: String],
+        setting: ShellPreviewVariant
+    ) -> ShellPreviewVariant {
+        if let forced = environment["KAISOLA_SHELL_PREVIEW_TABS"]
+            .flatMap(ShellPreviewVariant.init) {
+            return forced
+        }
+        return setting
+    }
+}
+
+private struct ShellPreviewEnvironmentKey: EnvironmentKey {
+    /// Off by default so a hierarchy nobody injected into — unit-test
+    /// renders, previews — is the shipped shell, never the experiment.
+    static let defaultValue = ShellPreviewVariant.off
+}
+
+extension EnvironmentValues {
+    /// The resolved shell-preview variant for this window. Injected once at
+    /// the workspace window's root from the observed settings object (env
+    /// override applied there), so every preview-gated view under it switches
+    /// live and from one source.
+    var shellPreview: ShellPreviewVariant {
+        get { self[ShellPreviewEnvironmentKey.self] }
+        set { self[ShellPreviewEnvironmentKey.self] = newValue }
+    }
+}
+
+/// The preview tabs' silhouette (and the rail selection fills that borrow
+/// their language).
+enum ShellTabShape {
     /// The silhouette at the requested scale. Tabs pass `paneRadius`; the
     /// rail rows pass their own row-scale radius so a pill stays a row and
-    /// never becomes a lozenge.
-    static func shape(cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius) -> AnyShape {
-        switch variant {
-        case .pills:
+    /// never becomes a lozenge. With the preview off this is the shipped
+    /// continuous rounded rectangle, identical to the pills case, so shared
+    /// call sites (the rail pills) render exactly as main does today.
+    static func shape(
+        cornerRadius: CGFloat = KaisolaVisualSystem.paneRadius,
+        preview: ShellPreviewVariant
+    ) -> AnyShape {
+        switch preview {
+        case .off, .pills:
             AnyShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         case .capsules:
             AnyShape(Capsule(style: .continuous))
@@ -215,9 +279,10 @@ struct ShellTabCardBackground: View {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.shellPreview) private var shellPreview
 
     var body: some View {
-        let shape = ShellTabShape.shape(cornerRadius: cornerRadius)
+        let shape = ShellTabShape.shape(cornerRadius: cornerRadius, preview: shellPreview)
         Group {
             if reduceTransparency {
                 shape.fill(Color(nsColor: .controlBackgroundColor))

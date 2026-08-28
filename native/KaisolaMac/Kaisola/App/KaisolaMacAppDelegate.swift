@@ -385,6 +385,44 @@ final class FullHeightWorkspaceHostingView<Content: View>: NSHostingView<Content
     }
 }
 
+/// The workspace window's SwiftUI root: resolves the 2026-08-28 shell preview
+/// once per render — `KAISOLA_SHELL_PREVIEW_TABS` over the persisted setting
+/// — injects it as `\.shellPreview` for every preview-gated view in the
+/// window, and applies decision 4's real window shape.
+///
+/// Observing the settings object here is what makes the Settings picker apply
+/// live: the window is created once, but this view re-renders on every
+/// settings publish, so flipping the preview re-clips and re-injects without
+/// a relaunch.
+///
+/// The corner itself: the window already runs a transparent titlebar over a
+/// full-size, clear-backed content view, so clipping the root container at
+/// the shell's 30pt continuous corner makes the corner the window's own — the
+/// pixels outside the curve are genuinely transparent, not painted over the
+/// system corner. With the preview off the radius is zero: a bounds-rect clip
+/// that changes nothing, leaving the shipped system corner. Known preview
+/// limits, named honestly: full screen and split view still need their own
+/// fixture pass before the corner ships by default.
+struct ShellPreviewWindowRoot: View {
+    @ObservedObject var settings: NativePreviewSettings
+    let content: AnyView
+
+    var body: some View {
+        let preview = ShellPreviewVariant.resolved(
+            environment: ProcessInfo.processInfo.environment,
+            setting: settings.shellPreviewVariant
+        )
+        content
+            .clipShape(
+                RoundedRectangle(
+                    cornerRadius: preview.windowCornerRadius,
+                    style: .continuous
+                )
+            )
+            .environment(\.shellPreview, preview)
+    }
+}
+
 struct NativeFrameCadenceReport: Encodable, Equatable, Sendable {
     struct Thresholds: Encodable, Equatable, Sendable {
         let maximumDeadlineLossRateMsPerSecond: Double
@@ -1276,6 +1314,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             ].contains(visualSurface)
                 ? .topBar
                 : .leftTree
+            // The two shell-revision surfaces exist to preview the redesign,
+            // so they default the preview on (pill tabs); every other fixture
+            // keeps the shipped shell and its existing baselines. The
+            // KAISOLA_SHELL_PREVIEW_TABS override — resolved at the window
+            // root — still outranks this, exactly as on a live install, so a
+            // capture run can force any surface into either state.
+            settings.shellPreviewVariant = [
+                "topbar-mixed", "topbar-mixed-narrow",
+            ].contains(visualSurface) ? .pills : .off
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
@@ -1802,23 +1849,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if visualSettings || visualOnboarding {
             window.contentView = NSHostingView(rootView: content)
         } else {
-            // 2026-08-28 decision 4: `shellRadius` becomes a real custom
-            // window shape. The window already runs a transparent titlebar
-            // over a full-size, clear-backed content view, so clipping the
-            // root container at the shell's 30pt continuous corner is what
-            // makes the corner the window's own — the pixels outside the
-            // curve are genuinely transparent, not painted over the system
-            // corner. Settings and onboarding keep their system chrome.
-            // Known preview limits, named honestly: full screen and split
-            // view still need their own fixture pass before this ships.
+            // The workspace window's root rides `ShellPreviewWindowRoot`,
+            // which resolves the 2026-08-28 shell preview (env override over
+            // the persisted setting), injects it as `\.shellPreview` for
+            // every gated view below, and applies decision 4's real window
+            // shape while the preview is on. Settings and onboarding keep
+            // their system chrome.
             window.contentView = FullHeightWorkspaceHostingView(
                 rootView: AnyView(
-                    content.clipShape(
-                        RoundedRectangle(
-                            cornerRadius: KaisolaVisualSystem.shellRadius,
-                            style: .continuous
-                        )
-                    )
+                    ShellPreviewWindowRoot(settings: settings, content: content)
                 )
             )
         }

@@ -177,6 +177,7 @@ struct WorkspaceRailView: View {
 
     @EnvironmentObject private var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.shellPreview) private var shellPreview
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
@@ -298,7 +299,8 @@ struct WorkspaceRailView: View {
                                         )
                                         : .clear,
                                     in: ShellTabShape.shape(
-                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
+                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
+                                        preview: shellPreview
                                     )
                                 )
                                 .contentShape(Rectangle())
@@ -324,12 +326,21 @@ struct WorkspaceRailView: View {
         // The persisted preference stays at least 164 pt, but the responsive
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
-        // No backdrop of its own since the 2026-08-28 revision (decision 6):
-        // the rail mounts inside the shared floating chrome card
+        // Shell preview OFF (shipped): one layer, flush to the window edges,
+        // exactly like the left project rail — the rail paints its own glass
+        // and the seam to the content is the resize divider's hairline.
+        // Preview ON (2026-08-28 revision, decision 6): no backdrop of its
+        // own — the rail mounts inside the shared floating chrome card
         // (`kaisolaChromePanel` in `RootShellView.detailArea`), which supplies
         // the surface, the soft shadow, and the gutter of window glass around
         // it. Painting the full-bleed rail glass here again would fill that
         // gutter and turn the card back into a column.
+        .background {
+            if !shellPreview.isOn {
+                SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
+                    .ignoresSafeArea()
+            }
+        }
         .task {
             tree.load(root)
             tree.search(searchText)
@@ -1017,7 +1028,8 @@ struct WorkspaceRailView: View {
                     )
                     : .clear,
                 in: ShellTabShape.shape(
-                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
+                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
+                    preview: shellPreview
                 )
             )
             .contentShape(Rectangle())

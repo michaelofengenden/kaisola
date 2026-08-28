@@ -215,6 +215,28 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertTrue(SettingsTakeoverPolicy.isPresented(after: .openSection, from: true))
     }
 
+    func testBareOpenSettingsSurfacePostIsADoorWhileASectionDeepLinks() {
+        // `kaisolaOpenSettingsSurface` is posted both by ⌘, / the bare menu
+        // item and by deep links that name a section. Only the latter carries
+        // a section identifier, and only the former may toggle: with the
+        // takeover covering the footer gear, ⌘, is the way back out.
+        XCTAssertEqual(
+            SettingsTakeoverPolicy.action(forOpenSettingsSurfaceSection: nil),
+            .pressSettingsDoor
+        )
+        XCTAssertEqual(
+            SettingsTakeoverPolicy.action(forOpenSettingsSurfaceSection: "providers"),
+            .openSection
+        )
+        XCTAssertFalse(
+            SettingsTakeoverPolicy.isPresented(
+                after: SettingsTakeoverPolicy.action(forOpenSettingsSurfaceSection: nil),
+                from: true
+            ),
+            "⌘, with the takeover already up restores the workspace"
+        )
+    }
+
     // MARK: - Pane header declutter (2026-08-28)
 
     func testChatHeaderDropsTheMaximizeArrowAndAccountButtonsIntoOneTightCluster() {

@@ -46,6 +46,14 @@ enum SettingsTakeoverPolicy {
         case .openSection: true
         }
     }
+
+    /// `kaisolaOpenSettingsSurface` carries a section identifier only when
+    /// something deep-linked to one. A bare post is a whole-app door — ⌘, or
+    /// the bare menu item — and so toggles exactly like the footer gear;
+    /// with the takeover covering the footer, that press is the way back.
+    static func action(forOpenSettingsSurfaceSection sectionID: String?) -> Action {
+        sectionID == nil ? .pressSettingsDoor : .openSection
+    }
 }
 
 /// The terminal header is resolved from the terminal's own lifecycle and input
@@ -492,10 +500,15 @@ struct RootShellView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenSettingsSurface)) { note in
                 guard let target = note.object as? AppModel, target === model else { return }
-                settingsSectionID = note.userInfo?[
+                let sectionID = note.userInfo?[
                     AcpProviderSettingsNotificationKey.sectionID
-                ] as? String ?? settingsSectionID
-                applySettingsTakeover(.openSection)
+                ] as? String
+                // A deep link names its destination and always lands open;
+                // a bare post is the ⌘, door and toggles.
+                if let sectionID { settingsSectionID = sectionID }
+                applySettingsTakeover(
+                    SettingsTakeoverPolicy.action(forOpenSettingsSurfaceSection: sectionID)
+                )
             }
     }
 
@@ -2022,11 +2035,14 @@ struct RootShellView: View {
     /// document views below it in backing-view order without placing an
     /// invisible pointer surface over the terminal, preview, or Files panel.
     private func detailDividerTrackers(widths: NativeDetailPaneSizing.Widths) -> some View {
+        // `trailingPanelInset` is zero now: the chrome card whose trailing
+        // gutter it measured is gone, so the preview divider sits directly
+        // against the rail divider's lane and the corridors must not carry a
+        // phantom 6pt offset.
         let corridors = NativeDetailPaneSizing.corridors(
             widths: widths,
             previewVisible: detailPreviewPanelVisible,
-            railVisible: detailRailPanelVisible,
-            trailingPanelInset: KaisolaVisualSystem.chromeInset
+            railVisible: detailRailPanelVisible
         )
         return DetailDividerTrackingView(
             corridors: corridors,
@@ -5241,12 +5257,12 @@ enum NativeWorkspaceChrome {
         detailChromeControlHeight + detailToggleRevealPadding * 2
     }
 
-    /// The detail card's top gutter, per navigation layout.
+    /// The workspace's top gutter, per navigation layout. History below;
+    /// the shipped answer is the final paragraph.
     ///
-    /// **`.leftTree` (the default): `chromeInset`.** The card runs to the
-    /// window's own top edge with nothing above it but the standard gutter every
-    /// other side of the card already has, and the two panel toggles are not
-    /// drawn in this layout at all.
+    /// The card era's `.leftTree` answer was `chromeInset`: the card ran to
+    /// the window's own top edge with nothing above it but the standard
+    /// gutter every other side already had.
     ///
     /// v1.1.9 stopped 28pt short and said why: the Files rail opens a 30pt
     /// header bar 6pt below the card's top edge, and the hover-revealed toggles
@@ -5568,10 +5584,10 @@ enum NativeDetailPaneSizing {
     ) -> [Corridor] {
         var corridors: [Corridor] = []
         // Walk in from the trailing edge in the same order the layout mounts
-        // the panels: [ card( content | preview divider | preview ) |
-        // rail divider | rail ]. The rail is flush to the window edge; the
-        // preview lives inside the chrome card, whose trailing gutter is
-        // `trailingPanelInset`.
+        // the panels: [ content | preview divider | preview | rail divider |
+        // rail ]. Everything is flush now — `trailingPanelInset` survives
+        // only for a hypothetical future gutter and is zero in the shipped
+        // layout.
         var consumed: CGFloat = trailingPanelInset
         if railVisible {
             corridors.append(

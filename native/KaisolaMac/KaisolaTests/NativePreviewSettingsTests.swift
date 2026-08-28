@@ -1001,9 +1001,10 @@ final class NativePreviewSettingsTests: XCTestCase {
             railVisible: false
         ).isEmpty)
 
-        // With the rail flush to the window edge (v0.1.125), the preview
-        // stays inside the chrome card, so its corridor alone shifts inward
-        // by the card's trailing gutter; the rail corridor is unmoved.
+        // The parameterised gutter still holds its arithmetic, but the
+        // shipped layout passes ZERO now: the chrome card whose trailing
+        // gutter this measured retired with the 2026-08-28 flush workspace,
+        // and `detailDividerTrackers` calls `corridors` with the default.
         let inset = NativeDetailPaneSizing.corridors(
             widths: widths,
             previewVisible: true,

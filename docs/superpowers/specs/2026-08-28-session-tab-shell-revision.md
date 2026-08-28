@@ -1,5 +1,16 @@
 # Session-tab shell revision
 
+## Feedback round — 2026-08-28, static renders reviewed
+
+Michael reviewed the first implementation as rendered screenshots and gave three corrections plus a process change. All four are now in the branch:
+
+1. **No double-card rail.** The left-tree renders showed every on-screen session row carrying its own filled pill inside the new sidebar card — cards inside a card. The rail card stays; row fills follow Finder's grammar under the preview: only the selected row is filled, split companions and other resting rows are quiet text and icon, hover answers with the faint wash. (`QuietSelectionPill.fill` is the single decision point.)
+2. **Condensed merged bar.** The tabs read spread out with the trailing controls stranded at the far edge. The bar is now structurally pinned (`MergedTopBarGrammar.slots`): project switcher leading, session tabs packed immediately beside it at fixed 8pt gaps, the bar's one flexible gap after the tabs, then the tight trailing cluster. Tabs keep intrinsic width, truncate only when the bar is genuinely full, and never spread to fill.
+3. **Confirmation moved from renders to a live preview.** "Don't do the UI images… let me play around with a live preview version instead." The whole redesign is gated behind a persisted setting — Settings ▸ General ▸ Shell preview (Off / New shell · pill tabs / New shell · capsule tabs, UserDefaults key `shellPreviewVariant`, default off) — applied live in both layouts, no relaunch. Off renders the shipped shell exactly; `KAISOLA_SHELL_PREVIEW_TABS` keeps working for fixtures and outranks the setting. The committed `preview-renders/` PNG corpus is retired and deleted.
+4. The canvas colour feedback ("always white or glass, never gray") is handled separately on main; this branch does not touch the backdrop or ground washes.
+
+Decision 3's pill-versus-capsule call now happens inside the running app via the same picker rather than through side-by-side screenshots.
+
 ## Status
 
 This revises the 2026-08-27 minimal canonical shell design after Michael's review. The core change of direction: the session-tab top bar stays and becomes the thing we invest in. There will be no single persistent native toolbar, and the top-bar layout is not being deleted.

@@ -1,4 +1,4 @@
-KAISOLA_NATIVE_VISUAL_TERMINAL=frame={{0, 0}, {647.5, 716}} buffer=55 fixtureText=false
+KAISOLA_NATIVE_VISUAL_TERMINAL=frame={{0, 0}, {647.5, 716}} buffer=233 fixtureText=true
 KAISOLA_NATIVE_VISUAL_CAPTURE_METHOD=screen-capture-kit
 KAISOLA_NATIVE_VISUAL_CAPTURE=PASS /Users/michaelofengenden/Developer/kaisola-worktrees/canonical-shell/preview-renders/topbar-pills-light-wide.png
-KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=PASS surface=topbar-mixed elements=207 source=view-tree controls=3 path=/Users/michaelofengenden/Developer/kaisola-worktrees/canonical-shell/preview-renders/topbar-pills-light-wide.layout.json
+KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=PASS surface=topbar-mixed elements=204 source=view-tree controls=3 path=/Users/michaelofengenden/Developer/kaisola-worktrees/canonical-shell/preview-renders/topbar-pills-light-wide.layout.json

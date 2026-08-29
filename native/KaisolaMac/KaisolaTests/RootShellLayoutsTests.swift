@@ -299,6 +299,67 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.shiftedOrigins(standardMinXs: []), [])
     }
 
+    func testTrafficLightsStayEvenlySpacedThroughAPartialRelayout() {
+        // v0.1.147's uneven red button. AppKit returns the buttons to stock one
+        // at a time, so a frame-change notification can land with close back at
+        // 7 while minimize and zoom still hold 40 and 60. The delta form spread
+        // that read out unevenly:
+        let skewed = WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [7, 40, 60])
+        XCTAssertEqual(skewed, [20, 53, 73])
+        XCTAssertNotEqual(
+            skewed[1] - skewed[0],
+            skewed[2] - skewed[1],
+            "this is the reported defect: the gaps disagree"
+        )
+
+        // Rebuilding from the remembered stock gaps cannot express that, no
+        // matter which partial state the read caught.
+        let stockGaps = WorkspaceTrafficLights.gaps(between: [7, 27, 47])
+        XCTAssertEqual(stockGaps, [20, 20])
+        XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: stockGaps), [20, 40, 60])
+
+        for partial in [[7, 40, 60], [20, 27, 47], [7, 27, 60], [20, 40, 60]] {
+            let repaired = WorkspaceTrafficLights.origins(gaps: stockGaps)
+            XCTAssertEqual(
+                repaired,
+                [20, 40, 60],
+                "a read of \(partial) must still land the standard gaps"
+            )
+            XCTAssertEqual(repaired[1] - repaired[0], repaired[2] - repaired[1])
+        }
+
+        XCTAssertEqual(WorkspaceTrafficLights.gaps(between: [7]), [])
+        XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: []), [20])
+    }
+
+    /// "The default rail width should also be the default when double-clicking
+    /// the panel divider" (2026-08-28). It is — both read
+    /// `projectSidebarIdealWidth` — and this is what stops them drifting into
+    /// two literals that answer the question differently.
+    ///
+    /// The divider's own `mouseDown` sets that constant and then clears the
+    /// persisted drag, so the width the reset lands on and the width a fresh
+    /// window opens at have to be the same number by construction rather than
+    /// by coincidence.
+    func testDoubleClickResetAndTheOpeningDefaultAreTheSameWidth() {
+        let opening = NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+            storedWidth: NativePreviewSettings.projectRailWidthUnset
+        )
+        XCTAssertEqual(
+            opening,
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            "clearing the drag is what a double-click does, so it must resolve to the default"
+        )
+        XCTAssertEqual(opening, 180)
+
+        // A width the user dragged still outranks the default when the window
+        // reopens — the reset is the only thing that discards it.
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 268),
+            268
+        )
+    }
+
     // MARK: - Retained shell behaviors
 
     func testCollapsedSidebarMovesSessionIdentityPastWindowControls() {

@@ -603,7 +603,13 @@ struct RootShellView: View {
                     browserMounted: model.browserCardURL != nil,
                     previewMounted: model.previewedFileURL != nil,
                     filesRailVisible: settings.workspaceRailVisible
-                        && model.currentProjectDirectory != nil
+                        && model.currentProjectDirectory != nil,
+                    // Exactly the condition `emptyWorkspaceState` renders the
+                    // chooser under, so "is the chooser up" is one answer
+                    // rather than two that can disagree.
+                    sessionChooserMounted: model.projects.contains {
+                        $0.id == activeProjectID && $0.directory != nil
+                    }
                 )
             )
             .ignoresSafeArea()
@@ -3867,8 +3873,18 @@ private struct NavigationSidebarResizeAffordance: View {
 
     var body: some View {
         ZStack {
+            // 0.42 → 0.78 at rest (2026-08-28, "the right border of the left
+            // hand side card disappears into the panel divider").
+            //
+            // 0.42 was set when the rail carried its own tone and the boundary
+            // was a tonal step that the hairline merely sharpened. The
+            // graduated rail mounts the CANVAS recipe, so the two sides are
+            // now deliberately the same colour and this hairline is the ONLY
+            // thing marking the edge — at 42% it was reading as a seam in one
+            // surface rather than as the card's border. Hover still answers
+            // with a further step, so the divider keeps saying it is grabbable.
             Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(hovered ? 0.95 : 0.42))
+                .fill(Color(nsColor: .separatorColor).opacity(hovered ? 1.0 : 0.78))
                 .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
             Capsule()
                 .fill(Color.accentColor.opacity(hovered ? 0.72 : 0.08))
@@ -3918,6 +3934,27 @@ private struct DetailEdgeResizeAffordance: View {
     var body: some View {
         NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 }, exposesAccessibility: false)
             .frame(width: NativeWorkspaceChrome.dividerCorridorReach)
+            // …and it draws the rule after all (2026-08-28, "the right hand
+            // border of the card is not visible", still true after the rest
+            // opacity went 0.42 → 0.78).
+            //
+            // The doc above says why raising the opacity could not have been
+            // enough: a tracking area cannot cross an `NSSplitView` subview's
+            // clip. Neither can a hairline. The sidebar's own trailing overlay
+            // is laid out exactly ON that clip edge, so it is the first thing
+            // rounded away — invisible at any opacity, which is why it looked
+            // like a colour problem and was a geometry one.
+            //
+            // This side has no such edge to fall off: the rule sits at the
+            // leading edge of the detail column, one point inside a region
+            // nothing clips, and lands in the same pixels the sidebar's
+            // overlay was aiming at.
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor).opacity(hovered ? 1.0 : 0.78))
+                    .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
+                    .animation(.easeOut(duration: 0.12), value: hovered)
+            }
             .accessibilityHidden(true)
     }
 }
@@ -3958,9 +3995,10 @@ enum InitialSidebarWidth {
     /// move again — matched exactly (±2 for the restoration round-trip), so a
     /// width the user dragged anywhere else stays exactly as found. 248
     /// joined the list with the v0.1.125 move to 290; 290 joined with the
-    /// 2026-08-26 move to 245. Dragged widths persist, so a user choice can
-    /// never sit in this band by accident.
-    static let previouslyForcedIdeals: [CGFloat] = [210, 248, 290]
+    /// 2026-08-26 move to 245; 245 joined with the 2026-08-28 move to 196.
+    /// Dragged widths persist, so a user choice can never sit in this band by
+    /// accident.
+    static let previouslyForcedIdeals: [CGFloat] = [196, 210, 245, 248, 290]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3988,11 +4026,18 @@ enum InitialSidebarWidth {
     }
 
     /// The key generation moves whenever the flag's meaning changes: v2
-    /// recorded "this window was widened to 248", v3 "moved to 290", and each
-    /// bump revisits flagged windows exactly once to move them to the current
-    /// ideal (or to the user's own persisted width, which wins outright).
+    /// recorded "this window was widened to 248", v3 "moved to 290", v4 "moved
+    /// to 245", v5 "narrowed to 196", and v6 "narrowed again to 180". Each
+    /// bump revisits flagged windows
+    /// exactly once to move them to the current ideal (or to the user's own
+    /// persisted width, which wins outright).
+    ///
+    /// Bumping is not optional when the ideal moves: a window already flagged
+    /// under v4 reports `didForce`, so without a new generation the narrowing
+    /// would reach only windows that had never been opened — which is the
+    /// exact way the 2026-08-14 widening missed the windows it was asked for.
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v4.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v6.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -5177,11 +5222,21 @@ enum NativeWorkspaceChrome {
     /// rail, and the density passes had walked the default back below legible;
     /// 248 → 290 in v0.1.125, again by request, matching the width Michael
     /// pins the Files rail to; 290 → 245 on 2026-08-26, again by request —
-    /// the double-click reset should land "1-2cm less wide" than it did.
+    /// the double-click reset should land "1-2cm less wide" than it did;
+    /// 245 → 196 → 180 across 2026-08-28, each by request.
+    ///
+    /// A further step to 125 ("about 65% of its current width") was built and
+    /// measured, and it does not work with this row: the title lane falls to
+    /// 29pt and draws TWO characters, and two different sessions both render
+    /// "M…a". Dropping the row's time label buys it back to six, and 150 gets
+    /// seven — still under the width where the rail's own disambiguation
+    /// works, since titles differing only at the tail stop being separable.
+    /// Reaching those widths honestly needs the ROW re-cut, not this constant
+    /// moved. 180 is what the current row grammar holds.
     /// Users who dragged their rail keep their width — a drag persists
     /// (`NativePreviewSettings.projectRailWidth`), so this constant sizes
     /// fresh windows and the divider's double-click reset.
-    static let projectSidebarIdealWidth: CGFloat = 245
+    static let projectSidebarIdealWidth: CGFloat = 180
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340
@@ -5326,16 +5381,28 @@ enum NativeWorkspaceChrome {
     /// text over the backdrop that the wash's contrast floors are solved for:
     /// session panes, the document preview, the browser card, and the Files
     /// rail all count, and so does the missing-session recovery state, which is
-    /// itself text on the canvas. The empty-state card does not — it carries
-    /// its own material.
+    /// itself text on the canvas.
+    ///
+    /// The "Start a session" chooser counts too, as of 2026-08-28 — "the start
+    /// a new session should share the same background canvas as the LHS and
+    /// RHS rails". It was excused on legibility grounds, which still holds
+    /// (the card brings its own material), but legibility was never the whole
+    /// question. The graduated rails mount the CANVAS recipe so the three
+    /// surfaces read as one; an idle canvas drops to the clear still and a
+    /// whisper of veil, so precisely when the chooser is up the middle went
+    /// flat while the rails either side stayed tinted. Idleness is now the
+    /// genuinely empty canvas — no project, nothing offered — which is what it
+    /// was always describing.
     nonisolated static func canvasIsIdle(
         layoutIsEmpty: Bool,
         hasRecovery: Bool,
         browserMounted: Bool,
         previewMounted: Bool,
-        filesRailVisible: Bool
+        filesRailVisible: Bool,
+        sessionChooserMounted: Bool = false
     ) -> Bool {
-        layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted && !filesRailVisible
+        layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted
+            && !filesRailVisible && !sessionChooserMounted
     }
 }
 
@@ -7021,11 +7088,26 @@ private struct ConnectionFooter: View {
                 // below; see the note there.
                 Color.clear
                     .frame(width: FooterAccountBudget.avatarSize, height: FooterAccountBudget.avatarSize)
-                Text(displayedAccountName)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.kaisolaPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                // The name is present when it fits and absent when it does
+                // not — never a stub.
+                //
+                // At the 125pt rail (2026-08-28) `FooterAccountBudget`'s lane
+                // goes NEGATIVE once the usage chip is showing: the avatar and
+                // the three control slots alone are more than the footer has.
+                // Left to truncate, the chip would draw "m…" or a bare
+                // ellipsis, which is worse than the avatar standing on its own
+                // — the avatar already identifies the account, and the full
+                // name is in the help text and the account menu either way.
+                // `ViewThatFits` puts that decision in the layout, which is
+                // the only thing that actually knows the width, rather than in
+                // a width guess threaded down from the rail.
+                ViewThatFits(in: .horizontal) {
+                    Text(displayedAccountName)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.kaisolaPrimary)
+                        .lineLimit(1)
+                    Color.clear.frame(width: 0, height: 0)
+                }
             }
             // Sized by its contents, floored so a short name still leaves a
             // usable target, then laid leading inside whatever the footer has

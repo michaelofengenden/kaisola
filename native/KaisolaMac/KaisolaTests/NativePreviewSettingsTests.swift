@@ -6675,15 +6675,25 @@ final class NativePreviewSettingsTests: XCTestCase {
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 290, didForce: true)
         )
 
+        // 245 joins them with the 2026-08-28 narrowing to 196.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 245, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 245, didForce: true)
+        )
+
         // The new key generation is what re-arms previously-forced windows;
         // it must actually be new.
         XCTAssertTrue(
-            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v4.")
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v6.")
         )
 
-        // Never against a restored or user-chosen width — including the ideal
-        // itself, so a second window does not re-run the override.
-        for width in [168.0, 240.0, 245.0, 300.0, 340.0] {
+        // Never against a restored or user-chosen width. 245 has left this
+        // list — it is a width the app placed and so the app's to move — and
+        // the current ideal cannot join it: 196 is inside AppKit's own default
+        // band, so "is this untouched?" already answers for it.
+        for width in [240.0, 268.0, 300.0, 340.0] {
             XCTAssertFalse(
                 InitialSidebarWidth.shouldForceInitialWidth(
                     currentWidth: width,
@@ -6741,11 +6751,32 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 180)
+
+        // 180 sits outside macOS's own default band (195 ± 10) again — 196
+        // briefly did not — so the fresh-window path is meaningful once more.
         XCTAssertGreaterThan(
+            InitialSidebarWidth.systemDefault - InitialSidebarWidth.tolerance,
             NativeWorkspaceChrome.projectSidebarIdealWidth,
-            InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
             "the ideal is inside the default's tolerance, so the override would never fire"
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.isPreviouslyForcedIdeal(196),
+            "the width this morning forced must still be the app's to move"
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 196, didForce: false),
+            "a 196pt window from earlier today must narrow again"
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 268, didForce: false),
+            "a width the user dragged is still left exactly as found"
+        )
+        // The generation must move with the ideal, or every already-flagged
+        // window reports `didForce` and never hears about the new width.
+        XCTAssertTrue(
+            InitialSidebarWidth.defaultsKey(restorationID: "w").contains(".v6."),
+            "the key generation has to bump when the ideal does"
         )
         XCTAssertGreaterThanOrEqual(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
@@ -7227,9 +7258,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
         // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125, 290 → 245 on
-        // 2026-08-26: the double-click reset should land "1-2cm less wide",
-        // by request.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        // 2026-08-26, 245 → 196 on 2026-08-28: each by request, the last
+        // one "at least 20% less wide" (245 × 0.8 = 196 exactly).
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 180)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

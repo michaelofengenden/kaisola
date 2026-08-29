@@ -993,6 +993,25 @@ final class UsageCenter: ObservableObject {
     private var planRefreshGeneration = 0
     private var planRefreshContextKey: String?
     private var planUsageCache: [String: (providers: [ProviderPlanUsage], fetchedAt: Date)] = [:]
+
+    /// How long the reading currently on screen stays inside
+    /// `automaticPlanUsageTTL`, or nil when there is no cached reading for the
+    /// context being shown.
+    ///
+    /// Exposed for the Usage pane's own refresh loop. Sleeping a whole TTL
+    /// between ticks is wrong whenever the pane opens partway through one: a
+    /// reading 170 seconds old is accepted on open and then held for another
+    /// 180, so what is on screen can reach nearly two TTLs while the loop
+    /// believes it is holding to one. Sleeping the REMAINING lifetime instead
+    /// lands the next probe just as the cache expires, without polling faster
+    /// — each unforced call still resolves a context key, which reads and
+    /// digests credential files, so ticking more often is not free.
+    var planUsageRemainingLifetime: TimeInterval? {
+        guard let key = planRefreshContextKey,
+              let cached = planUsageCache[key] else { return nil }
+        let age = now().timeIntervalSince(cached.fetchedAt)
+        return max(0, Self.automaticPlanUsageTTL - age)
+    }
     private var planUsageFailures: [String: PlanUsageStaleness] = [:]
     /// Disk backing for `planUsageCache`, so cards render on launch instead of
     /// after a multi-second probe. Hydrated lazily on first access.

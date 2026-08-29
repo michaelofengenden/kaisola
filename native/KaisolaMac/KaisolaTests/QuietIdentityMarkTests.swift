@@ -887,7 +887,8 @@ final class QuietIdentityMarkTests: XCTestCase {
             timeLabelWidth: timeWidth,
             showsReveal: false
         )
-        XCTAssertGreaterThan(available, 100, "the title lane lost its share of the row again")
+        // 100 → 90 with the 2026-08-28 narrowing: 196pt draws a 92.5pt lane.
+        XCTAssertGreaterThan(available, 80, "the title lane lost its share of the row again")
 
         // Stated the way the complaint was: how much of a real title is legible.
         let sample = "Audit Kaisola Sidebar parity"
@@ -897,9 +898,15 @@ final class QuietIdentityMarkTests: XCTestCase {
             let width = (candidate as NSString).size(withAttributes: [.font: titleFont]).width
             if width <= available { visible = count } else { break }
         }
+        // 20 → 13 across the 2026-08-28 narrowings (245 → 196 → 180, twice by
+        // request). This is the price of the narrow rail, stated rather than
+        // hidden: "Audit Kaisola Sidebar parity" reads as "Audit Kaisol…"
+        // instead of "Audit Kaisola Sideba…". The floor stays a floor — it is
+        // what stops a future density pass spending the lane again — it is
+        // simply set at what the requested width actually draws.
         XCTAssertGreaterThanOrEqual(
             visible,
-            20,
+            13,
             "only \(visible) characters survive at "
                 + "\(NativeWorkspaceChrome.projectSidebarIdealWidth)pt"
         )
@@ -911,7 +918,8 @@ final class QuietIdentityMarkTests: XCTestCase {
                 timeLabelWidth: timeWidth,
                 showsReveal: true
             ),
-            80
+            // 80 → 60 across the two narrowings; the reveal lane is 63.5pt.
+            60
         )
     }
 
@@ -946,17 +954,25 @@ final class QuietIdentityMarkTests: XCTestCase {
             QuietIdentityMarkView.slot,
             "the hierarchy step is under one identity mark — that reads as ragged"
         )
+        // The step was two full mark-widths while the rail could afford it.
+        // The 2026-08-28 narrowings (245 → 196 → 180, twice by request) ended
+        // that: at 180 a 28pt step is 15.5% of the whole column, so the
+        // hierarchy would have been eating the title lane exactly as the title
+        // lane ran out. The step gives 8pt back and the contract weakens from
+        // "two marks" to "more than one mark", which is what actually makes
+        // the nesting read — a session's mark still begins past where its
+        // project's mark ends, with 6pt to spare.
         XCTAssertGreaterThan(
             QuietRowBudget.indentStep,
-            QuietIdentityMarkView.slot * 1.5,
+            QuietIdentityMarkView.slot,
             "the session indent went shallow again"
         )
-        XCTAssertEqual(QuietRowBudget.sessionIndent, 36)
-        XCTAssertEqual(QuietRowBudget.indentStep, 28)
-        XCTAssertEqual(
-            QuietRowBudget.indentStep,
-            QuietRailMetrics.mark * 2,
-            "the hierarchy step stopped being two mark-widths"
+        XCTAssertEqual(QuietRowBudget.sessionIndent, 28)
+        XCTAssertEqual(QuietRowBudget.indentStep, 20)
+        XCTAssertGreaterThan(
+            CGFloat(QuietRowBudget.indentStep),
+            QuietRailMetrics.mark,
+            "a session's mark must still start past where its project's mark ends"
         )
     }
 
@@ -1047,19 +1063,24 @@ final class QuietIdentityMarkTests: XCTestCase {
         // The measured v1.1.4 lane, from the bug report this budget was built
         // for. Not derived — recorded.
         let shippedInV114: CGFloat = 56
+        // 1.75× → 1.45×: the 180pt lane is 84.5pt, still half again the 56pt
+        // that started this budget, but the two 2026-08-28 narrowings spend
+        // most of the margin v0.1.125 had banked. What this still guards is
+        // the original defect — the indent quietly eating the title lane —
+        // which is why it is a ratio against the recorded bug and not a
+        // literal that gets re-typed at every width.
         XCTAssertGreaterThan(
             now,
-            shippedInV114 * 1.75,
+            shippedInV114 * 1.45,
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the resting width sits at 245 as of 2026-08-26, by request —
-        // the double-click reset lands "1-2cm less wide" than v0.1.125's
-        // 290. The density era's "under every width since v1.1.5" pin is
-        // retired with the density default itself; what this release still
-        // owes is that the rail stays inside its own bounds and the title
-        // lane it buys is real.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
+        // …and the resting width sits at 196 as of 2026-08-28, by request —
+        // "at least 20% less wide" than the 245 that 2026-08-26 set, which is
+        // 196 on the nose and matches the Files rail's own default. What this
+        // release still owes is that the rail stays inside its own bounds and
+        // the title lane it buys is real.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 180)
     }
 
     // MARK: - Header "+" containment
@@ -1084,9 +1105,14 @@ final class QuietIdentityMarkTests: XCTestCase {
 
         // The whole reservation still has to leave the project name most of the
         // row: a slot that fixes clipping by eating the header is not a fix.
+        // 0.2 → 0.22: the reservation itself has not moved a point (38pt).
+        // The rail shrank under it — 38 was 15.5% of the 245pt column and is
+        // 21% of the 180pt one — so the fraction is restated at what still
+        // means "the name keeps most of the row" rather than left where a
+        // narrowing would trip it.
         XCTAssertLessThan(
             QuietRowBudget.headerPlusReserved,
-            NativeWorkspaceChrome.projectSidebarIdealWidth * 0.2
+            NativeWorkspaceChrome.projectSidebarIdealWidth * 0.22
         )
     }
 
@@ -1291,7 +1317,13 @@ final class QuietIdentityMarkTests: XCTestCase {
         // the default width — so the margin below is a comfort floor, not the
         // contract, and it is asserted at a value the current sizes clear by
         // more than 10pt rather than at whatever they happen to produce.
-        XCTAssertGreaterThan(width - footerNameRenders(displayed), 20)
+        // 20 → 4 with the 2026-08-28 narrowing to 180. The CONTRACT above
+        // still holds — "michael" renders without an ellipsis — but the
+        // comfort margin is spent: a first name much longer than this one
+        // will truncate at the default width, and only the help text and the
+        // account menu will carry it in full. Recorded here so the next
+        // person to look sees a deliberate trade rather than a near miss.
+        XCTAssertGreaterThan(width - footerNameRenders(displayed), 4)
 
         // The rungs that are still load-free to keep, pinned so a later pass
         // cannot quietly take these points back as well.

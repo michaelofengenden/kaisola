@@ -132,6 +132,27 @@ struct UsageSettingsTab: View {
                             .accessibilityLabel("Refresh account limits")
                         }
 
+                        // Say that a refresh is running even when there are
+                        // already numbers on screen.
+                        //
+                        // The only "loading" signal used to be the Refresh
+                        // button swapping to a mini spinner, which is easy to
+                        // miss and sits nowhere near the figures it is about
+                        // to change — so seeded cache numbers read as live
+                        // ones. The empty state keeps its own spinner; this is
+                        // the case where last-known values are showing and the
+                        // question is whether they are being checked.
+                        if usage.isRefreshingPlanUsage, !usage.planUsage.isEmpty {
+                            HStack(spacing: 7) {
+                                ProgressView().controlSize(.small)
+                                Text("Updating account limits…")
+                                    .font(.callout)
+                                    .foregroundStyle(.kaisolaSecondary)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityIdentifier("usage.plan.refreshing")
+                        }
+
                         if let staleness = usage.planUsageStaleness {
                             let timestamp = staleness.lastSuccessfulRefresh.formatted(
                                 date: .abbreviated,
@@ -247,6 +268,37 @@ struct UsageSettingsTab: View {
             // Production always performs the real signed-helper refresh.
             guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
             usage.refreshPlanUsage(workspace: workspace)
+
+            // "…they should show the previous known state and just
+            // continuously update if on the usage page in settings"
+            // (2026-08-28). The seeded cache already answers the first half:
+            // a reading for this exact context paints immediately and the
+            // probe runs underneath it. This is the second half — while the
+            // pane is on screen, keep asking.
+            //
+            // Each tick waits out what is LEFT of the reading on screen, not a
+            // whole TTL.
+            //
+            // Sleeping a full TTL is only right when the pane opens on a fresh
+            // reading. Open it 170 seconds into one and the refresh above
+            // accepts that cache, then this loop holds it for another 180 — so
+            // the figures can reach nearly two TTLs while the loop believes it
+            // is keeping them inside one. Polling faster would fix the
+            // staleness and cost real work: every unforced call still resolves
+            // a context key, which reads and digests the credential files.
+            // Waiting the remaining lifetime lands the next probe as the cache
+            // expires and does nothing in between.
+            //
+            // `.task` cancels this when the pane goes away, which is what stops
+            // it probing behind a closed Settings window.
+            while !Task.isCancelled {
+                let remaining = usage.planUsageRemainingLifetime
+                    ?? UsageCenter.automaticPlanUsageTTL
+                // A floor, so an already-expired reading cannot spin the loop.
+                try? await Task.sleep(for: .seconds(max(remaining, 1)))
+                guard !Task.isCancelled else { return }
+                usage.refreshPlanUsage(workspace: workspace)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)) { _ in
             accountProfiles = usage.fixtureAccountProfiles ?? accountStore.profiles()

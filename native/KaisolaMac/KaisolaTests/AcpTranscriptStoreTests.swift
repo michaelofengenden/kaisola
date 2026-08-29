@@ -2785,3 +2785,45 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertNotNil(healthAfterExport.failure)
     }
 }
+
+// MARK: - Copying a whole message (2026-08-28)
+
+extension AcpTranscriptStoreTests {
+    /// "Users should be able to highlight and copy text from agent chat
+    /// sessions." Highlighting reaches one paragraph and stops — SwiftUI
+    /// selection cannot cross two `Text` views, and a rendered answer is one
+    /// per block — so every prose row also offers itself whole.
+    func testProseRowsOfferTheirWholeTextAndEvidenceRowsDoNot() {
+        XCTAssertEqual(
+            AcpTranscriptRow.message(id: "1", text: "First.\n\nSecond.").copyableText,
+            "First.\n\nSecond.",
+            "an answer copies across the paragraph break highlighting cannot cross"
+        )
+        XCTAssertEqual(
+            AcpTranscriptRow.thought(id: "2", text: "reasoning").copyableText,
+            "reasoning"
+        )
+        XCTAssertEqual(
+            AcpTranscriptRow.permissionDecision(id: "3", text: "denied").copyableText,
+            "denied"
+        )
+
+        // The markdown is copied, not the rendered attributed text, so a
+        // pasted code fence is still a code fence.
+        let fenced = "Here:\n\n```swift\nlet x = 1\n```"
+        XCTAssertEqual(AcpTranscriptRow.message(id: "4", text: fenced).copyableText, fenced)
+
+        // A user prompt copies what the bubble showed: the pinned trailing
+        // attachment line is parsed back out, not pasted.
+        let prompted = AcpTranscriptRow.user(id: "5", text: "look at this", failed: false)
+        XCTAssertEqual(prompted.copyableText, "look at this")
+
+        // Evidence rows keep their own affordances; flattening them would
+        // paste something that was never on screen.
+        XCTAssertNil(AcpTranscriptRow.plan(id: "6", entries: []).copyableText)
+        XCTAssertNil(
+            AcpTranscriptRow.message(id: "7", text: "").copyableText,
+            "an empty row offers nothing to copy"
+        )
+    }
+}

@@ -671,19 +671,27 @@ struct SettingsView: View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) { selectedSection = section }
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: section.symbol)
-                    .frame(width: 18)
+            HStack(spacing: 9) {
+                SettingsSectionGlyph(section: section, isSelected: selectedSection == section)
                 Text(section.title)
                 Spacer(minLength: 0)
             }
+            // System Settings fills the selected row with the accent itself
+            // and flips its content to white, rather than tinting the surface
+            // under otherwise-unchanged text. The 14% wash this replaces read
+            // as "slightly warmer row"; at a glance the sidebar did not say
+            // which pane you were on.
             .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-            .foregroundStyle(selectedSection == section ? Color.primary : .kaisolaSecondary)
+            .foregroundStyle(
+                selectedSection == section
+                    ? AnyShapeStyle(.white)
+                    : AnyShapeStyle(Color.kaisolaSecondary)
+            )
             .padding(.horizontal, 11)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                selectedSection == section ? Color.accentColor.opacity(0.14) : .clear,
+                selectedSection == section ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.clear),
                 in: RoundedRectangle(cornerRadius: 9)
             )
             .contentShape(Rectangle())
@@ -1624,6 +1632,53 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .updates: "arrow.triangle.2.circlepath"
         }
     }
+
+    /// The glyph tile's colour, the way System Settings gives every row its
+    /// own — Wi-Fi blue, Battery green, Accessibility blue, Focus indigo.
+    ///
+    /// It is the tiles, more than anything else, that make that sidebar read
+    /// as Apple's: a plain SF Symbol in the label colour is what a third-party
+    /// settings window looks like. Hues are grouped by kind rather than picked
+    /// per row — appearance blue, workspace tones warm, agents purple, device
+    /// teal — so the column still scans as four families.
+    var tint: Color {
+        switch self {
+        case .general: .blue
+        case .updates: .indigo
+        case .terminal: .orange
+        case .guardrails: .red
+        case .shortcuts: .gray
+        case .extensions: .purple
+        case .accounts: .blue
+        case .agents: .purple
+        case .models: .orange
+        case .usage: .green
+        case .companion: .teal
+        }
+    }
+}
+
+/// One System Settings sidebar glyph: a small filled rounded square with a
+/// white symbol centred in it.
+private struct SettingsSectionGlyph: View {
+    let section: SettingsSection
+    let isSelected: Bool
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+            // On the selected row the tile sits on the accent fill, where a
+            // saturated colour on saturated blue reads as a smudge. Apple
+            // keeps the glyph legible there by dropping the tile to a white
+            // veil and letting the symbol carry the shape.
+            .fill(isSelected ? AnyShapeStyle(.white.opacity(0.22)) : AnyShapeStyle(section.tint))
+            .frame(width: 20, height: 20)
+            .overlay {
+                Image(systemName: section.symbol)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .accessibilityHidden(true)
+    }
 }
 
 enum SettingsCatalogSearch {
@@ -1679,24 +1734,41 @@ enum SettingsCatalogSearch {
     }
 }
 
+/// A settings group in System Settings' grammar: the group's name sits ABOVE
+/// the card as a quiet heading, and the card itself is one plain rounded
+/// surface holding nothing but rows.
+///
+/// What this replaces is a titled, dividered, shadowed panel — a heading bar
+/// with its own glyph and rule inside the same rounded box as the content, so
+/// every group read as a small window. Apple puts the label outside and lets
+/// the card be furniture; the result is a page of settings instead of a stack
+/// of panels, which is what "mimic settings the way Apple does it" is asking
+/// for. The `symbol` is kept in the API because a dozen call sites pass one
+/// and the sidebar still uses glyphs, but a group heading in the content pane
+/// does not carry an icon in System Settings, so it is no longer drawn.
 struct SettingsCard<Content: View>: View {
     let title: String
     let symbol: String
     @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Label(title, systemImage: symbol)
-                .font(.caption.weight(.semibold))
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.kaisolaSecondary)
-                .padding(.horizontal, 16)
-                .frame(height: 40)
-            Divider().opacity(0.65)
-            content
+                .padding(.horizontal, 4)
+            VStack(alignment: .leading, spacing: 0) {
+                content
+            }
+            .background(
+                Color(nsColor: .controlBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: KaisolaVisualSystem.hairline)
+            )
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.quaternary))
-        .shadow(color: .black.opacity(0.035), radius: 12, y: 5)
     }
 }
 
@@ -1707,41 +1779,74 @@ struct SettingsRow<Trailing: View>: View {
     @ViewBuilder let trailing: Trailing
 
     var body: some View {
+        // No leading glyph. System Settings carries icons in the sidebar and
+        // nowhere else: a column of them down the content pane competes with
+        // the labels for the eye and pushes every control further right, which
+        // is half of why these rows read as long boxes. The parameter stays
+        // for the call sites that already pass one.
         HStack(spacing: 12) {
-            Image(systemName: symbol)
-                .foregroundStyle(.kaisolaSecondary)
-                .frame(width: 22)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.callout.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.kaisolaSecondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.body)
+                // Apple's secondary line is a real second register, not a
+                // caption: smaller, quieter, and omitted entirely when there
+                // is nothing worth saying.
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 16)
-            trailing
+            // The control takes its own width, never the row's leftovers.
+            //
+            // A `Menu` fills whatever it is offered, and with a `Spacer` on
+            // its leading side that is every point the label does not use —
+            // so a two-word choice rendered as a control running most of the
+            // pane ("all the menu options are elongated", 2026-08-28). System
+            // Settings sizes each control to its value and right-aligns it,
+            // which is what asking for the ideal size here does. Applied once
+            // for every row rather than at ~15 call sites that can each forget.
+            trailing.fixedSize()
         }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 58)
+        .padding(.horizontal, 14)
+        // 58 → 44. The old height was sized around a two-line label plus a
+        // 22pt glyph; without the glyph, and with the detail line optional,
+        // System Settings' own row cadence is what fits. Rows with a detail
+        // line still grow past this on their own.
+        .frame(minHeight: 44)
     }
 }
 
+/// The hairline between rows, inset to the label's own leading edge the way
+/// System Settings insets it — 50pt was clearing a row glyph that no longer
+/// exists, which left every rule starting a third of the way into the card.
 struct SettingsDivider: View {
-    var body: some View { Divider().padding(.leading, 50).opacity(0.55) }
+    var body: some View { Divider().padding(.leading, 14).opacity(0.5) }
 }
 
+/// A pop-up value in System Settings' grammar: the current choice, then the
+/// chevron, sized to the value and nothing more.
+///
+/// The filled 108pt-minimum plate this replaced is what made the rows read as
+/// a column of long boxes. Apple draws the value as plain text with an accent
+/// chevron beside it and lets the row's own card supply the surface, so the
+/// eye reads a list of settings rather than a stack of controls. `minWidth` is
+/// gone with the plate: a fixed floor under a right-aligned label only pushes
+/// short values away from their own chevron.
 private struct SettingsChoiceLabel: View {
     let title: String
     init(_ title: String) { self.title = title }
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Text(title).lineLimit(1)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.kaisolaTertiary)
+                .foregroundStyle(Color.accentColor)
         }
         .font(.callout)
-        .padding(.horizontal, 10)
-        .frame(minWidth: 108, minHeight: 30)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .frame(minHeight: 22)
+        .contentShape(Rectangle())
     }
 }
 

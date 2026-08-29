@@ -1547,6 +1547,30 @@ struct TranscriptRowView: View {
     var conversationIsRunning = true
 
     var body: some View {
+        // Every prose row can be copied whole.
+        //
+        // Highlighting reaches one paragraph and stops: SwiftUI selection
+        // cannot cross two `Text` views, and a rendered answer is one per
+        // block. Selection is still enabled and still worth having for
+        // grabbing a phrase; this is the affordance for when what you wanted
+        // was the message. Rows that are evidence rather than prose (tool
+        // calls, plans, audits) return nil and keep their own affordances.
+        if let copyable = row.copyableText {
+            content.contextMenu {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(copyable, forType: .string)
+                } label: {
+                    Label("Copy Message", systemImage: "doc.on.doc")
+                }
+            }
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         switch row {
         case let .runProfileAudit(_, profile):
             HStack(spacing: 6) {
@@ -1901,7 +1925,7 @@ struct SubagentChipRow: View {
     @State private var showsActivity = false
 
     private var statusText: String {
-        phase == .backgrounded && !turnIsLive ? "delegated" : phase.statusWord
+        phase.statusWord(turnIsLive: turnIsLive)
     }
 
     /// The launch acknowledgement on a backgrounded spawn is adapter
@@ -1967,7 +1991,7 @@ struct SubagentChipRow: View {
                 .symbolEffect(
                     .pulse,
                     options: .repeating,
-                    isActive: !reduceMotion && phase == .working
+                    isActive: !reduceMotion && phase.animates(turnIsLive: turnIsLive)
                 )
                 .accessibilityHidden(true)
             Text(call.title)
@@ -2003,7 +2027,7 @@ struct SubagentChipRow: View {
                     .fill(.red.opacity(0.08))
             }
         }
-        .kaisolaControlSurface(active: phase == .working)
+        .kaisolaControlSurface(active: phase.animates(turnIsLive: turnIsLive))
         .contentShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous))
     }
 

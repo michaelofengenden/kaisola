@@ -5708,6 +5708,10 @@ enum WorkspaceTrafficLights {
 
     /// Pure shift: every button moves by the same delta that brings the
     /// first one to `leadingInset`, so the standard gaps survive untouched.
+    ///
+    /// Correct only when every input is genuinely at its stock position. That
+    /// is not something a live read can promise, which is what `gaps(between:)`
+    /// and `origins(leadingInset:gaps:)` below exist to fix; see `apply()`.
     nonisolated static func shiftedOrigins(
         standardMinXs: [CGFloat],
         leadingInset: CGFloat = WorkspaceTrafficLights.leadingInset
@@ -5715,6 +5719,33 @@ enum WorkspaceTrafficLights {
         guard let first = standardMinXs.first else { return [] }
         let delta = leadingInset - first
         return standardMinXs.map { $0 + delta }
+    }
+
+    /// The distance from each button's leading edge to the next one's.
+    nonisolated static func gaps(between minXs: [CGFloat]) -> [CGFloat] {
+        guard minXs.count > 1 else { return [] }
+        return zip(minXs.dropFirst(), minXs).map { $0 - $1 }
+    }
+
+    /// Absolute origins built from the leading inset and a remembered set of
+    /// gaps, rather than from a delta against whatever the buttons read right
+    /// now.
+    ///
+    /// v0.1.147 shipped the delta form and it spaced the close button wrong.
+    /// AppKit relays the three buttons out individually, so a frame-change
+    /// notification can arrive with close already returned to stock (7) while
+    /// minimize and zoom still hold the shifted spots (40, 60). Shifting that
+    /// read by close's own delta yields 20/53/73: the red button pushed a
+    /// third of a button-width away from its neighbours, which is exactly the
+    /// uneven gap that got reported. Rebuilding from known gaps cannot express
+    /// an uneven result, whatever partial state the read caught.
+    nonisolated static func origins(
+        leadingInset: CGFloat = WorkspaceTrafficLights.leadingInset,
+        gaps: [CGFloat]
+    ) -> [CGFloat] {
+        var origins: [CGFloat] = [leadingInset]
+        for gap in gaps { origins.append(origins[origins.count - 1] + gap) }
+        return origins
     }
 
     @MainActor private static var controllers: [ObjectIdentifier: Controller] = [:]
@@ -5737,6 +5768,8 @@ enum WorkspaceTrafficLights {
         private weak var window: NSWindow?
         private var observers: [NSObjectProtocol] = []
         private var reapplying = false
+        /// Captured once from the stock layout; see `apply()`.
+        private var stockGaps: [CGFloat]?
         private let release: () -> Void
 
         init(window: NSWindow, release: @escaping () -> Void) {
@@ -5779,7 +5812,17 @@ enum WorkspaceTrafficLights {
             ].compactMap { $0 }
             guard buttons.count == 3 else { return }
             let currentMinXs = buttons.map { $0.frame.minX }
-            let targets = WorkspaceTrafficLights.shiftedOrigins(standardMinXs: currentMinXs)
+            // The first read of a freshly installed controller is the one
+            // moment the layout is guaranteed stock, so that is where the gaps
+            // come from. Every later application rebuilds from them, so a
+            // partial AppKit relayout can move the buttons but never respace
+            // them.
+            if stockGaps == nil {
+                let observed = WorkspaceTrafficLights.gaps(between: currentMinXs)
+                if observed.allSatisfy({ $0 > 0 }) { stockGaps = observed }
+            }
+            guard let stockGaps else { return }
+            let targets = WorkspaceTrafficLights.origins(gaps: stockGaps)
             guard zip(currentMinXs, targets).contains(where: { abs($0 - $1) > 0.5 }) else { return }
             reapplying = true
             defer { reapplying = false }

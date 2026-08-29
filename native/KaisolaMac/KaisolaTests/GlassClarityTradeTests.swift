@@ -165,6 +165,24 @@ final class GlassClarityTradeTests: XCTestCase {
             layoutIsEmpty: true, hasRecovery: false, browserMounted: false,
             previewMounted: false, filesRailVisible: true
         ))
+
+        // The "Start a session" chooser counts as mounted (2026-08-28). It
+        // brings its own material, so this was never a legibility question —
+        // it is that the graduated rails carry the CANVAS recipe, so an idle
+        // middle went flat between two tinted rails exactly when the chooser
+        // was up.
+        XCTAssertFalse(NativeWorkspaceChrome.canvasIsIdle(
+            layoutIsEmpty: true, hasRecovery: false, browserMounted: false,
+            previewMounted: false, filesRailVisible: false,
+            sessionChooserMounted: true
+        ))
+        // …and the genuinely empty canvas — no project, nothing offered — is
+        // still idle, which is what the state was always describing.
+        XCTAssertTrue(NativeWorkspaceChrome.canvasIsIdle(
+            layoutIsEmpty: true, hasRecovery: false, browserMounted: false,
+            previewMounted: false, filesRailVisible: false,
+            sessionChooserMounted: false
+        ))
     }
 
     /// The clear still has to be the wallpaper, not the bake: same brightness

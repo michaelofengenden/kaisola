@@ -343,6 +343,49 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNil(center.planUsageError)
     }
 
+    /// The Usage pane's loop sleeps this rather than a whole TTL.
+    ///
+    /// Review finding on PR #907: opening the pane part-way through a cached
+    /// reading meant the initial refresh accepted that cache and the loop then
+    /// held it for another full TTL, so what was on screen could reach nearly
+    /// two TTLs while the loop believed it was keeping inside one. Waiting the
+    /// REMAINING lifetime lands the next probe as the cache expires, without
+    /// polling faster — every unforced call resolves a context key, which
+    /// reads and digests credential files, so a shorter tick is not free.
+    func testRemainingLifetimeIsWhatIsLeftOfTheCachedReading() async throws {
+        let clock = Date(timeIntervalSince1970: 2_000)
+        let center = UsageCenter(now: { clock })
+        let workspace = URL(fileURLWithPath: "/tmp/kaisola-usage-remaining", isDirectory: true)
+        let providers = try UsageCenter.decodeProviderPlanUsage(Data(#"""
+        {"providers":[{
+          "provider":"codex","displayName":"Codex","ok":true,
+          "sourceLabel":"Codex CLI app-server","windows":[]
+        }]}
+        """#.utf8))
+
+        // Nothing cached for a context yet: the caller falls back to the TTL.
+        XCTAssertNil(center.planUsageRemainingLifetime)
+
+        // A reading taken 30s ago has TTL − 30 left, not a whole TTL.
+        await center.cachePlanUsage(
+            providers,
+            workspace: workspace,
+            fetchedAt: clock.addingTimeInterval(-30)
+        )
+        center.refreshPlanUsage(workspace: workspace)
+        await center.waitForPlanUsageRefresh()
+
+        let remaining = try XCTUnwrap(center.planUsageRemainingLifetime)
+        XCTAssertEqual(
+            remaining,
+            UsageCenter.automaticPlanUsageTTL - 30,
+            accuracy: 0.5,
+            "sleeping a full TTL here is what let the figures reach nearly two"
+        )
+        XCTAssertLessThan(remaining, UsageCenter.automaticPlanUsageTTL)
+        XCTAssertGreaterThan(remaining, 0)
+    }
+
     func testTransientProviderRefreshFailureRetainsLastKnownSnapshotAndMarksItStale() async throws {
         let lastSuccess = Date(timeIntervalSince1970: 4_000)
         var currentTime = lastSuccess.addingTimeInterval(120)

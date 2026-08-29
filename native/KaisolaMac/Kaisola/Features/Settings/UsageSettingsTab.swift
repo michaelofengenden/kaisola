@@ -276,15 +276,26 @@ struct UsageSettingsTab: View {
             // probe runs underneath it. This is the second half — while the
             // pane is on screen, keep asking.
             //
-            // Unforced, so each tick is free until the cached reading passes
-            // `automaticPlanUsageTTL` and then costs exactly one probe. The
-            // cadence is the TTL itself: asking faster only returns the same
-            // cache, and asking slower leaves the page staler than the number
-            // it is showing. `.task` cancels this loop when the pane goes
-            // away, which is what keeps it from probing behind a closed
-            // Settings window.
+            // Each tick waits out what is LEFT of the reading on screen, not a
+            // whole TTL.
+            //
+            // Sleeping a full TTL is only right when the pane opens on a fresh
+            // reading. Open it 170 seconds into one and the refresh above
+            // accepts that cache, then this loop holds it for another 180 — so
+            // the figures can reach nearly two TTLs while the loop believes it
+            // is keeping them inside one. Polling faster would fix the
+            // staleness and cost real work: every unforced call still resolves
+            // a context key, which reads and digests the credential files.
+            // Waiting the remaining lifetime lands the next probe as the cache
+            // expires and does nothing in between.
+            //
+            // `.task` cancels this when the pane goes away, which is what stops
+            // it probing behind a closed Settings window.
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(UsageCenter.automaticPlanUsageTTL))
+                let remaining = usage.planUsageRemainingLifetime
+                    ?? UsageCenter.automaticPlanUsageTTL
+                // A floor, so an already-expired reading cannot spin the loop.
+                try? await Task.sleep(for: .seconds(max(remaining, 1)))
                 guard !Task.isCancelled else { return }
                 usage.refreshPlanUsage(workspace: workspace)
             }

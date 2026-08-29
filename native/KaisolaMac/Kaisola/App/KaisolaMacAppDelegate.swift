@@ -5739,9 +5739,6 @@ enum WorkspaceTrafficLights {
     /// is worse than the bug it replaced, which at least self-corrected on the
     /// next relayout.
     ///
-    /// Squeezing moves buttons closer, never further apart, so the LARGEST
-    /// observed gap is the stock one and the smaller ones are the artefact.
-    /// Taking the max recovers 20 from 20/12 and is a no-op on a clean read.
     /// How close to `leadingInset` counts as "already there".
     ///
     /// Measured 2026-08-29 through the accessibility API: Finder and Notes on
@@ -5764,9 +5761,26 @@ enum WorkspaceTrafficLights {
         currentLeading < leadingInset - alreadyInsetTolerance
     }
 
+    /// How far two gaps may differ and still count as the same pitch.
+    nonisolated static let gapAgreementTolerance: CGFloat = 0.5
+
+    /// Only an EVEN read teaches the pitch. A read whose gaps disagree is
+    /// discarded — not averaged, and not maxed.
+    ///
+    /// Taking the largest gap was the obvious repair, and it is wrong in the
+    /// other direction: the partial relayout documented above, `[7, 40, 60]`,
+    /// has gaps of 33 and 20, so the max learns 33 and spreads the buttons to
+    /// 20/53/86 — further apart than any layout AppKit would produce, and
+    /// permanently, because a rule that only ever widens can never come back
+    /// down. A transient read is not evidence about the window whichever
+    /// direction it errs in. The only safe inference is from a layout that
+    /// already agrees with itself.
     nonisolated static func uniformGap(from minXs: [CGFloat]) -> CGFloat? {
-        let observed = gaps(between: minXs).filter { $0 > 0 }
-        return observed.max()
+        let observed = gaps(between: minXs)
+        guard let first = observed.first, first > 0 else { return nil }
+        guard observed.allSatisfy({ abs($0 - first) <= gapAgreementTolerance })
+        else { return nil }
+        return first
     }
 
     /// Absolute origins for evenly spaced buttons.
@@ -5820,8 +5834,8 @@ enum WorkspaceTrafficLights {
         private weak var window: NSWindow?
         private var observers: [NSObjectProtocol] = []
         private var reapplying = false
-        /// The uniform spacing the buttons are laid out by, widened toward the
-        /// stock value as reads arrive; see `apply()`.
+        /// The uniform spacing the buttons are laid out by, learned once from
+        /// an even read; see `apply()`.
         private var stockGap: CGFloat?
         private let release: () -> Void
 
@@ -5868,13 +5882,12 @@ enum WorkspaceTrafficLights {
             // AppKit already insets them on this macOS; leave them alone.
             guard let leading = currentMinXs.first,
                   WorkspaceTrafficLights.shouldReposition(currentLeading: leading) else { return }
-            // Widen the remembered gap whenever a read shows a larger one: the
-            // first read is not guaranteed to be stock, and a squeezed layout
-            // only ever reports gaps SMALLER than the real one. Keeping the
-            // maximum means one clean read fixes the window for good, and no
-            // read can ever narrow it again.
-            if let observed = WorkspaceTrafficLights.uniformGap(from: currentMinXs) {
-                stockGap = max(stockGap ?? observed, observed)
+            // Learn the pitch once, from a read that agrees with itself, and
+            // never revise it. A disagreeing read teaches nothing, and the
+            // buttons are left alone that pass — the next clean relayout
+            // supplies it.
+            if stockGap == nil {
+                stockGap = WorkspaceTrafficLights.uniformGap(from: currentMinXs)
             }
             guard let stockGap else { return }
             let targets = WorkspaceTrafficLights.origins(

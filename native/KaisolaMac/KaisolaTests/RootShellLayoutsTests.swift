@@ -335,37 +335,52 @@ final class RootShellLayoutsTests: XCTestCase {
     /// Measured on a real v0.1.148 window through the accessibility API:
     /// close 21, minimize 41, zoom 53 — gaps of 20 and 12.
     ///
-    /// v0.1.148's fix made this permanent instead of fixing it. It captured
-    /// the first read's gaps verbatim, guarded only against negatives, and
-    /// then re-imposed them forever — so a read taken mid-layout became the
-    /// window's spacing for the rest of its life. macOS spaces these evenly by
-    /// definition, so disagreeing gaps describe the read, not the window.
-    func testTheUniformGapIsRecoveredFromASqueezedRead() {
-        // The exact shipped defect.
-        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [21, 41, 53]), 20)
-        XCTAssertEqual(
-            WorkspaceTrafficLights.origins(uniformGap: 20, count: 3),
-            [20, 40, 60],
-            "one clean rebuild puts all three back on the standard pitch"
-        )
-
-        // Squeezing only ever makes gaps smaller, so the largest is the stock
-        // one whichever pair got compressed.
-        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [7, 15, 35]), 20)
+    /// v0.1.148's fix made this permanent instead of fixing it: it captured
+    /// the first read's gaps verbatim and re-imposed them forever, so a read
+    /// taken mid-layout became the window's spacing for life. The obvious
+    /// repair — trust the LARGEST gap, since squeezing only closes them — is
+    /// wrong in the other direction, and review caught it: `[7, 40, 60]`, the
+    /// partial relayout where close has moved and the others have not, has
+    /// gaps of 33 and 20, so the max learns 33 and spreads the buttons to
+    /// 20/53/86. Wider than anything AppKit would draw, and permanent, since a
+    /// rule that only widens cannot come back down.
+    ///
+    /// So a disagreeing read teaches nothing at all.
+    func testOnlyAnEvenReadTeachesThePitch() {
+        // Even reads teach; the value is the pitch itself.
         XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [7, 27, 47]), 20)
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [18, 41, 64]), 23)
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [20, 40, 60]), 20)
 
-        // A clean read is a fixed point: rebuilding changes nothing.
-        XCTAssertEqual(
-            WorkspaceTrafficLights.origins(uniformGap: 20, count: 3),
-            WorkspaceTrafficLights.origins(
-                uniformGap: WorkspaceTrafficLights.uniformGap(from: [20, 40, 60]) ?? 0,
-                count: 3
-            )
+        // Every disagreeing read is discarded — squeezed or inflated alike.
+        XCTAssertNil(
+            WorkspaceTrafficLights.uniformGap(from: [21, 41, 53]),
+            "the shipped 0.1.148 squeeze"
         )
+        XCTAssertNil(
+            WorkspaceTrafficLights.uniformGap(from: [7, 40, 60]),
+            "the inflated partial relayout: max would learn 33 and spread to 20/53/86"
+        )
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [19, 45, 64]))
 
-        // Degenerate reads yield nothing to act on rather than a bad gap.
+        // Nothing learned from that read can move the buttons anywhere, which
+        // is the property the spread violated.
+        for bad in [[21.0, 41, 53], [7, 40, 60], [19, 45, 64]] {
+            XCTAssertNil(
+                WorkspaceTrafficLights.uniformGap(from: bad.map { CGFloat($0) }),
+                "a transient read must never become a pitch"
+            )
+        }
+
+        // Once a pitch IS learned, the rebuild is evenly spaced by construction.
+        let origins = WorkspaceTrafficLights.origins(uniformGap: 20, count: 3)
+        XCTAssertEqual(origins, [20, 40, 60])
+        XCTAssertEqual(origins[1] - origins[0], origins[2] - origins[1])
+
+        // Degenerate reads yield nothing to act on.
         XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [20]))
         XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: []))
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [40, 20, 60]))
         XCTAssertEqual(WorkspaceTrafficLights.origins(uniformGap: 20, count: 0), [])
     }
 
@@ -400,7 +415,8 @@ final class RootShellLayoutsTests: XCTestCase {
                 uniformGap: WorkspaceTrafficLights.uniformGap(from: [7, 30, 53]) ?? 0,
                 count: 3
             ),
-            [20, 43, 66]
+            [20, 43, 66],
+            "an even stock read of pitch 23 rebuilds onto the same pitch"
         )
     }
 

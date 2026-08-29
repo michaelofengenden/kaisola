@@ -7233,14 +7233,16 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     func testFullHeightWorkspaceOnlyReservesTrafficLightClearanceInNavigation() {
         XCTAssertEqual(NativeWorkspaceChrome.sidebarTrafficLightClearance, 40)
-        // 76 → 88 with the Safari-inset traffic lights: the buttons moved
-        // ~13pt inward, so the merged bar's leading lane grows in step and
-        // must clear the shifted zoom button's trailing edge (~74) with room.
+        // The buttons are AppKit's own again (the 0.1.147–0.1.149 repositioner
+        // is deleted; see `KaisolaMacAppDelegate`). The widest layout measured
+        // on a real window is 16pt buttons at 18/41/64, a zoom trailing edge
+        // of 80 — the clearance must beat that, not a shifted position this
+        // app no longer creates.
         XCTAssertEqual(NativeWorkspaceChrome.topBarTrafficLightClearance, 88)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.topBarTrafficLightClearance,
-            WorkspaceTrafficLights.shiftedOrigins(standardMinXs: [7, 27, 47]).last! + 14,
-            "the switcher must start clear of the shifted zoom button"
+            64 + 16,
+            "the switcher must start clear of the system's own zoom button"
         )
     }
 

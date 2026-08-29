@@ -325,7 +325,7 @@ struct ExtensionsSettingsHub: View {
                         }
                     }
                 }
-                .padding(18)
+                .padding(SettingsWindowChrome.paneMargin)
             }
             .onAppear {
                 guard let category = initialRoute?.category,

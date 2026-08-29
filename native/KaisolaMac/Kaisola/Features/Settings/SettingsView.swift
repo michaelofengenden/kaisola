@@ -30,6 +30,15 @@ enum SettingsWindowChrome {
 
     /// SettingsView's own frame contract, stated once so the ⌘, window, the
     /// visual fixtures, and the tests cannot drift from it.
+    /// The breathing room around a pane's cards.
+    ///
+    /// 18 → 32 (2026-08-29, "the settings have large margins"). 18 was sized
+    /// for the 810×540 window Settings used to open at; at the 1,100×800 it
+    /// opens at now, cards ran nearly edge to edge and the pane read as a
+    /// table rather than a page. System Settings keeps a wide, even margin on
+    /// every side and lets the content breathe into it.
+    static let paneMargin: CGFloat = 32
+
     static let minimumContentSize = NSSize(width: 820, height: 560)
     static let idealContentSize = NSSize(width: 1_100, height: 800)
 
@@ -429,6 +438,19 @@ struct SettingsView: View {
                     settingsContent
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                // An opaque page, not the workspace showing through.
+                //
+                // The takeover renders over the canvas, so Settings inherited
+                // whatever wash the theme was painting — a grey page under
+                // white cards ("make settings background white", 2026-08-29).
+                //
+                // `windowBackgroundColor` rather than a literal white: it is
+                // the near-white macOS gives a settings window in light mode
+                // and the correct dark surface in dark, and critically it sits
+                // a shade under `controlBackgroundColor`, which is what lets
+                // the white cards read as raised without drawing a border.
+                // Pure white here was tried first and flattened them.
+                .background(Color(nsColor: .windowBackgroundColor))
             }
             // The detail column starts below the title bar for the same reason
             // the navigation column does: everything above this line is the
@@ -942,7 +964,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1023,7 +1045,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1189,7 +1211,7 @@ struct SettingsView: View {
                     }
                     .id("terminal-interaction")
                 }
-                .padding(18)
+                .padding(SettingsWindowChrome.paneMargin)
             }
             .onAppear {
                 guard let initialContentAnchorID else { return }
@@ -1282,7 +1304,7 @@ struct SettingsView: View {
                     workspace: workspace
                 )
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1760,14 +1782,24 @@ struct SettingsCard<Content: View>: View {
             VStack(alignment: .leading, spacing: 0) {
                 content
             }
+            // Apple's own recipe, rather than an approximation of it.
+            //
+            // A grey fill with a drawn border is how a third-party window
+            // imitates a group box. System Settings does the opposite: the box
+            // is the LIGHTER surface — `controlBackgroundColor`, true white in
+            // light mode — sitting on the slightly darker page, with no border
+            // at all and only a whisper of shadow to lift it. The page carries
+            // the contrast, so the card never has to draw its own outline.
+            //
+            // This is why the page moves off pure white below: two identical
+            // whites cannot separate, and the one that has to give is the
+            // page, because the card being the brightest thing on screen is
+            // the whole effect.
             .background(
                 Color(nsColor: .controlBackgroundColor),
-                in: RoundedRectangle(cornerRadius: 10)
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: KaisolaVisualSystem.hairline)
-            )
+            .shadow(color: .black.opacity(0.05), radius: 1.5, y: 0.5)
         }
     }
 }

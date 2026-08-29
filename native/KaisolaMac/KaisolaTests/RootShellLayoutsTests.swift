@@ -332,6 +332,94 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: []), [20])
     }
 
+    /// Measured on a real v0.1.148 window through the accessibility API:
+    /// close 21, minimize 41, zoom 53 — gaps of 20 and 12.
+    ///
+    /// v0.1.148's fix made this permanent instead of fixing it: it captured
+    /// the first read's gaps verbatim and re-imposed them forever, so a read
+    /// taken mid-layout became the window's spacing for life. The obvious
+    /// repair — trust the LARGEST gap, since squeezing only closes them — is
+    /// wrong in the other direction, and review caught it: `[7, 40, 60]`, the
+    /// partial relayout where close has moved and the others have not, has
+    /// gaps of 33 and 20, so the max learns 33 and spreads the buttons to
+    /// 20/53/86. Wider than anything AppKit would draw, and permanent, since a
+    /// rule that only widens cannot come back down.
+    ///
+    /// So a disagreeing read teaches nothing at all.
+    func testOnlyAnEvenReadTeachesThePitch() {
+        // Even reads teach; the value is the pitch itself.
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [7, 27, 47]), 20)
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [18, 41, 64]), 23)
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [20, 40, 60]), 20)
+
+        // Every disagreeing read is discarded — squeezed or inflated alike.
+        XCTAssertNil(
+            WorkspaceTrafficLights.uniformGap(from: [21, 41, 53]),
+            "the shipped 0.1.148 squeeze"
+        )
+        XCTAssertNil(
+            WorkspaceTrafficLights.uniformGap(from: [7, 40, 60]),
+            "the inflated partial relayout: max would learn 33 and spread to 20/53/86"
+        )
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [19, 45, 64]))
+
+        // Nothing learned from that read can move the buttons anywhere, which
+        // is the property the spread violated.
+        for bad in [[21.0, 41, 53], [7, 40, 60], [19, 45, 64]] {
+            XCTAssertNil(
+                WorkspaceTrafficLights.uniformGap(from: bad.map { CGFloat($0) }),
+                "a transient read must never become a pitch"
+            )
+        }
+
+        // Once a pitch IS learned, the rebuild is evenly spaced by construction.
+        let origins = WorkspaceTrafficLights.origins(uniformGap: 20, count: 3)
+        XCTAssertEqual(origins, [20, 40, 60])
+        XCTAssertEqual(origins[1] - origins[0], origins[2] - origins[1])
+
+        // Degenerate reads yield nothing to act on.
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [20]))
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: []))
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [40, 20, 60]))
+        XCTAssertEqual(WorkspaceTrafficLights.origins(uniformGap: 20, count: 0), [])
+    }
+
+    /// Measured 2026-08-29 through the accessibility API, same probe, same
+    /// moment: Finder 18/41/64 gaps 23,23. Notes 18/41/64 gaps 23,23. Kaisola
+    /// 19/45/64 gaps 26,19.
+    ///
+    /// The system already insets these buttons — 18 is the "like in Safari"
+    /// position this feature was written to create back when the stock corner
+    /// was ~7. What was left was a 2pt correction that could only do harm, and
+    /// twice did. The controller now stands down whenever AppKit has already
+    /// placed them near the target, which is the only way to guarantee the
+    /// pitch stays the system's own.
+    func testTheButtonsAreLeftAloneWhenAppKitAlreadyInsetsThem() {
+        // What Finder, Notes, and a stock Kaisola window all report today.
+        XCTAssertFalse(
+            WorkspaceTrafficLights.shouldReposition(currentLeading: 18),
+            "the system's own inset is the one this feature wanted"
+        )
+        XCTAssertFalse(WorkspaceTrafficLights.shouldReposition(currentLeading: 20))
+        XCTAssertFalse(WorkspaceTrafficLights.shouldReposition(currentLeading: 30))
+
+        // The corner this was written against, where the shift still earns its
+        // keep.
+        XCTAssertTrue(WorkspaceTrafficLights.shouldReposition(currentLeading: 7))
+        XCTAssertTrue(WorkspaceTrafficLights.shouldReposition(currentLeading: 0))
+
+        // And when it does fire, it lands on the system's own even pitch
+        // rather than a shift of whatever it happened to read.
+        XCTAssertEqual(
+            WorkspaceTrafficLights.origins(
+                uniformGap: WorkspaceTrafficLights.uniformGap(from: [7, 30, 53]) ?? 0,
+                count: 3
+            ),
+            [20, 43, 66],
+            "an even stock read of pitch 23 rebuilds onto the same pitch"
+        )
+    }
+
     /// "The default rail width should also be the default when double-clicking
     /// the panel divider" (2026-08-28). It is — both read
     /// `projectSidebarIdealWidth` — and this is what stops them drifting into

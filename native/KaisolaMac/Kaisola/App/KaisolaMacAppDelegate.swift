@@ -5727,6 +5727,72 @@ enum WorkspaceTrafficLights {
         return zip(minXs.dropFirst(), minXs).map { $0 - $1 }
     }
 
+    /// The one gap the three buttons are evenly spaced by, inferred from a
+    /// read that may not be stock.
+    ///
+    /// macOS spaces the traffic lights uniformly, always — so a read whose
+    /// gaps DISAGREE is a read taken mid-layout, not a description of the
+    /// window. v0.1.148 shipped a version of this that captured the first
+    /// read's gaps verbatim and re-imposed them forever, guarded only against
+    /// negatives; the measured result on a real window was 21/41/53, gaps of
+    /// 20 and 12, with the wrong spacing then held in place permanently. That
+    /// is worse than the bug it replaced, which at least self-corrected on the
+    /// next relayout.
+    ///
+    /// How close to `leadingInset` counts as "already there".
+    ///
+    /// Measured 2026-08-29 through the accessibility API: Finder and Notes on
+    /// this macOS both sit their buttons at x=18 on a 23pt pitch, and so did
+    /// Kaisola before this type touched them. The inset this feature exists to
+    /// create — "slightly more interior, not too far on the edge … like in
+    /// safari" — is what the system now ships by default; the 7pt corner it
+    /// was written against is gone.
+    ///
+    /// So the whole repositioning became a 2pt correction that could only do
+    /// harm, and did: the same measurement found Kaisola at 19/45/64, gaps of
+    /// 26 and 19, against the system's even 23/23. Two attempts to make the
+    /// shift respace correctly both failed, because the shift is the problem.
+    /// Within this distance the buttons are left exactly as AppKit laid them,
+    /// which is the only way to be certain they stay evenly spaced.
+    nonisolated static let alreadyInsetTolerance: CGFloat = 6
+
+    /// Whether the buttons need moving at all.
+    nonisolated static func shouldReposition(currentLeading: CGFloat) -> Bool {
+        currentLeading < leadingInset - alreadyInsetTolerance
+    }
+
+    /// How far two gaps may differ and still count as the same pitch.
+    nonisolated static let gapAgreementTolerance: CGFloat = 0.5
+
+    /// Only an EVEN read teaches the pitch. A read whose gaps disagree is
+    /// discarded — not averaged, and not maxed.
+    ///
+    /// Taking the largest gap was the obvious repair, and it is wrong in the
+    /// other direction: the partial relayout documented above, `[7, 40, 60]`,
+    /// has gaps of 33 and 20, so the max learns 33 and spreads the buttons to
+    /// 20/53/86 — further apart than any layout AppKit would produce, and
+    /// permanently, because a rule that only ever widens can never come back
+    /// down. A transient read is not evidence about the window whichever
+    /// direction it errs in. The only safe inference is from a layout that
+    /// already agrees with itself.
+    nonisolated static func uniformGap(from minXs: [CGFloat]) -> CGFloat? {
+        let observed = gaps(between: minXs)
+        guard let first = observed.first, first > 0 else { return nil }
+        guard observed.allSatisfy({ abs($0 - first) <= gapAgreementTolerance })
+        else { return nil }
+        return first
+    }
+
+    /// Absolute origins for evenly spaced buttons.
+    nonisolated static func origins(
+        leadingInset: CGFloat = WorkspaceTrafficLights.leadingInset,
+        uniformGap gap: CGFloat,
+        count: Int
+    ) -> [CGFloat] {
+        guard count > 0 else { return [] }
+        return (0..<count).map { leadingInset + CGFloat($0) * gap }
+    }
+
     /// Absolute origins built from the leading inset and a remembered set of
     /// gaps, rather than from a delta against whatever the buttons read right
     /// now.
@@ -5768,8 +5834,9 @@ enum WorkspaceTrafficLights {
         private weak var window: NSWindow?
         private var observers: [NSObjectProtocol] = []
         private var reapplying = false
-        /// Captured once from the stock layout; see `apply()`.
-        private var stockGaps: [CGFloat]?
+        /// The uniform spacing the buttons are laid out by, learned once from
+        /// an even read; see `apply()`.
+        private var stockGap: CGFloat?
         private let release: () -> Void
 
         init(window: NSWindow, release: @escaping () -> Void) {
@@ -5812,17 +5879,21 @@ enum WorkspaceTrafficLights {
             ].compactMap { $0 }
             guard buttons.count == 3 else { return }
             let currentMinXs = buttons.map { $0.frame.minX }
-            // The first read of a freshly installed controller is the one
-            // moment the layout is guaranteed stock, so that is where the gaps
-            // come from. Every later application rebuilds from them, so a
-            // partial AppKit relayout can move the buttons but never respace
-            // them.
-            if stockGaps == nil {
-                let observed = WorkspaceTrafficLights.gaps(between: currentMinXs)
-                if observed.allSatisfy({ $0 > 0 }) { stockGaps = observed }
+            // AppKit already insets them on this macOS; leave them alone.
+            guard let leading = currentMinXs.first,
+                  WorkspaceTrafficLights.shouldReposition(currentLeading: leading) else { return }
+            // Learn the pitch once, from a read that agrees with itself, and
+            // never revise it. A disagreeing read teaches nothing, and the
+            // buttons are left alone that pass — the next clean relayout
+            // supplies it.
+            if stockGap == nil {
+                stockGap = WorkspaceTrafficLights.uniformGap(from: currentMinXs)
             }
-            guard let stockGaps else { return }
-            let targets = WorkspaceTrafficLights.origins(gaps: stockGaps)
+            guard let stockGap else { return }
+            let targets = WorkspaceTrafficLights.origins(
+                uniformGap: stockGap,
+                count: buttons.count
+            )
             guard zip(currentMinXs, targets).contains(where: { abs($0 - $1) > 0.5 }) else { return }
             reapplying = true
             defer { reapplying = false }

@@ -443,10 +443,14 @@ struct SettingsView: View {
                 // The takeover renders over the canvas, so Settings inherited
                 // whatever wash the theme was painting — a grey page under
                 // white cards ("make settings background white", 2026-08-29).
-                // `textBackgroundColor` is the document white in light and the
-                // matching near-black in dark, so this is "white" without
-                // hard-coding a colour that dark mode would have to undo.
-                .background(Color(nsColor: .textBackgroundColor))
+                //
+                // `windowBackgroundColor` rather than a literal white: it is
+                // the near-white macOS gives a settings window in light mode
+                // and the correct dark surface in dark, and critically it sits
+                // a shade under `controlBackgroundColor`, which is what lets
+                // the white cards read as raised without drawing a border.
+                // Pure white here was tried first and flattened them.
+                .background(Color(nsColor: .windowBackgroundColor))
             }
             // The detail column starts below the title bar for the same reason
             // the navigation column does: everything above this line is the
@@ -1778,21 +1782,24 @@ struct SettingsCard<Content: View>: View {
             VStack(alignment: .leading, spacing: 0) {
                 content
             }
-            // A faint fill, because the page is white now.
+            // Apple's own recipe, rather than an approximation of it.
             //
-            // The card used `controlBackgroundColor`, which IS white in light
-            // mode: white on a white page left only the hairline, and the
-            // groups stopped reading as groups. Apple's own grouped settings
-            // separate them the same way — a barely-there fill plus a border,
-            // both derived from the label colour so they invert correctly.
+            // A grey fill with a drawn border is how a third-party window
+            // imitates a group box. System Settings does the opposite: the box
+            // is the LIGHTER surface — `controlBackgroundColor`, true white in
+            // light mode — sitting on the slightly darker page, with no border
+            // at all and only a whisper of shadow to lift it. The page carries
+            // the contrast, so the card never has to draw its own outline.
+            //
+            // This is why the page moves off pure white below: two identical
+            // whites cannot separate, and the one that has to give is the
+            // page, because the card being the brightest thing on screen is
+            // the whole effect.
             .background(
-                Color.primary.opacity(0.035),
-                in: RoundedRectangle(cornerRadius: 10)
+                Color(nsColor: .controlBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.primary.opacity(0.09), lineWidth: KaisolaVisualSystem.hairline)
-            )
+            .shadow(color: .black.opacity(0.05), radius: 1.5, y: 0.5)
         }
     }
 }

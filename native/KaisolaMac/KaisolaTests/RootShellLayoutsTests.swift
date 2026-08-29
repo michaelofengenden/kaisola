@@ -332,6 +332,43 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.origins(gaps: []), [20])
     }
 
+    /// Measured on a real v0.1.148 window through the accessibility API:
+    /// close 21, minimize 41, zoom 53 — gaps of 20 and 12.
+    ///
+    /// v0.1.148's fix made this permanent instead of fixing it. It captured
+    /// the first read's gaps verbatim, guarded only against negatives, and
+    /// then re-imposed them forever — so a read taken mid-layout became the
+    /// window's spacing for the rest of its life. macOS spaces these evenly by
+    /// definition, so disagreeing gaps describe the read, not the window.
+    func testTheUniformGapIsRecoveredFromASqueezedRead() {
+        // The exact shipped defect.
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [21, 41, 53]), 20)
+        XCTAssertEqual(
+            WorkspaceTrafficLights.origins(uniformGap: 20, count: 3),
+            [20, 40, 60],
+            "one clean rebuild puts all three back on the standard pitch"
+        )
+
+        // Squeezing only ever makes gaps smaller, so the largest is the stock
+        // one whichever pair got compressed.
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [7, 15, 35]), 20)
+        XCTAssertEqual(WorkspaceTrafficLights.uniformGap(from: [7, 27, 47]), 20)
+
+        // A clean read is a fixed point: rebuilding changes nothing.
+        XCTAssertEqual(
+            WorkspaceTrafficLights.origins(uniformGap: 20, count: 3),
+            WorkspaceTrafficLights.origins(
+                uniformGap: WorkspaceTrafficLights.uniformGap(from: [20, 40, 60]) ?? 0,
+                count: 3
+            )
+        )
+
+        // Degenerate reads yield nothing to act on rather than a bad gap.
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: [20]))
+        XCTAssertNil(WorkspaceTrafficLights.uniformGap(from: []))
+        XCTAssertEqual(WorkspaceTrafficLights.origins(uniformGap: 20, count: 0), [])
+    }
+
     /// "The default rail width should also be the default when double-clicking
     /// the panel divider" (2026-08-28). It is — both read
     /// `projectSidebarIdealWidth` — and this is what stops them drifting into

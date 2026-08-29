@@ -5727,6 +5727,36 @@ enum WorkspaceTrafficLights {
         return zip(minXs.dropFirst(), minXs).map { $0 - $1 }
     }
 
+    /// The one gap the three buttons are evenly spaced by, inferred from a
+    /// read that may not be stock.
+    ///
+    /// macOS spaces the traffic lights uniformly, always — so a read whose
+    /// gaps DISAGREE is a read taken mid-layout, not a description of the
+    /// window. v0.1.148 shipped a version of this that captured the first
+    /// read's gaps verbatim and re-imposed them forever, guarded only against
+    /// negatives; the measured result on a real window was 21/41/53, gaps of
+    /// 20 and 12, with the wrong spacing then held in place permanently. That
+    /// is worse than the bug it replaced, which at least self-corrected on the
+    /// next relayout.
+    ///
+    /// Squeezing moves buttons closer, never further apart, so the LARGEST
+    /// observed gap is the stock one and the smaller ones are the artefact.
+    /// Taking the max recovers 20 from 20/12 and is a no-op on a clean read.
+    nonisolated static func uniformGap(from minXs: [CGFloat]) -> CGFloat? {
+        let observed = gaps(between: minXs).filter { $0 > 0 }
+        return observed.max()
+    }
+
+    /// Absolute origins for evenly spaced buttons.
+    nonisolated static func origins(
+        leadingInset: CGFloat = WorkspaceTrafficLights.leadingInset,
+        uniformGap gap: CGFloat,
+        count: Int
+    ) -> [CGFloat] {
+        guard count > 0 else { return [] }
+        return (0..<count).map { leadingInset + CGFloat($0) * gap }
+    }
+
     /// Absolute origins built from the leading inset and a remembered set of
     /// gaps, rather than from a delta against whatever the buttons read right
     /// now.
@@ -5768,8 +5798,9 @@ enum WorkspaceTrafficLights {
         private weak var window: NSWindow?
         private var observers: [NSObjectProtocol] = []
         private var reapplying = false
-        /// Captured once from the stock layout; see `apply()`.
-        private var stockGaps: [CGFloat]?
+        /// The uniform spacing the buttons are laid out by, widened toward the
+        /// stock value as reads arrive; see `apply()`.
+        private var stockGap: CGFloat?
         private let release: () -> Void
 
         init(window: NSWindow, release: @escaping () -> Void) {
@@ -5812,17 +5843,19 @@ enum WorkspaceTrafficLights {
             ].compactMap { $0 }
             guard buttons.count == 3 else { return }
             let currentMinXs = buttons.map { $0.frame.minX }
-            // The first read of a freshly installed controller is the one
-            // moment the layout is guaranteed stock, so that is where the gaps
-            // come from. Every later application rebuilds from them, so a
-            // partial AppKit relayout can move the buttons but never respace
-            // them.
-            if stockGaps == nil {
-                let observed = WorkspaceTrafficLights.gaps(between: currentMinXs)
-                if observed.allSatisfy({ $0 > 0 }) { stockGaps = observed }
+            // Widen the remembered gap whenever a read shows a larger one: the
+            // first read is not guaranteed to be stock, and a squeezed layout
+            // only ever reports gaps SMALLER than the real one. Keeping the
+            // maximum means one clean read fixes the window for good, and no
+            // read can ever narrow it again.
+            if let observed = WorkspaceTrafficLights.uniformGap(from: currentMinXs) {
+                stockGap = max(stockGap ?? observed, observed)
             }
-            guard let stockGaps else { return }
-            let targets = WorkspaceTrafficLights.origins(gaps: stockGaps)
+            guard let stockGap else { return }
+            let targets = WorkspaceTrafficLights.origins(
+                uniformGap: stockGap,
+                count: buttons.count
+            )
             guard zip(currentMinXs, targets).contains(where: { abs($0 - $1) > 0.5 }) else { return }
             reapplying = true
             defer { reapplying = false }

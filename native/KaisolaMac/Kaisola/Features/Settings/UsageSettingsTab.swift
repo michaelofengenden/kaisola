@@ -254,7 +254,7 @@ struct UsageSettingsTab: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
 
         .task(id: workspace?.standardizedFileURL.path) {

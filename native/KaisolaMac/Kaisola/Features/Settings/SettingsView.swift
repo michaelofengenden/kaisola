@@ -30,6 +30,15 @@ enum SettingsWindowChrome {
 
     /// SettingsView's own frame contract, stated once so the ⌘, window, the
     /// visual fixtures, and the tests cannot drift from it.
+    /// The breathing room around a pane's cards.
+    ///
+    /// 18 → 32 (2026-08-29, "the settings have large margins"). 18 was sized
+    /// for the 810×540 window Settings used to open at; at the 1,100×800 it
+    /// opens at now, cards ran nearly edge to edge and the pane read as a
+    /// table rather than a page. System Settings keeps a wide, even margin on
+    /// every side and lets the content breathe into it.
+    static let paneMargin: CGFloat = 32
+
     static let minimumContentSize = NSSize(width: 820, height: 560)
     static let idealContentSize = NSSize(width: 1_100, height: 800)
 
@@ -429,6 +438,15 @@ struct SettingsView: View {
                     settingsContent
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                // An opaque page, not the workspace showing through.
+                //
+                // The takeover renders over the canvas, so Settings inherited
+                // whatever wash the theme was painting — a grey page under
+                // white cards ("make settings background white", 2026-08-29).
+                // `textBackgroundColor` is the document white in light and the
+                // matching near-black in dark, so this is "white" without
+                // hard-coding a colour that dark mode would have to undo.
+                .background(Color(nsColor: .textBackgroundColor))
             }
             // The detail column starts below the title bar for the same reason
             // the navigation column does: everything above this line is the
@@ -942,7 +960,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1023,7 +1041,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1189,7 +1207,7 @@ struct SettingsView: View {
                     }
                     .id("terminal-interaction")
                 }
-                .padding(18)
+                .padding(SettingsWindowChrome.paneMargin)
             }
             .onAppear {
                 guard let initialContentAnchorID else { return }
@@ -1282,7 +1300,7 @@ struct SettingsView: View {
                     workspace: workspace
                 )
             }
-            .padding(18)
+            .padding(SettingsWindowChrome.paneMargin)
         }
     }
 
@@ -1760,13 +1778,20 @@ struct SettingsCard<Content: View>: View {
             VStack(alignment: .leading, spacing: 0) {
                 content
             }
+            // A faint fill, because the page is white now.
+            //
+            // The card used `controlBackgroundColor`, which IS white in light
+            // mode: white on a white page left only the hairline, and the
+            // groups stopped reading as groups. Apple's own grouped settings
+            // separate them the same way — a barely-there fill plus a border,
+            // both derived from the label colour so they invert correctly.
             .background(
-                Color(nsColor: .controlBackgroundColor),
+                Color.primary.opacity(0.035),
                 in: RoundedRectangle(cornerRadius: 10)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: KaisolaVisualSystem.hairline)
+                    .strokeBorder(Color.primary.opacity(0.09), lineWidth: KaisolaVisualSystem.hairline)
             )
         }
     }

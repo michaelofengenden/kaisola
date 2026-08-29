@@ -479,7 +479,7 @@ struct CompanionSettingsTab: View {
                 }
 
                 }
-                .padding(18)
+                .padding(SettingsWindowChrome.paneMargin)
             }
             .onChange(of: failureFocusRequest) { _, target in
                 guard let target else { return }

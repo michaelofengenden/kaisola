@@ -369,6 +369,41 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertEqual(WorkspaceTrafficLights.origins(uniformGap: 20, count: 0), [])
     }
 
+    /// Measured 2026-08-29 through the accessibility API, same probe, same
+    /// moment: Finder 18/41/64 gaps 23,23. Notes 18/41/64 gaps 23,23. Kaisola
+    /// 19/45/64 gaps 26,19.
+    ///
+    /// The system already insets these buttons — 18 is the "like in Safari"
+    /// position this feature was written to create back when the stock corner
+    /// was ~7. What was left was a 2pt correction that could only do harm, and
+    /// twice did. The controller now stands down whenever AppKit has already
+    /// placed them near the target, which is the only way to guarantee the
+    /// pitch stays the system's own.
+    func testTheButtonsAreLeftAloneWhenAppKitAlreadyInsetsThem() {
+        // What Finder, Notes, and a stock Kaisola window all report today.
+        XCTAssertFalse(
+            WorkspaceTrafficLights.shouldReposition(currentLeading: 18),
+            "the system's own inset is the one this feature wanted"
+        )
+        XCTAssertFalse(WorkspaceTrafficLights.shouldReposition(currentLeading: 20))
+        XCTAssertFalse(WorkspaceTrafficLights.shouldReposition(currentLeading: 30))
+
+        // The corner this was written against, where the shift still earns its
+        // keep.
+        XCTAssertTrue(WorkspaceTrafficLights.shouldReposition(currentLeading: 7))
+        XCTAssertTrue(WorkspaceTrafficLights.shouldReposition(currentLeading: 0))
+
+        // And when it does fire, it lands on the system's own even pitch
+        // rather than a shift of whatever it happened to read.
+        XCTAssertEqual(
+            WorkspaceTrafficLights.origins(
+                uniformGap: WorkspaceTrafficLights.uniformGap(from: [7, 30, 53]) ?? 0,
+                count: 3
+            ),
+            [20, 43, 66]
+        )
+    }
+
     /// "The default rail width should also be the default when double-clicking
     /// the panel divider" (2026-08-28). It is — both read
     /// `projectSidebarIdealWidth` — and this is what stops them drifting into

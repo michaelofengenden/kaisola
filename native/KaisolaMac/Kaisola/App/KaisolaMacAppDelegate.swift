@@ -5742,6 +5742,28 @@ enum WorkspaceTrafficLights {
     /// Squeezing moves buttons closer, never further apart, so the LARGEST
     /// observed gap is the stock one and the smaller ones are the artefact.
     /// Taking the max recovers 20 from 20/12 and is a no-op on a clean read.
+    /// How close to `leadingInset` counts as "already there".
+    ///
+    /// Measured 2026-08-29 through the accessibility API: Finder and Notes on
+    /// this macOS both sit their buttons at x=18 on a 23pt pitch, and so did
+    /// Kaisola before this type touched them. The inset this feature exists to
+    /// create — "slightly more interior, not too far on the edge … like in
+    /// safari" — is what the system now ships by default; the 7pt corner it
+    /// was written against is gone.
+    ///
+    /// So the whole repositioning became a 2pt correction that could only do
+    /// harm, and did: the same measurement found Kaisola at 19/45/64, gaps of
+    /// 26 and 19, against the system's even 23/23. Two attempts to make the
+    /// shift respace correctly both failed, because the shift is the problem.
+    /// Within this distance the buttons are left exactly as AppKit laid them,
+    /// which is the only way to be certain they stay evenly spaced.
+    nonisolated static let alreadyInsetTolerance: CGFloat = 6
+
+    /// Whether the buttons need moving at all.
+    nonisolated static func shouldReposition(currentLeading: CGFloat) -> Bool {
+        currentLeading < leadingInset - alreadyInsetTolerance
+    }
+
     nonisolated static func uniformGap(from minXs: [CGFloat]) -> CGFloat? {
         let observed = gaps(between: minXs).filter { $0 > 0 }
         return observed.max()
@@ -5843,6 +5865,9 @@ enum WorkspaceTrafficLights {
             ].compactMap { $0 }
             guard buttons.count == 3 else { return }
             let currentMinXs = buttons.map { $0.frame.minX }
+            // AppKit already insets them on this macOS; leave them alone.
+            guard let leading = currentMinXs.first,
+                  WorkspaceTrafficLights.shouldReposition(currentLeading: leading) else { return }
             // Widen the remembered gap whenever a read shows a larger one: the
             // first read is not guaranteed to be stock, and a squeezed layout
             // only ever reports gaps SMALLER than the real one. Keeping the

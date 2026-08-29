@@ -1064,9 +1064,46 @@ struct RootShellView: View {
             // the shipped rails read a step apart from the canvas is simply
             // no longer mounted; its constants stay untouched in the
             // appearance layer.
+            // The rail is a card again (2026-08-29, "the LHS is not a card").
+            //
+            // 0.1.147 graduated it to a full-height flush surface carrying the
+            // CANVAS recipe, on the reading that the card should BE the column
+            // and its tone should run seamlessly into the canvas. That is what
+            // then left it with no visible edge at all: both sides of the
+            // boundary were deliberately the same colour, so the whole
+            // distinction rested on one hairline that the split view's clip
+            // kept eating. Michael has since called it a card twice and asked
+            // for its border back, so the flush treatment is withdrawn rather
+            // than patched again.
+            //
+            // What returns is Safari's shape: the column insets on all four
+            // sides, rounds at `panelRadius`, and carries a hairline. The
+            // traffic lights stay where AppKit puts them — x=18, inside the
+            // 6pt gutter — so the card holds them the way Safari's sidebar
+            // does rather than being pushed out from under them.
+            .padding(KaisolaVisualSystem.chromeInset)
             .background {
                 WorkspaceBackdropView(mode: settings.workspaceBackdrop)
                     .ignoresSafeArea()
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: KaisolaVisualSystem.panelRadius,
+                            style: .continuous
+                        )
+                        .inset(by: KaisolaVisualSystem.chromeInset)
+                    )
+            }
+            .overlay {
+                RoundedRectangle(
+                    cornerRadius: KaisolaVisualSystem.panelRadius,
+                    style: .continuous
+                )
+                .inset(by: KaisolaVisualSystem.chromeInset)
+                .strokeBorder(
+                    Color.primary.opacity(0.10),
+                    lineWidth: KaisolaVisualSystem.hairline
+                )
+                .allowsHitTesting(false)
             }
             // `ideal:` below is honoured for the double-click reset but not for
             // the opening width; this plants the one AppKit view that can fix
@@ -3951,7 +3988,11 @@ private struct DetailEdgeResizeAffordance: View {
             // overlay was aiming at.
             .overlay(alignment: .leading) {
                 Rectangle()
-                    .fill(Color(nsColor: .separatorColor).opacity(hovered ? 1.0 : 0.78))
+                    // Hover only: with the rail an inset card again, its own
+                    // stroke is the edge, and a resting rule in the gutter
+                    // would be a second border beside it. This stays as the
+                    // resize affordance it was always meant to be.
+                    .fill(Color(nsColor: .separatorColor).opacity(hovered ? 1.0 : 0))
                     .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
                     .animation(.easeOut(duration: 0.12), value: hovered)
             }

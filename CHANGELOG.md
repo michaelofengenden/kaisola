@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.150 — 2026-08-29
+
+- The window buttons are macOS's again, untouched. Three releases in a row tried to reposition them into a Safari-style inset and each shipped a differently wrong window; the report that ended it was a real 0.1.149 window whose buttons sat at three uneven positions the code itself had put them in, next to a Finder that was even. The premise was false from the start — on windows that carry a toolbar, macOS already insets the buttons, which is the exact look the feature was chasing — and no reading of a live window is guaranteed to catch the layout mid-flight rather than settled, so there was never a safe moment to impose our own. The whole mechanism is deleted. The buttons cannot be wrong if nothing moves them, and a fresh launch verifies it: identical positions and spacing to Finder, measured through the accessibility API.
+
 ## 0.1.149 — 2026-08-29
 
 - The window buttons sit evenly again, and this time it was measured rather than reasoned about. 0.1.148 claimed this fix and made it worse: it captured whatever spacing it first read and then held the buttons there permanently, so a reading taken mid-layout became that window's spacing for good, where the original bug at least corrected itself on the next redraw. Checked against Finder and Notes through the accessibility API, all three sat their buttons at the same place — and so did Kaisola, before any of this code touched them. macOS has moved the buttons inward on its own; the inset this feature existed to create is now what the system ships. It stands down when the buttons are already where it wanted them, which is the only way to be sure they keep the system's own spacing.

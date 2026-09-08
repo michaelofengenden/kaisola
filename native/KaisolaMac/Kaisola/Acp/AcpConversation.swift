@@ -525,6 +525,7 @@ final class AcpConversation: ObservableObject {
     private var isApplyingEphemeralTimelineEvent = false
     private var earlierPageLoadInFlight = false
     private var hasStarted = false
+    @Published private var isStarting = false
     private var turnCounter = 0
     /// Monotonic transcript segment identity. A single turn may emit
     /// message -> tool -> message (or thought -> tool -> thought); using only
@@ -536,6 +537,10 @@ final class AcpConversation: ObservableObject {
     /// crash race where an old failure could otherwise mark a new turn idle.
     private var activePromptTask: Task<Void, Never>?
     private var activePromptTurn: Int?
+    var activeTurnStartRowID: String? {
+        guard isRunning, let activePromptTurn else { return nil }
+        return "user-\(activePromptTurn)"
+    }
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
@@ -715,6 +720,8 @@ final class AcpConversation: ObservableObject {
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        isStarting = true
+        defer { isStarting = false }
         providerStartupFailure = nil
         pendingModelFallback = nil
         remembersAdapterModeSwitches = false
@@ -735,6 +742,7 @@ final class AcpConversation: ObservableObject {
         }
         await client.configureFsGuard(sensitiveGlobs: sensitiveGlobs)
         do {
+            try Task.checkCancellation()
             let launch = try containment.map {
                 try $0.prepare(environment: environment, cwd: cwd)
             } ?? AcpAdapterLaunch(
@@ -758,6 +766,7 @@ final class AcpConversation: ObservableObject {
                 access: launch.access,
                 runProfile: runProfile
             )
+            try Task.checkCancellation()
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)
             models = info.models
@@ -787,7 +796,11 @@ final class AcpConversation: ObservableObject {
             if let remembered = rememberedModeID,
                remembered != info.currentModeID,
                info.modes.contains(where: { $0.id == remembered }) {
-                switch await client.setMode(remembered) {
+                let outcome = await client.setMode(remembered)
+                // A cancelled request is not an adapter refusal and must not
+                // overwrite the user's remembered permission choice.
+                try Task.checkCancellation()
+                switch outcome {
                 case .accepted:
                     // A user selection that raced in while this request was
                     // in flight outranks the restore: the adapter processed
@@ -821,7 +834,9 @@ final class AcpConversation: ObservableObject {
                         id: id,
                         value: .boolean(desiredValue)
                     )
+                    try Task.checkCancellation()
                 } catch {
+                    try Task.checkCancellation()
                     let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                     restorationFailure = "Couldn’t restore \(option.name) to \(desiredValue ? "On" : "Off"). \(detail)"
                 }
@@ -844,15 +859,18 @@ final class AcpConversation: ObservableObject {
                         id: effort.id,
                         value: .select(remembered)
                     )
+                    try Task.checkCancellation()
                     if let confirmedValue = AcpComposerMetrics
                         .effortOption(confirmedOptions)?.currentValue,
                         confirmedValue != remembered {
                         rememberEffort(confirmedValue)
                     }
                 } catch {
+                    try Task.checkCancellation()
                     rememberEffort(effort.currentValue)
                 }
             }
+            try Task.checkCancellation()
             applyConfirmedConfigOptions(confirmedOptions)
             // Only from here on are confirmed option sets decisions worth
             // remembering (mirrors `remembersAdapterModeSwitches` above). The
@@ -871,6 +889,18 @@ final class AcpConversation: ObservableObject {
             // app restoration leaves them paused until the user chooses Resume
             // All, avoiding surprise work immediately after launch.
             if resumeQueuedPrompts { flushQueue() }
+        } catch is CancellationError where Task.isCancelled {
+            eventContinuation?.finish()
+            eventContinuation = nil
+            eventConsumerTask?.cancel()
+            eventConsumerTask = nil
+            statusMessage = "Agent startup was cancelled."
+            isConnected = false
+            supportsSteering = false
+            // Startup owns the adapter through remembered-setting restoration,
+            // after the client's initial handshake cancellation scope ends.
+            await client.stop()
+            hasStarted = false
         } catch {
             hasStarted = false
             eventContinuation?.finish()
@@ -907,7 +937,7 @@ final class AcpConversation: ObservableObject {
     }
 
     var canRestart: Bool {
-        ownsClient && !isConnected && !isRunning && !isReconnecting
+        ownsClient && !isStarting && !isConnected && !isRunning && !isReconnecting
     }
 
     /// Restart an app-owned adapter with a fresh transport. Reusing the dead
@@ -2269,6 +2299,23 @@ final class AcpConversation: ObservableObject {
                 status: .inProgress
             )))
             isRunning = true
+        }
+        if ["chat-studio-running", "chat-studio-queue"].contains(
+            ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] ?? ""
+        ) {
+            rows.append(.user(id: "2", text: "Check the smaller window layouts and keep the session controls easy to reach.", failed: false))
+            rows.append(.message(id: "studio-stream", text: "I’m checking the composer, file preview, and keyboard navigation at the smallest supported window size."))
+            rows.append(.tool(AcpToolCall(
+                id: "studio-running-tool", title: "Inspect the compact workspace layout",
+                kind: "read", status: .inProgress
+            )))
+            activePromptTurn = 2
+            isRunning = true
+            if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "chat-studio-queue" {
+                seedQueuedPromptsForTesting((1...8).map {
+                    "Follow-up \($0): review the keyboard controls and confirm that the current draft stays available when changing layouts."
+                })
+            }
         }
         usage = AcpUsage(
             used: 18_400,

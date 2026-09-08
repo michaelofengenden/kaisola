@@ -41,7 +41,9 @@ struct OmniBarView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.quaternary))
         .shadow(radius: 24, y: 8)
-        .onAppear { fieldFocused = true }
+        .onAppear {
+            DispatchQueue.main.async { fieldFocused = true }
+        }
         .onKeyPress(.escape) { isPresented = false; return .handled }
     }
 

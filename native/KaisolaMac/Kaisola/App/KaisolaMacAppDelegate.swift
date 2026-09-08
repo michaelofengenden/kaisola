@@ -1335,6 +1335,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 .flatMap(TintIntensity.init) ?? .standard
             settings.tintIntensity = fixtureTintIntensity
             NativePreviewSettings.shared.tintIntensity = fixtureTintIntensity
+            let fixtureChatTextSize: AgentChatTextSize =
+                visualLargeText || NativeVisualMeshFixture.parse(visualSurface)?.usesLargeText == true
+                    ? .extraLarge : .standard
+            settings.agentChatTextSize = fixtureChatTextSize
+            NativePreviewSettings.shared.agentChatTextSize = fixtureChatTextSize
             // Painted-glass evidence captures pin a wallpaper file and force
             // the painted source, because the live material samples whatever
             // desktop the host machine happens to show — not deterministic,
@@ -1357,6 +1362,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
+                && !visualSurface.hasPrefix("chat-studio")
                 && visualSurface != "empty-workspace" && visualSurface != "new-session"
                 && visualSurface != "new-session-topbar"
                 && visualSurface != "topbar-mixed" && visualSurface != "topbar-mixed-narrow"
@@ -1502,6 +1508,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 model.loadVisualCompletedAttentionFixture()
             } else if [
                 "mixed", "mixed-search", "mixed-density", "permission", "chat-thinking",
+                "chat-studio", "chat-studio-running", "chat-studio-queue", "chat-studio-permission",
                 // The 2026-08-28 shell-revision previews: the same three mixed
                 // sessions (terminal, agent terminal, chat) under the merged
                 // session-tab bar, at the ordinary width and at a narrow one.
@@ -1509,7 +1516,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             ].contains(visualSurface) {
                 model.loadVisualMixedSessionFixture(
                     workspace: workspace,
-                    includePermission: visualSurface == "permission"
+                    includePermission: visualSurface == "permission" || visualSurface == "chat-studio-permission"
                 )
             } else if visualSurface == "preview-dirty-tab" {
                 let document = workspace.appendingPathComponent("README.md", isDirectory: false)
@@ -1787,7 +1794,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             && SettingsWindowChrome.visualSurfaces.contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
         let visualMesh = visualFixture ? NativeVisualMeshFixture.parse(visualSurface) : nil
-        if visualMesh?.usesLargeText == true {
+        if visualFixture && (visualLargeText || visualMesh?.usesLargeText == true) {
             // The accessibility text sizes are what actually strand a Mesh
             // column, so the large-text fixtures ask for one rather than
             // nudging the ordinary steps.
@@ -1799,13 +1806,20 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
         // The shell-revision compression preview: the same merged-bar window,
         // narrow enough that the inactive tabs visibly give up title width.
-        let visualWorkspaceWidth: CGFloat = visualSurface == "topbar-mixed-narrow" ? 820 : 1_360
+        let fixtureWidth = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_WIDTH"].flatMap(Double.init)
+        let fixtureHeight = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_HEIGHT"].flatMap(Double.init)
+        let visualWorkspaceWidth: CGFloat = fixtureWidth.flatMap {
+            $0.isFinite ? CGFloat(min(max($0, 760), 2_560)) : nil
+        } ?? (visualSurface == "topbar-mixed-narrow" ? 820 : 1_360)
+        let visualWorkspaceHeight: CGFloat = fixtureHeight.flatMap {
+            $0.isFinite ? CGFloat(min(max($0, 480), 1_600)) : nil
+        } ?? 860
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
                 width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? visualWorkspaceWidth : 1_080)))),
-                height: visualSettings ? visualSettingsSize.height : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
+                height: visualSettings ? visualSettingsSize.height : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? visualWorkspaceHeight : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1831,13 +1845,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         } else {
             window.cascadeTopLeft(from: NSPoint(x: 40 * CGFloat(windowCounter), y: 40 * CGFloat(windowCounter)))
         }
-        if resourceWorkload != nil {
+        if resourceWorkload != nil || (visualFixture && !visualSettings && !visualOnboarding) {
             // Electron BrowserWindow width/height describe the outer frame.
             // Force the same interpretation instead of merely declaring a
             // 1280x800 content rectangle and emitting a misleading receipt.
             let origin = window.frame.origin
             window.setFrame(
-                NSRect(x: origin.x, y: origin.y, width: 1_280, height: 800),
+                NSRect(
+                    x: origin.x,
+                    y: origin.y,
+                    width: resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? visualWorkspaceWidth),
+                    height: resourceWorkload != nil ? 800 : visualWorkspaceHeight
+                ),
                 display: false
             )
         }

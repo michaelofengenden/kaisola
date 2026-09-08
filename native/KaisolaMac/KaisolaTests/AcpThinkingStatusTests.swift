@@ -80,6 +80,73 @@ final class AcpThinkingStatusTests: XCTestCase {
         XCTAssertEqual(derive(lastRow: tool("   ", status: .inProgress))?.word, "Working")
     }
 
+    func testVisibleActiveToolSuppressesOnlyItsDuplicateThinkingStatus() throws {
+        let active = AcpToolCall(
+            id: "active",
+            title: "Inspect the compact workspace layout",
+            kind: "read",
+            status: .inProgress
+        )
+        let status = try XCTUnwrap(derive(lastRow: .tool(active)))
+        let visible = AcpTranscriptDisplay.items(rows: [.tool(active)], isRunning: true)
+
+        XCTAssertFalse(AcpThinkingStatusPresentation.shouldPresent(status, among: visible))
+
+        let hidden: [AcpTranscriptDisplayItem] = []
+        XCTAssertTrue(
+            AcpThinkingStatusPresentation.shouldPresent(status, among: hidden),
+            "a paged-out active tool still needs a visible progress line"
+        )
+        let other = AcpToolCall(
+            id: "other",
+            title: "Run focused tests",
+            kind: "execute",
+            status: .inProgress
+        )
+        XCTAssertTrue(
+            AcpThinkingStatusPresentation.shouldPresent(
+                status,
+                among: AcpTranscriptDisplay.items(rows: [.tool(other)], isRunning: true)
+            ),
+            "a different visible activity must not hide the current status"
+        )
+    }
+
+    func testGenericThinkingStatusRemainsBesidePendingAndCompletedTools() throws {
+        let pending = try XCTUnwrap(derive(lastRow: tool("Build", status: .pending)))
+        let pendingItems = AcpTranscriptDisplay.items(
+            rows: [tool("Build", status: .pending)],
+            isRunning: true
+        )
+        XCTAssertTrue(AcpThinkingStatusPresentation.shouldPresent(pending, among: pendingItems))
+
+        let thought = try XCTUnwrap(derive(lastRow: .thought(id: "thought", text: "considering")))
+        let completedItems = AcpTranscriptDisplay.items(
+            rows: [tool("Build", status: .completed)],
+            isRunning: true
+        )
+        XCTAssertTrue(AcpThinkingStatusPresentation.shouldPresent(thought, among: completedItems))
+    }
+
+    @MainActor
+    func testDuplicateWordStillRendersElapsedOrSubagentMetadata() {
+        XCTAssertFalse(AcpThinkingStatusRow.shouldRender(
+            showsStatusWord: false,
+            hasSubagentDetail: false,
+            hasElapsedTime: false
+        ))
+        XCTAssertTrue(AcpThinkingStatusRow.shouldRender(
+            showsStatusWord: false,
+            hasSubagentDetail: true,
+            hasElapsedTime: false
+        ))
+        XCTAssertTrue(AcpThinkingStatusRow.shouldRender(
+            showsStatusWord: false,
+            hasSubagentDetail: false,
+            hasElapsedTime: true
+        ))
+    }
+
     func testTranscriptSectionsKeepWorkDistinctFromTheResponse() {
         XCTAssertEqual(
             AcpTranscriptRow.user(id: "u", text: "go", failed: false).transcriptSection,

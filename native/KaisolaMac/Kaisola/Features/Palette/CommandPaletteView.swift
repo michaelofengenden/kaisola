@@ -39,6 +39,48 @@ enum CommandPaletteResultIdentity {
     }
 }
 
+enum CommandPaletteRanking {
+    static func ranked(_ items: [PaletteItem], query: String) -> [PaletteItem] {
+        let normalizedQuery = query.lowercased()
+        return items.enumerated()
+            .compactMap { index, item -> (item: PaletteItem, tier: Int, score: Int, index: Int)? in
+                guard let score = FuzzyMatch.score(query: query, candidate: item.title) else { return nil }
+                return (item, tier(for: item, query: normalizedQuery), score, index)
+            }
+            .sorted {
+                if $0.tier != $1.tier { return $0.tier < $1.tier }
+                if $0.score != $1.score { return $0.score > $1.score }
+                return $0.index < $1.index
+            }
+            .map(\.item)
+    }
+
+    private static func tier(for item: PaletteItem, query: String) -> Int {
+        let title = item.title.lowercased()
+        let isFile = item.id.hasPrefix("file.")
+        let filename = title.split(separator: "/").last.map(String.init) ?? title
+        // A named file or explicit trailing path is a precise destination,
+        // even if a command happens to mention that same filename.
+        if title == query || (isFile && (filename == query
+            || (query.contains("/") && title.hasSuffix("/" + query)))) {
+            return 0
+        }
+        if !isFile {
+            let words = title.split { !$0.isLetter && !$0.isNumber }
+            if title.hasPrefix(query) || words.contains(where: { $0.hasPrefix(query) }) {
+                return 1
+            }
+        } else {
+            if query.contains("/"), title.hasPrefix(query) { return 1 }
+            if filename.hasPrefix(query) { return 2 }
+        }
+        if title.contains(query) { return 3 }
+        // Word-boundary bonuses still order loose matches, but cannot lift a
+        // scattered match in a long path over a clearly named command.
+        return 4
+    }
+}
+
 /// A ⌘K fuzzy command palette: app actions (new terminal/agent/chat, open
 /// folder), view toggles (layout/appearance), and jump-to targets (projects,
 /// sessions, chats). Filters with `FuzzyMatch`, arrow-key navigable, Enter runs,
@@ -50,6 +92,8 @@ struct CommandPaletteView: View {
     @Binding var isPresented: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var query = ""
     @State private var selection = 0
@@ -57,22 +101,37 @@ struct CommandPaletteView: View {
     @FocusState private var searchFocused: Bool
 
     var body: some View {
+        // One result snapshot per render keeps row drawing, empty state and
+        // keyboard navigation consistent without re-ranking the file index.
+        let items = filtered
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.kaisolaSecondary)
-                TextField("Run a command or jump to…", text: $query)
+            HStack(spacing: 12) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(.kaisolaSecondary)
+                TextField("Search commands, projects, and files", text: $query)
                     .textFieldStyle(.plain)
-                    .font(.title3)
+                    .font(.system(size: 16))
                     .focused($searchFocused)
                     .onSubmit(runSelection)
                     .onChange(of: query) { _, _ in selection = 0 }
+                    .accessibilityLabel("Search commands, projects, and files")
+                    .accessibilityIdentifier("palette.search")
+                Text("esc")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.kaisolaSecondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
+                    .accessibilityHidden(true)
             }
-            .padding(.horizontal, 16).padding(.vertical, 12)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 20)
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(filtered.enumerated()), id: \.element.id) { index, item in
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                             Button {
                                 selection = index
                                 run(item)
@@ -92,18 +151,28 @@ struct CommandPaletteView: View {
                             .accessibilityAddTraits(index == selection ? .isSelected : [])
                             .id(item.id)
                         }
-                        if filtered.isEmpty {
-                            Text("No matching commands")
-                                .foregroundStyle(.kaisolaSecondary)
-                                .padding(16)
+                        if items.isEmpty {
+                            VStack(spacing: 7) {
+                                Text("No results for “\(query)”")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(.kaisolaPrimary)
+                                Text("Try a project name, file, or action.")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.kaisolaSecondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 32)
+                            .padding(.horizontal, 12)
                         }
                     }
+                    .padding(8)
                 }
-                .frame(maxHeight: 360)
+                .scrollBounceBehavior(.basedOnSize)
+                .frame(maxHeight: 390)
                 .onChange(of: selection) { _, new in
                     guard let itemID = CommandPaletteResultIdentity.itemID(
                         at: new,
-                        in: filtered
+                        in: items
                     ) else { return }
                     if reduceMotion {
                         proxy.scrollTo(itemID, anchor: .center)
@@ -114,12 +183,37 @@ struct CommandPaletteView: View {
                     }
                 }
             }
+            Divider()
+            HStack(spacing: 16) {
+                Label("Navigate", systemImage: "arrow.up.arrow.down")
+                Label("Open", systemImage: "return")
+                Spacer()
+                Text("Commands & files")
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.kaisolaSecondary)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .accessibilityHidden(true)
         }
-        .frame(width: 560)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.quaternary))
-        .shadow(radius: 24, y: 8)
-        .onAppear { searchFocused = true }
+        .frame(maxWidth: 600)
+        .background {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+            if !reduceTransparency {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(.regularMaterial)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.08), lineWidth: 0.5))
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.28 : 0.13), radius: 28, y: 12)
+        .onAppear {
+            // The overlay must enter the window before it can take focus from
+            // the mounted chat or terminal underneath it.
+            DispatchQueue.main.async { searchFocused = true }
+        }
         .task(id: model.currentProjectDirectory?.standardizedFileURL.path) {
             guard let root = model.currentProjectDirectory else {
                 projectFiles = []
@@ -127,37 +221,54 @@ struct CommandPaletteView: View {
             }
             projectFiles = await ProjectFileIndex.shared.files(for: root)
         }
-        .onKeyPress(.downArrow) { move(1); return .handled }
-        .onKeyPress(.upArrow) { move(-1); return .handled }
+        .onKeyPress(.downArrow) { move(1, count: items.count); return .handled }
+        .onKeyPress(.upArrow) { move(-1, count: items.count); return .handled }
         .onKeyPress(.escape) { isPresented = false; return .handled }
         .onKeyPress(.return) { runSelection(); return .handled }
     }
 
     private func row(_ item: PaletteItem, selected: Bool) -> some View {
-        let selectedText = Color(nsColor: .alternateSelectedControlTextColor)
+        let selectedText = QuietSelectionPill.ink
+        let isFile = item.id.hasPrefix("file.")
+        let parentFolder = (item.title as NSString).deletingLastPathComponent
+        let detail = isFile ? (parentFolder.isEmpty ? "Project root" : parentFolder) : item.subtitle
         return HStack(spacing: 10) {
             Image(systemName: item.systemImage)
                 .frame(width: 18)
                 .foregroundStyle(selected ? selectedText : .kaisolaSecondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.title)
+                Group {
+                    if isFile {
+                        Text((item.title as NSString).lastPathComponent)
+                            .help(item.title)
+                    } else {
+                        Text(item.title)
+                    }
+                }
+                    .font(.system(size: 13, weight: selected ? .medium : .regular))
                     .foregroundStyle(selected ? selectedText : .primary)
-                Text(item.disabledReason ?? item.subtitle)
-                    .font(.caption)
+                Text(item.disabledReason ?? detail)
+                    .font(.system(size: 11))
                     .foregroundStyle(selected ? selectedText.opacity(0.78) : .kaisolaSecondary)
                     .lineLimit(2)
             }
             Spacer()
             if let shortcutHint = item.shortcutHint {
                 Text(shortcutHint)
-                    .font(.caption.monospaced())
+                    .font(.system(size: 11).monospaced())
                     .foregroundStyle(selected ? selectedText.opacity(0.8) : .kaisolaSecondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 5))
                     .accessibilityHidden(true)
             }
         }
-        .padding(.horizontal, 16).padding(.vertical, 9)
+        .padding(.horizontal, 12).padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(selected ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
+        .background(
+            selected ? Color.accentColor.opacity(colorScheme == .dark ? 0.22 : 0.11) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
         .opacity(item.isEnabled ? 1 : 0.72)
     }
 
@@ -165,13 +276,7 @@ struct CommandPaletteView: View {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return allItems() }
         // With a query, project files join the candidates (⌘P-style).
-        let ranked = (allItems() + fileItems())
-            .compactMap { item -> (PaletteItem, Int)? in
-                guard let score = FuzzyMatch.score(query: trimmed, candidate: item.title) else { return nil }
-                return (item, score)
-            }
-            .sorted { $0.1 > $1.1 }
-            .map(\.0)
+        let ranked = CommandPaletteRanking.ranked(allItems() + fileItems(), query: trimmed)
         return Array(ranked.prefix(40))
     }
 
@@ -185,8 +290,7 @@ struct CommandPaletteView: View {
         }
     }
 
-    private func move(_ delta: Int) {
-        let count = filtered.count
+    private func move(_ delta: Int, count: Int) {
         guard count > 0 else { return }
         selection = min(max(selection + delta, 0), count - 1)
     }

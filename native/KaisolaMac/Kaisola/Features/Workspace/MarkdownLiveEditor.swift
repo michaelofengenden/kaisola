@@ -193,6 +193,13 @@ struct MarkdownHybridDiffPlan: Equatable, Sendable {
 /// activate a Markdown link or mutate the draft.
 @MainActor
 final class MarkdownHybridDiffRulerView: NSRulerView {
+    /// The detail divider claims the first 11pt inside the document. Keep the
+    /// marker's full pointer target beyond that corridor while leaving enough
+    /// gutter on its right for the text to start cleanly.
+    private static let gutterThickness: CGFloat = 26
+    private static let markerX: CGFloat = 18
+    private static let markerWidth: CGFloat = 4
+    private static let markerHitExpansionX: CGFloat = 4
     private weak var markdownTextView: NSTextView?
     private var diffMarkers: [MarkdownHybridDiffPlan.Marker] = []
     private var markerRects: [NSRect] = []
@@ -214,13 +221,12 @@ final class MarkdownHybridDiffRulerView: NSRulerView {
 
     func apply(_ markers: [MarkdownHybridDiffPlan.Marker]) {
         diffMarkers = markers
-        ruleThickness = markers.isEmpty ? 0 : 14
+        ruleThickness = markers.isEmpty ? 0 : Self.gutterThickness
         scrollView?.tile()
         needsDisplay = true
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
-        super.drawHashMarksAndLabels(in: rect)
         markerRects = diffMarkers.map(markerRect)
         for (marker, markerRect) in zip(diffMarkers, markerRects) {
             color(for: marker.kind).setFill()
@@ -231,7 +237,7 @@ final class MarkdownHybridDiffRulerView: NSRulerView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let index = markerRects.firstIndex(where: {
-            $0.insetBy(dx: -2, dy: -4).contains(point)
+            $0.insetBy(dx: -Self.markerHitExpansionX, dy: -4).contains(point)
         }), diffMarkers.indices.contains(index) else {
             super.mouseDown(with: event)
             return
@@ -244,7 +250,12 @@ final class MarkdownHybridDiffRulerView: NSRulerView {
               let layoutManager = textView.layoutManager,
               let textContainer = textView.textContainer,
               !textView.string.isEmpty else {
-            return NSRect(x: 2, y: 4, width: 10, height: 8)
+            return NSRect(
+                x: Self.markerX,
+                y: 4,
+                width: Self.markerWidth,
+                height: 8
+            )
         }
         let stringLength = (textView.string as NSString).length
         let characterIndex = min(max(0, marker.editedRange.location), max(0, stringLength - 1))
@@ -261,9 +272,9 @@ final class MarkdownHybridDiffRulerView: NSRulerView {
         textRect.origin.y += textView.textContainerOrigin.y
         let local = convert(textRect, from: textView)
         return NSRect(
-            x: 2,
+            x: Self.markerX,
             y: local.minY,
-            width: 10,
+            width: Self.markerWidth,
             height: max(4, min(14, local.height))
         )
     }

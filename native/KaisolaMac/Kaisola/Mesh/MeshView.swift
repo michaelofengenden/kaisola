@@ -36,6 +36,7 @@ enum MeshColumnWidth {
     /// tool rows render at. Deliberately not `NSFont.smallSystemFontSize`,
     /// which is the AppKit control size and a point larger.
     static let captionPointSize: CGFloat = 10
+    static let codePointSize: CGFloat = AcpTranscriptMetrics.codePointSize
     /// SwiftUI's `.callout`, the size a column header's agent name renders at.
     static let headerPointSize: CGFloat = 12
 
@@ -73,7 +74,7 @@ enum MeshColumnWidth {
     }
 
     private static func codeFloor(scale: CGFloat) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: captionPointSize * scale, weight: .regular)
+        let font = NSFont.monospacedSystemFont(ofSize: codePointSize * scale, weight: .regular)
         return CGFloat(codeLineCharacters) * advance(of: font)
             + 2 * codeBlockInset
             + 2 * transcriptInset
@@ -124,6 +125,59 @@ enum MeshColumnDeck: Equatable, Sendable {
     /// One readable transcript plus an overview strip carrying the rest of the
     /// agents' status and waiting permissions.
     case focused
+}
+
+struct MeshEmptyPresentation: Equatable, Sendable {
+    let title: String
+    let message: String?
+    let symbol: String?
+    let showsProgress: Bool
+    let offersAgentSettings: Bool
+
+    static func forLifecycle(_ lifecycle: NativeMeshLifecycle) -> Self {
+        switch lifecycle {
+        case .provisioning:
+            return .init(
+                title: "Starting agents…",
+                message: nil,
+                symbol: nil,
+                showsProgress: true,
+                offersAgentSettings: false
+            )
+        case .active:
+            return .init(
+                title: "No agents could start",
+                message: "Choose an available agent in Settings, then start a new Mesh.",
+                symbol: "person.2.slash",
+                showsProgress: false,
+                offersAgentSettings: true
+            )
+        case .suspended:
+            return .init(
+                title: "Mesh is suspended",
+                message: "This Mesh has no active agent sessions.",
+                symbol: "pause.circle",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        case .pendingDeletion:
+            return .init(
+                title: "Removing Mesh…",
+                message: "Kaisola is safely closing this Mesh.",
+                symbol: "trash",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        case .recoveryRequired:
+            return .init(
+                title: "Mesh recovery needed",
+                message: "Kaisola preserved this run's Git manifest but could not safely reattach every worktree. Nothing was deleted.",
+                symbol: "externaldrive.badge.exclamationmark",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        }
+    }
 }
 
 /// The rules that decide which deck the Mesh draws and what it draws into it.
@@ -370,6 +424,7 @@ struct MeshView: View {
     @State private var requestedColumnID: String?
     @State private var transcriptStates = MeshTranscriptViewStates()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @EnvironmentObject private var model: AppModel
     @State private var integrationOutcome: MeshIntegrationOutcome?
     /// The column the reported outcome belongs to, so "Try Again" and "Review
     /// Diff" act on it rather than guessing from the message.
@@ -401,16 +456,27 @@ struct MeshView: View {
                 Divider()
             }
             if mesh.columns.isEmpty {
-                if mesh.lifecycle == .recoveryRequired {
+                let empty = MeshEmptyPresentation.forLifecycle(mesh.lifecycle)
+                if empty.showsProgress {
+                    ProgressView(empty.title)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
                     ContentUnavailableView {
-                        Label("Mesh recovery needed", systemImage: "externaldrive.badge.exclamationmark")
+                        Label(empty.title, systemImage: empty.symbol ?? "person.2.slash")
                     } description: {
-                        Text("Kaisola preserved this run's Git manifest but could not safely reattach every worktree. Nothing was deleted.")
+                        if let message = empty.message { Text(message) }
+                    } actions: {
+                        if empty.offersAgentSettings {
+                            Button("Open Agent Settings") {
+                                NotificationCenter.default.post(
+                                    name: .kaisolaOpenSettingsSurface,
+                                    object: model,
+                                    userInfo: [AcpProviderSettingsNotificationKey.sectionID: "agents"]
+                                )
+                            }
+                        }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ProgressView("Starting agents…")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
                 GeometryReader { geometry in
@@ -580,7 +646,8 @@ struct MeshView: View {
             }
             .buttonStyle(.borderless)
             .disabled(
-                mesh.hookSubmissionInProgress
+                !mesh.canSubmit
+                    || mesh.hookSubmissionInProgress
                     || mesh.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
             .help("Fan this prompt out to every column")
@@ -597,6 +664,7 @@ struct MeshView: View {
     }
 
     private func send() {
+        guard mesh.canSubmit else { return }
         let text = mesh.draft
         Task { @MainActor in
             if await mesh.submit(text), mesh.draft == text {

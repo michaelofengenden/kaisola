@@ -272,6 +272,7 @@ struct RootShellView: View {
     @State private var gitRepo: URL?
     @State private var showPalette = false
     @State private var showOmniBar = false
+    @State private var commandOverlayFocus = CommandOverlayFocusState()
     @State private var showOnboarding = false
     /// Whether the Settings takeover covers the workspace. Never write this
     /// directly — `applySettingsTakeover(_:)` routes every change through the
@@ -470,7 +471,12 @@ struct RootShellView: View {
         chromeDecorated
             .kaisolaReduceMotionFallback()
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenFileLink)) { note in
-                guard let url = note.userInfo?["url"] as? URL else { return }
+                let receivingWindow = (NSApp.delegate as? KaisolaMacAppDelegate)?.commandWindow(for: model)
+                guard let url = note.userInfo?["url"] as? URL,
+                      TerminalLinkNotificationRouting.shouldHandle(
+                        note,
+                        receivingWindow: receivingWindow
+                      ) else { return }
                 model.openFilePreview(
                     url,
                     line: note.userInfo?["line"] as? Int,
@@ -478,7 +484,11 @@ struct RootShellView: View {
                 )
             }
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenBrowserCard)) { note in
-                guard let url = note.object as? URL else { return }
+                guard let url = note.object as? URL,
+                      TerminalLinkNotificationRouting.shouldHandle(
+                        note,
+                        receivingWindow: (NSApp.delegate as? KaisolaMacAppDelegate)?.commandWindow(for: model)
+                      ) else { return }
                 model.openBrowserCard(url)
             }
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaLocalCommand)) { note in
@@ -732,12 +742,16 @@ struct RootShellView: View {
         }
         .overlay {
             if showPalette {
-                ZStack(alignment: .top) {
-                    Color.black.opacity(0.18)
-                        .ignoresSafeArea()
-                        .onTapGesture { showPalette = false }
-                    CommandPaletteView(model: model, settings: settings, isPresented: $showPalette)
-                        .padding(.top, 72)
+                GeometryReader { geometry in
+                    ZStack(alignment: .top) {
+                        Color.black.opacity(0.18)
+                            .ignoresSafeArea()
+                            .onTapGesture { showPalette = false }
+                        CommandPaletteView(model: model, settings: settings, isPresented: $showPalette)
+                            .frame(maxHeight: max(180, geometry.size.height - 64))
+                            .padding(.horizontal, 24)
+                            .padding(.top, min(72, geometry.size.height * 0.08))
+                    }
                 }
                 .transition(.opacity)
             } else if showOmniBar {
@@ -752,6 +766,18 @@ struct RootShellView: View {
             }
         }
         .overlay { ToastOverlayView() }
+        .onChange(of: showPalette || showOmniBar) { _, isPresented in
+            if isPresented {
+                if let delegate = NSApp.delegate as? KaisolaMacAppDelegate,
+                   let window = delegate.commandWindow(for: model) {
+                    commandOverlayFocus.capture(in: window)
+                }
+            } else {
+                // Let the overlay leave the responder chain first. Commands
+                // that focus their own destination keep that focus.
+                DispatchQueue.main.async { commandOverlayFocus.restoreIfUnclaimed() }
+            }
+        }
         .confirmationDialog(
             "Permanently Delete Mesh?",
             isPresented: Binding(get: { meshDeleteConfirm != nil }, set: { if !$0 { meshDeleteConfirm = nil } })
@@ -913,6 +939,47 @@ struct RootShellView: View {
         )
     }
 
+    private var sidebarQuickActions: some View {
+        HStack(spacing: 6) {
+            Button {
+                if let project = model.projects.first(where: { $0.id == activeProjectID && $0.directory != nil }) {
+                    beginNewSession(in: project)
+                } else {
+                    Self.promptForOpenFolder(model: model)
+                }
+            } label: {
+                ViewThatFits(in: .horizontal) {
+                    Label("New session", systemImage: "square.and.pencil").fixedSize()
+                    Label("New", systemImage: "square.and.pencil").fixedSize()
+                }
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 11)
+                    .frame(height: 34)
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.kaisolaChrome)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .help("Start a session in the current project")
+            .accessibilityLabel("New session")
+            .accessibilityIdentifier("sidebar.new-session")
+
+            Button(action: toggleCommandPalette) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 30, height: 34)
+            }
+            .buttonStyle(.kaisolaChrome)
+            .accessibilityLabel("Search commands, projects, and files")
+            .accessibilityIdentifier("sidebar.search")
+            .help("Search commands, projects, and files")
+        }
+        .foregroundStyle(.kaisolaPrimary)
+        .padding(.horizontal, 7)
+        .padding(.top, 7)
+        .padding(.bottom, 9)
+    }
+
     /// Nested project→session tree in a left sidebar (the default).
     private var leftTreeLayout: some View {
         let actions = shellActions
@@ -921,16 +988,7 @@ struct RootShellView: View {
             columnVisibility: $leftTreeColumnVisibility
         ) { actions in
             VStack(spacing: 0) {
-                // No "Projects" title row: the chrome panel already starts below
-                // the traffic lights, the rail's own pinned project names the
-                // workspace, and the two buttons that lived here survive in the
-                // menu bar (File ▸ Open Folder…, View ▸ Navigation) and the
-                // command palette. The rail begins directly under the traffic
-                // light clearance, as the v4 mock has it.
-                //
-                // A selection-bound macOS sidebar paints a full-width blue block.
-                // Navigation is explicit here so visible surfaces are communicated
-                // by their blue icons instead of a heavy row treatment.
+                sidebarQuickActions
                 List {
                     QuietProjectRail(
                         model: model,
@@ -2191,7 +2249,7 @@ struct RootShellView: View {
                     cancel: { cancelNewSession(draft.projectID) }
                 )
                 .id(draft.id)
-                .padding(32)
+                .padding(16)
                 .accessibilityIdentifier("new-session-chooser")
             }
         }
@@ -2733,7 +2791,7 @@ struct RootShellView: View {
                 choose: { chooseNewSessionFromEmptyWorkspace($0, project: project) },
                 cancel: {}
             )
-            .padding(32)
+            .padding(16)
             .accessibilityIdentifier("empty-workspace-session-chooser")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -2833,26 +2891,58 @@ struct RootShellView: View {
                 }
             } else {
                 GeometryReader { geometry in
+                    let presentation = SessionPaneAdaptiveSizing.mode(
+                        size: geometry.size,
+                        rowCounts: layout.columns.map { $0.sessionIDs.count },
+                        divider: SessionPaneDividerSizing.layoutExtent
+                    )
+                    let focused = model.focusedPaneID.flatMap { layout.contains($0) ? $0 : nil }
+                        ?? layout.sessionIDs.first
+                    let focusedPresentation = presentation == .focused
+                    let stacked = presentation == .stacked
                     let dividerSpace = CGFloat(max(0, layout.columns.count - 1)) * SessionPaneDividerSizing.layoutExtent
-                    let available = max(1, geometry.size.width - dividerSpace)
-                    let totalWeight = max(0.01, layout.columns.reduce(0) { $0 + $1.weight })
-                    let isSolo = layout.sessionIDs.count == 1
-                    HStack(spacing: 0) {
+                    let available = max(1, (stacked ? geometry.size.height : geometry.size.width) - dividerSpace)
+                    let minima = layout.columns.map {
+                            stacked ? SessionPaneAdaptiveSizing.rowMinimum(
+                                count: $0.sessionIDs.count,
+                                divider: SessionPaneDividerSizing.layoutExtent
+                            ) : SessionPaneAdaptiveSizing.minimumWidth
+                    }
+                    let extents = SessionPaneAdaptiveSizing.extents(
+                        available: available,
+                        weights: layout.columns.map(\.weight),
+                        minima: minima
+                    )
+                    let isSolo = focusedPresentation || layout.sessionIDs.count == 1
+                    let adaptiveLayout = focusedPresentation ? AnyLayout(ZStackLayout()) : stacked
+                        ? AnyLayout(VStackLayout(spacing: 0))
+                        : AnyLayout(HStackLayout(spacing: 0))
+                    adaptiveLayout {
                         ForEach(Array(layout.columns.enumerated()), id: \.element.id) { index, column in
+                            let columnVisible = !focusedPresentation || column.sessionIDs.contains(focused ?? "")
                             unifiedSessionColumn(
                                 column,
                                 projectID: activeProjectID,
-                                clearsWindowControls: index == 0,
+                                clearsWindowControls: focusedPresentation ? columnVisible : index == 0,
                                 isSolo: isSolo,
-                                hostsDetailDoors: index == layout.columns.count - 1
+                                hostsDetailDoors: focusedPresentation ? columnVisible
+                                    : index == (stacked ? 0 : layout.columns.count - 1),
+                                focusedPresentationID: focusedPresentation ? focused : nil
                             )
-                                .frame(width: available * CGFloat(column.weight / totalWeight))
-                            if index < layout.columns.count - 1, let projectID = activeProjectID {
+                                .frame(width: focusedPresentation ? geometry.size.width : stacked ? nil : extents[index],
+                                       height: focusedPresentation ? geometry.size.height : stacked ? extents[index] : nil)
+                                .opacity(columnVisible ? 1 : 0)
+                                .allowsHitTesting(columnVisible)
+                                .accessibilityHidden(!columnVisible)
+                                .zIndex(columnVisible ? 1 : 0)
+                            if !focusedPresentation, index < layout.columns.count - 1, let projectID = activeProjectID {
                                 paneColumnDivider(
                                     projectID: projectID,
                                     boundary: index,
-                                    available: available,
-                                    totalWeight: totalWeight
+                                    axis: stacked ? .vertical : .horizontal,
+                                    extents: extents,
+                                    weights: layout.columns.map(\.weight),
+                                    minima: minima
                                 )
                             }
                         }
@@ -2867,28 +2957,40 @@ struct RootShellView: View {
         projectID: String?,
         clearsWindowControls: Bool,
         isSolo: Bool = false,
-        hostsDetailDoors: Bool = false
+        hostsDetailDoors: Bool = false,
+        focusedPresentationID: String? = nil
     ) -> some View {
         GeometryReader { geometry in
             let dividerSpace = CGFloat(max(0, column.sessionIDs.count - 1)) * SessionPaneDividerSizing.layoutExtent
             let available = max(1, geometry.size.height - dividerSpace)
-            let totalWeight = max(0.01, column.rowWeights.reduce(0, +))
-            VStack(spacing: 0) {
+            let extents = SessionPaneAdaptiveSizing.extents(
+                available: available,
+                weights: column.rowWeights,
+                minima: Array(repeating: SessionPaneAdaptiveSizing.minimumHeight, count: column.sessionIDs.count)
+            )
+            let rowLayout = focusedPresentationID == nil
+                ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(ZStackLayout())
+            rowLayout {
                 ForEach(Array(column.sessionIDs.enumerated()), id: \.element) { index, id in
+                    let rowVisible = focusedPresentationID == nil || focusedPresentationID == id
                     unifiedSessionCard(
                         id,
-                        clearsWindowControls: clearsWindowControls && index == 0,
+                        clearsWindowControls: clearsWindowControls && (focusedPresentationID != nil ? rowVisible : index == 0),
                         isSolo: isSolo,
-                        hostsDetailDoors: hostsDetailDoors && index == 0
+                        hostsDetailDoors: hostsDetailDoors && (focusedPresentationID != nil ? rowVisible : index == 0)
                     )
-                        .frame(height: available * CGFloat(column.rowWeights[index] / totalWeight))
-                    if index < column.sessionIDs.count - 1, let projectID {
+                        .frame(height: focusedPresentationID == nil ? extents[index] : geometry.size.height)
+                        .opacity(rowVisible ? 1 : 0)
+                        .allowsHitTesting(rowVisible)
+                        .accessibilityHidden(!rowVisible)
+                        .zIndex(rowVisible ? 1 : 0)
+                    if focusedPresentationID == nil, index < column.sessionIDs.count - 1, let projectID {
                         paneRowDivider(
                             projectID: projectID,
                             columnID: column.id,
                             boundary: index,
-                            available: available,
-                            totalWeight: totalWeight
+                            extents: extents,
+                            weights: column.rowWeights
                         )
                     }
                 }
@@ -2899,25 +3001,24 @@ struct RootShellView: View {
     private func paneColumnDivider(
         projectID: String,
         boundary: Int,
-        available: CGFloat,
-        totalWeight: Double
+        axis: Axis,
+        extents: [CGFloat],
+        weights: [Double],
+        minima: [CGFloat]
     ) -> some View {
         return PaneResizeHandle(
-            axis: .horizontal,
+            axis: axis,
             onDelta: { incremental in
                 model.resizePaneColumns(
                     projectID: projectID,
                     boundary: boundary,
-                    delta: SessionPaneLayout.weightDelta(
-                        pointDelta: Double(incremental),
-                        availableExtent: Double(available),
-                        totalWeight: totalWeight
+                    delta: SessionPaneAdaptiveSizing.resizeDelta(
+                        points: incremental,
+                        leadingExtent: extents[boundary], trailingExtent: extents[boundary + 1],
+                        leadingWeight: weights[boundary], trailingWeight: weights[boundary + 1],
+                        leadingMinimum: minima[boundary], trailingMinimum: minima[boundary + 1]
                     ),
-                    minimumWeight: SessionPaneLayout.minimumWeight(
-                        minimumExtent: 180,
-                        availableExtent: Double(available),
-                        totalWeight: totalWeight
-                    )
+                    minimumWeight: 0.0001
                 )
             },
             onEnded: { model.finishPaneResize(projectID: projectID) },
@@ -2929,8 +3030,8 @@ struct RootShellView: View {
         projectID: String,
         columnID: String,
         boundary: Int,
-        available: CGFloat,
-        totalWeight: Double
+        extents: [CGFloat],
+        weights: [Double]
     ) -> some View {
         return PaneResizeHandle(
             axis: .vertical,
@@ -2939,16 +3040,14 @@ struct RootShellView: View {
                     projectID: projectID,
                     columnID: columnID,
                     boundary: boundary,
-                    delta: SessionPaneLayout.weightDelta(
-                        pointDelta: Double(incremental),
-                        availableExtent: Double(available),
-                        totalWeight: totalWeight
+                    delta: SessionPaneAdaptiveSizing.resizeDelta(
+                        points: incremental,
+                        leadingExtent: extents[boundary], trailingExtent: extents[boundary + 1],
+                        leadingWeight: weights[boundary], trailingWeight: weights[boundary + 1],
+                        leadingMinimum: SessionPaneAdaptiveSizing.minimumHeight,
+                        trailingMinimum: SessionPaneAdaptiveSizing.minimumHeight
                     ),
-                    minimumWeight: SessionPaneLayout.minimumWeight(
-                        minimumExtent: 150,
-                        availableExtent: Double(available),
-                        totalWeight: totalWeight
-                    )
+                    minimumWeight: 0.0001
                 )
             },
             onEnded: { model.finishPaneResize(projectID: projectID) },
@@ -3034,11 +3133,11 @@ struct RootShellView: View {
             } label: {
                 HStack(spacing: 7) {
                     Image(systemName: surfaceSymbol(id))
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(surfaceTint(id))
                         .frame(width: 16)
                     Text(surfaceTitle(id))
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
                     if surfaceWorking(id) {
                         if let chat = model.chats.first(where: { $0.id == id }),
@@ -3052,8 +3151,8 @@ struct RootShellView: View {
                                         .controlSize(.mini)
                                         .scaleEffect(0.5)
                                 }
-                                Text(status.word)
-                                    .font(.caption2.weight(.medium))
+                                Text("Working")
+                                    .font(.system(size: 11, weight: .medium))
                                     .lineLimit(1)
                             }
                             .foregroundStyle(KaisolaStatusTone.working.foregroundColor)
@@ -3132,7 +3231,7 @@ struct RootShellView: View {
             )
         )
         .padding(.trailing, 9)
-        .frame(height: 32)
+        .frame(height: NativeWorkspaceChrome.sessionHeaderHeight)
         .background {
             if let terminalChrome {
                 ZStack {
@@ -3213,6 +3312,8 @@ struct RootShellView: View {
             // accounting, export — as one overflow in the pane's only bar.
             if let chat = model.chats.first(where: { $0.id == id }) {
                 AcpChatOverflowMenu(conversation: chat.conversation) {
+                    paneMenuActions(id)
+                    Divider()
                     if SessionAccountBinding.declaredProvider(forAgentID: chat.agentID) != nil {
                         chatAccountMenuContent(chat)
                         Divider()
@@ -3220,19 +3321,29 @@ struct RootShellView: View {
                 }
                 .foregroundStyle(.kaisolaSecondary)
             }
-        case .terminalTranscript:
-            Button {
-                openTerminalTranscript(id)
+        case .terminalOverflow:
+            Menu {
+                Button("Open Transcript", systemImage: "doc.text.magnifyingglass") {
+                    openTerminalTranscript(id)
+                }
+                .disabled(model.terminalTranscriptContext(for: id) == nil)
+                Button("Open in New Window", systemImage: "macwindow.badge.plus") {
+                    KaisolaMacAppDelegate.popOut(sessionID: id)
+                }
+                Divider()
+                paneMenuActions(id)
             } label: {
-                Image(systemName: "doc.text.magnifyingglass")
-                    .frame(width: 24, height: 22)
+                Image(systemName: "ellipsis.circle")
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.kaisolaChrome)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .foregroundStyle(.kaisolaSecondary)
-            .disabled(model.terminalTranscriptContext(for: id) == nil)
-            .help("Open the full retained terminal transcript")
-        case .terminalPopOut:
-            popOutTerminalButton(id)
+            .help("Terminal options")
+            .accessibilityLabel("Terminal options")
+            .accessibilityIdentifier("terminal.options")
         case .hide:
             Button { Task { await model.minimizeSurface(id) } } label: {
                 Image(systemName: "minus.circle")
@@ -3243,6 +3354,20 @@ struct RootShellView: View {
             .help("Hide this session; keep it running")
         case .detailDoors:
             detailShowDoorButtons
+        }
+    }
+
+    @ViewBuilder
+    private func paneMenuActions(_ id: String) -> some View {
+        Button("Rename…", systemImage: "pencil") { renameTarget = id }
+        Button(
+            model.maximizedPaneID == id ? "Restore Pane" : "Maximize Pane",
+            systemImage: model.maximizedPaneID == id ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+        ) {
+            model.toggleMaximizeSurface(id)
+        }
+        Button("Hide Pane", systemImage: "minus.circle") {
+            Task { await model.minimizeSurface(id) }
         }
     }
 
@@ -5256,28 +5381,10 @@ enum NativeWorkspaceChrome {
     /// keeps a comfortable lane after it.
     static let topBarTrafficLightClearance: CGFloat = 88
     static let projectSidebarMinimumWidth: CGFloat = 168
-    /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
-    /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
-    /// spending width on chrome; 228 → 210 in v1.1.8; 210 → 248 in v0.1.124 by
-    /// request — long project and session titles were the point of the wide
-    /// rail, and the density passes had walked the default back below legible;
-    /// 248 → 290 in v0.1.125, again by request, matching the width Michael
-    /// pins the Files rail to; 290 → 245 on 2026-08-26, again by request —
-    /// the double-click reset should land "1-2cm less wide" than it did;
-    /// 245 → 196 → 180 across 2026-08-28, each by request.
-    ///
-    /// A further step to 125 ("about 65% of its current width") was built and
-    /// measured, and it does not work with this row: the title lane falls to
-    /// 29pt and draws TWO characters, and two different sessions both render
-    /// "M…a". Dropping the row's time label buys it back to six, and 150 gets
-    /// seven — still under the width where the rail's own disambiguation
-    /// works, since titles differing only at the tail stop being separable.
-    /// Reaching those widths honestly needs the ROW re-cut, not this constant
-    /// moved. 180 is what the current row grammar holds.
-    /// Users who dragged their rail keep their width — a drag persists
-    /// (`NativePreviewSettings.projectRailWidth`), so this constant sizes
-    /// fresh windows and the divider's double-click reset.
-    static let projectSidebarIdealWidth: CGFloat = 180
+    /// A comfortable default for project and task names. Persisted drag widths
+    /// still win, and double-clicking the divider restores this measure.
+    static let projectSidebarIdealWidth: CGFloat = 244
+    static let sessionHeaderHeight: CGFloat = 44
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340
@@ -5468,8 +5575,7 @@ enum UnifiedSessionHeaderGrammar {
         case meshQueue
         case meshConfiguration
         case chatOverflow
-        case terminalTranscript
-        case terminalPopOut
+        case terminalOverflow
         case hide
         case detailDoors
     }
@@ -5483,8 +5589,8 @@ enum UnifiedSessionHeaderGrammar {
         var controls: [Control] = []
         if isMesh { controls.append(contentsOf: [.meshQueue, .meshConfiguration]) }
         if isChat { controls.append(.chatOverflow) }
-        if isTerminal { controls.append(contentsOf: [.terminalTranscript, .terminalPopOut]) }
-        controls.append(.hide)
+        if isTerminal { controls.append(.terminalOverflow) }
+        if !isChat && !isTerminal { controls.append(.hide) }
         if hostsDetailDoors { controls.append(.detailDoors) }
         return controls
     }

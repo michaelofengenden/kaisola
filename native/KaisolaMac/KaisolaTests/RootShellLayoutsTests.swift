@@ -6,6 +6,141 @@ import XCTest
 
 @MainActor
 final class RootShellLayoutsTests: XCTestCase {
+    func testNarrowSessionColumnsStackWithoutChangingTheirStoredLayout() {
+        XCTAssertEqual(SessionPaneAdaptiveSizing.mode(
+            size: CGSize(width: 312, height: 500), rowCounts: [1, 1], divider: 1
+        ), .stacked)
+        XCTAssertEqual(SessionPaneAdaptiveSizing.mode(
+            size: CGSize(width: 312, height: 500), rowCounts: [2, 1], divider: 1
+        ), .stacked)
+        XCTAssertEqual(SessionPaneAdaptiveSizing.mode(
+            size: CGSize(width: 800, height: 500), rowCounts: [2, 1], divider: 1
+        ), .columns)
+    }
+
+    func testOversubscribedSessionGridKeepsTheFocusedPaneUsable() {
+        XCTAssertEqual(SessionPaneAdaptiveSizing.mode(
+            size: CGSize(width: 312, height: 500), rowCounts: [2, 2], divider: 1
+        ), .focused)
+        XCTAssertEqual(SessionPaneAdaptiveSizing.mode(
+            size: CGSize(width: 800, height: 250), rowCounts: [2, 1], divider: 1
+        ), .focused)
+    }
+
+    func testPaneAllocationPreservesUsableMinimaAndAvailableExtent() {
+        let widths = SessionPaneAdaptiveSizing.extents(
+            available: 700, weights: [99, 1], minima: [220, 220]
+        )
+        XCTAssertEqual(widths, [480, 220])
+        let heights = SessionPaneAdaptiveSizing.extents(
+            available: 499, weights: [1, 1], minima: [301, 150]
+        )
+        XCTAssertEqual(heights, [301, 198])
+        XCTAssertEqual(SessionPaneAdaptiveSizing.extents(
+            available: 900, weights: [2, 1], minima: [220, 220]
+        ), [600, 300])
+    }
+
+    func testPaneResizeTracksRenderedExtentsAndDistinctAdjacentMinima() {
+        for (movement, expected) in [(CGFloat(-20), [CGFloat(301), 198]), (CGFloat(20), [CGFloat(321), 178])] {
+            let delta = SessionPaneAdaptiveSizing.resizeDelta(
+                points: movement, leadingExtent: 301, trailingExtent: 198,
+                leadingWeight: 1, trailingWeight: 1, leadingMinimum: 301, trailingMinimum: 150
+            )
+            let extents = SessionPaneAdaptiveSizing.extents(
+                available: 499, weights: [1 + delta, 1 - delta], minima: [301, 150]
+            )
+            XCTAssertEqual(extents[0], expected[0], accuracy: 0.001)
+            XCTAssertEqual(extents[1], expected[1], accuracy: 0.001)
+        }
+        let delta = SessionPaneAdaptiveSizing.resizeDelta(
+            points: -10, leadingExtent: 480, trailingExtent: 220,
+            leadingWeight: 99, trailingWeight: 1, leadingMinimum: 220, trailingMinimum: 220
+        )
+        let extents = SessionPaneAdaptiveSizing.extents(
+            available: 700, weights: [99 + delta, 1 - delta], minima: [220, 220]
+        )
+        XCTAssertEqual(extents[0], 470, accuracy: 0.001)
+        XCTAssertEqual(extents[1], 230, accuracy: 0.001)
+    }
+
+    func testClosingCommandOverlayRestoresTheOriginalEditingControl() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { NativeHostedTestWindows.keep(window) }
+        let source = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
+        source.stringValue = "Draft stays here"
+        let search = NSTextField(frame: NSRect(x: 20, y: 80, width: 240, height: 24))
+        window.contentView?.addSubview(source)
+        window.contentView?.addSubview(search)
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(source))
+        let originalEditor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        let insertionPoint = NSRange(location: source.stringValue.utf16.count, length: 0)
+        originalEditor.setSelectedRange(insertionPoint)
+        let focus = CommandOverlayFocusState()
+        focus.capture(in: window)
+        XCTAssertTrue(window.makeFirstResponder(search))
+        XCTAssertTrue(window.makeFirstResponder(nil))
+
+        focus.restoreIfUnclaimed()
+
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        XCTAssertTrue(editor.delegate as? NSTextField === source)
+        XCTAssertEqual(editor.selectedRange(), insertionPoint)
+    }
+
+    func testClosingCommandOverlayDoesNotStealACommandDestinationsFocus() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { NativeHostedTestWindows.keep(window) }
+        let source = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
+        let destination = NSTextField(frame: NSRect(x: 20, y: 80, width: 240, height: 24))
+        window.contentView?.addSubview(source)
+        window.contentView?.addSubview(destination)
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(source))
+        let focus = CommandOverlayFocusState()
+        focus.capture(in: window)
+        XCTAssertTrue(window.makeFirstResponder(destination))
+
+        focus.restoreIfUnclaimed()
+
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        XCTAssertTrue(editor.delegate as? NSTextField === destination)
+    }
+
+    func testClosingCommandOverlayPreservesSelectionAfterAutomaticRefocus() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { NativeHostedTestWindows.keep(window) }
+        let source = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
+        source.stringValue = "Draft stays here"
+        let search = NSTextField(frame: NSRect(x: 20, y: 80, width: 240, height: 24))
+        window.contentView?.addSubview(source)
+        window.contentView?.addSubview(search)
+        XCTAssertTrue(window.makeFirstResponder(source))
+        let selection = NSRange(location: 6, length: 5)
+        try XCTUnwrap(window.firstResponder as? NSTextView).setSelectedRange(selection)
+        let focus = CommandOverlayFocusState()
+        focus.capture(in: window)
+        XCTAssertTrue(window.makeFirstResponder(search))
+        XCTAssertTrue(window.makeFirstResponder(source))
+
+        focus.restoreIfUnclaimed()
+
+        XCTAssertEqual(try XCTUnwrap(window.firstResponder as? NSTextView).selectedRange(), selection)
+    }
+
     // MARK: - Graduated shell contract
 
     func testLeftTreeShellRendersProjectsWorkspaceAndFooter() throws {
@@ -248,8 +383,8 @@ final class RootShellLayoutsTests: XCTestCase {
         )
         XCTAssertEqual(
             chat,
-            [.chatOverflow, .hide, .detailDoors],
-            "ellipsis and the panel toggles stay; the arrow and account buttons are gone"
+            [.chatOverflow, .detailDoors],
+            "session actions share one menu while the panel toggles stay directly available"
         )
 
         let terminal = UnifiedSessionHeaderGrammar.trailingControls(
@@ -258,7 +393,7 @@ final class RootShellLayoutsTests: XCTestCase {
             isTerminal: true,
             hostsDetailDoors: false
         )
-        XCTAssertEqual(terminal, [.terminalTranscript, .terminalPopOut, .hide])
+        XCTAssertEqual(terminal, [.terminalOverflow])
 
         let mesh = UnifiedSessionHeaderGrammar.trailingControls(
             isChat: false,
@@ -301,7 +436,7 @@ final class RootShellLayoutsTests: XCTestCase {
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             "clearing the drag is what a double-click does, so it must resolve to the default"
         )
-        XCTAssertEqual(opening, 180)
+        XCTAssertEqual(opening, 244)
 
         // A width the user dragged still outranks the default when the window
         // reopens — the reset is the only thing that discards it.
@@ -447,7 +582,7 @@ final class RootShellLayoutsTests: XCTestCase {
         hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
         let image = NSImage(size: frame.size)
         image.addRepresentation(representation)
-        window.contentView = nil
+        NativeHostedTestWindows.keep(window)
         return image
     }
 
@@ -474,5 +609,19 @@ final class RootShellLayoutsTests: XCTestCase {
             deleteMesh: { _ in },
             deleteRecentlyClosed: { _ in }
         )
+    }
+}
+
+/// Closing a hosted window is production app quit behavior. Keep these small,
+/// detached test windows alive until the test process exits so a later run-loop
+/// test cannot service a quit queued by an earlier geometry or focus test.
+@MainActor
+enum NativeHostedTestWindows {
+    private static var windows: [NSWindow] = []
+
+    static func keep(_ window: NSWindow) {
+        window.orderOut(nil)
+        window.contentView = nil
+        windows.append(window)
     }
 }

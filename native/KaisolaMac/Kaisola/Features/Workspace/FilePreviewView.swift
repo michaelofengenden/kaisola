@@ -889,7 +889,7 @@ struct FilePreviewView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 8) {
             documentTabs
             if tabs.isEmpty, isDirty {
                 Circle().fill(Color.accentColor).frame(width: 7, height: 7)
@@ -959,15 +959,16 @@ struct FilePreviewView: View {
             Button {
                 requestHide()
             } label: {
-                Image(systemName: "minus")
+                Image(systemName: "sidebar.right")
             }
             .buttonStyle(.borderless)
             .help("Hide Document")
             .accessibilityLabel("Hide Document")
             .accessibilityIdentifier("preview.hide")
         }
+        .font(.system(size: 12))
         .padding(.horizontal, 11)
-        .frame(height: 38)
+        .frame(height: NativeWorkspaceChrome.sessionHeaderHeight)
         .kaisolaBarSurface()
     }
 
@@ -1039,6 +1040,15 @@ struct FilePreviewView: View {
                                     "\(displayTitle), \(tab.isPinned ? "kept open" : "preview")"
                                         + "\(modified ? ", modified" : "")"
                                 )
+                                // The visual close button stays quiet until the
+                                // tab is selected or hovered. Keep closing
+                                // available from the tab itself so keyboard and
+                                // VoiceOver users can close any open document
+                                // without first changing the active preview.
+                                .accessibilityAction(named: Text("Close \(displayTitle)")) {
+                                    if selected { requestClose() }
+                                    else { closeTab(tab.url) }
+                                }
 
                                 Button {
                                     if selected { requestClose() }

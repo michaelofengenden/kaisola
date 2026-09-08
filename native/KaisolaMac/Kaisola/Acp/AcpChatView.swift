@@ -71,6 +71,8 @@ struct AcpChatView: View {
     @ObservedObject private var accountAccess: ChatAccountAccess
     private let presentation: Presentation
     @State private var draft = ""
+    @State private var queueExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Highlights the composer while an OS file drag hovers it.
     @State private var isDropTargeted = false
     @State private var transcriptIsReady = false
@@ -127,14 +129,19 @@ struct AcpChatView: View {
     private func refreshDisplayState() {
         let rows = conversation.visibleRows
         displayItems = AcpTranscriptDisplay.items(rows: rows, isRunning: conversation.isRunning)
-        finalResponseIDs = AcpTranscriptDisplay.finalResponseMessageIDs(rows: rows)
-        subagentStatusDetail = AcpSubagentSummary.derive(rows: rows)?.label
-        var spawns: Set<String> = []
-        for row in rows.reversed() {
-            if case .user = row { break }
-            if case let .tool(call) = row { spawns.insert(call.id) }
-        }
-        currentTurnToolIDs = spawns
+        finalResponseIDs = AcpTranscriptDisplay.finalResponseMessageIDs(
+            rows: rows,
+            isRunning: conversation.isRunning,
+            activeTurnStartRowID: conversation.activeTurnStartRowID
+        )
+        subagentStatusDetail = AcpSubagentSummary.derive(
+            rows: rows,
+            activeTurnStartRowID: conversation.activeTurnStartRowID
+        )?.label
+        currentTurnToolIDs = AcpSubagentSummary.activeToolIDs(
+            rows: rows,
+            activeTurnStartRowID: conversation.activeTurnStartRowID
+        )
     }
     @State private var transcriptConversationID: ObjectIdentifier?
     /// The one subagent being watched as a floating card, or nil. Watching a
@@ -190,6 +197,12 @@ struct AcpChatView: View {
     }
 
     var body: some View {
+        GeometryReader { geometry in
+            chatBody(paneHeight: geometry.size.height)
+        }
+    }
+
+    private func chatBody(paneHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
             // Embedded chats draw no header of their own (2026-08-26): the
             // containing pane's 32pt header is the one bar, and the session
@@ -202,10 +215,16 @@ struct AcpChatView: View {
             }
             if conversation.transcriptRetentionStatus.isTruncated {
                 transcriptRetentionNotice
+                    .frame(maxWidth: AcpTranscriptMetrics.maximumColumnWidth)
+                    .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
+                    .frame(maxWidth: .infinity)
                 Divider()
             }
             if conversation.transcriptPersistenceHealth.needsAttention {
                 transcriptPersistenceNotice
+                    .frame(maxWidth: AcpTranscriptMetrics.maximumColumnWidth)
+                    .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
+                    .frame(maxWidth: .infinity)
                 Divider()
             }
             if showsEmptyState {
@@ -220,10 +239,14 @@ struct AcpChatView: View {
                     pendingCount: conversation.pendingPermissionCount,
                     deny: { conversation.denyPermission() },
                     allowOnce: { conversation.allowPermissionOnce() },
-                    createRule: { conversation.answerPermissionAlways() }
+                    createRule: { conversation.answerPermissionAlways() },
+                    maximumDetailHeight: min(240, max(96, paneHeight * 0.3))
                 )
+                .frame(maxWidth: AcpTranscriptMetrics.maximumColumnWidth)
+                .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
+                .frame(maxWidth: .infinity)
             }
-            composer
+            composer(paneHeight: paneHeight)
         }
         // The drop target is the whole chat, not just the composer.
         //
@@ -253,6 +276,7 @@ struct AcpChatView: View {
         // saves the preceding session's draft.
         .task(id: ObjectIdentifier(conversation)) {
             transcriptSearch = AcpTranscriptSearchState()
+            queueExpanded = false
             draft = conversation.loadDraft()
         }
         .task(id: StartupTaskID(
@@ -453,7 +477,11 @@ struct AcpChatView: View {
                             AcpThinkingStatusRow(
                                 status: status,
                                 subagentDetail: subagentStatusDetail,
-                                startedAt: conversation.turnStartedAt
+                                startedAt: conversation.turnStartedAt,
+                                showsStatusWord: AcpThinkingStatusPresentation.shouldPresent(
+                                    status,
+                                    among: displayItems
+                                )
                             )
                                 .id("acp-thinking-status")
                                 .padding(.top, AcpTranscriptMetrics.spacing(
@@ -473,9 +501,10 @@ struct AcpChatView: View {
                             }
                             .onDisappear { transcriptIsAtBottom = false }
                     }
+                    .frame(maxWidth: AcpTranscriptMetrics.maximumColumnWidth, alignment: .leading)
                     .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
                     .padding(.vertical, AcpTranscriptMetrics.pagePadding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity)
                     .background {
                         AcpTranscriptScrollIntentSensor { distance in
                             let follows = AcpTranscriptFollowPolicy.follows(
@@ -507,19 +536,19 @@ struct AcpChatView: View {
                 // workspace's top-trailing corner over the stream it watches.
                 if let watchTarget = subagentWatchTarget {
                     SubagentWatchCard(target: watchTarget) {
-                        withAnimation(.spring(duration: 0.25)) { subagentWatchTarget = nil }
+                        withAnimation(reduceMotion ? nil : .spring(duration: 0.25)) { subagentWatchTarget = nil }
                     }
                     .padding(.top, 10)
                     .padding(.trailing, 14)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .transition(reduceMotion ? .identity : .move(edge: .trailing).combined(with: .opacity))
                 }
 
                 if transcriptIsReady, !transcriptFollowsTail, !conversation.rows.isEmpty {
                     Button {
                         hasUnseenTranscriptUpdates = false
                         transcriptFollowsTail = true
-                        withAnimation(.easeOut(duration: 0.15)) {
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
                             proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                         }
                     } label: {
@@ -674,7 +703,7 @@ struct AcpChatView: View {
     /// Watch toggles: the same chip closes its own card, a different chip
     /// replaces it.
     private func toggleSubagentWatch(_ target: AcpSubagentWatchTarget) {
-        withAnimation(.spring(duration: 0.3)) {
+        withAnimation(reduceMotion ? nil : .spring(duration: 0.3)) {
             subagentWatchTarget = subagentWatchTarget?.id == target.id ? nil : target
         }
     }
@@ -987,13 +1016,15 @@ struct AcpChatView: View {
             .map(\.0)
     }
 
-    private var composer: some View {
+    private func composer(paneHeight: CGFloat) -> some View {
         VStack(spacing: 6) {
             if let account = accountAccess.presentation {
                 accountRecoveryCard(account)
-            } else if !conversation.isConnected, conversation.statusMessage != nil {
+            } else if !conversation.isConnected, conversation.statusMessage != nil,
+                      conversation.providerStartupFailure == nil,
+                      conversation.pendingModelFallback == nil {
                 HStack(spacing: 8) {
-                    Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
+                    Label("Agent disconnected. Your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
                         .font(.caption)
                         .foregroundStyle(.kaisolaSecondary)
                     Spacer()
@@ -1035,18 +1066,21 @@ struct AcpChatView: View {
                 .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
             }
             if !conversation.queued.isEmpty {
-                queuedStrip
+                queuedStrip(paneHeight: paneHeight)
             }
             if !conversation.pendingAttachments.isEmpty {
                 attachmentStrip
             }
-        AcpComposerCard(
+            AcpComposerCard(
                 conversation: conversation,
                 draft: $draft,
                 focused: $composerFocused,
                 attachmentFocused: $attachmentControlFocused,
                 attachmentAccessibilityFocused: $attachmentControlAccessibilityFocused,
                 isNewConversation: showsEmptyState,
+                maximumDraftLines: min(8, max(1, Int(paneHeight / (
+                    70 * KaisolaChatTypography.scale(for: previewSettings.agentChatTextSize.dynamicTypeSize)
+                )))),
                 send: sendDraft,
                 onKeyboardFocus: onKeyboardFocus
             )
@@ -1056,10 +1090,10 @@ struct AcpChatView: View {
         // is a gutter rather than a bar: no divider, no material, nothing that
         // would draw a second edge a few points from the card's own.
         .frame(maxWidth: AcpChatView.composerMaximumWidth)
+        .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 14)
         .padding(.top, 10)
-        .padding(.bottom, 13)
+        .padding(.bottom, 18)
         // The drop target and its highlight now live on the whole chat; the
         // composer keeps only paste, which is focus-driven rather than aimed.
         .onPasteCommand(of: [.png, .tiff], perform: handlePaste)
@@ -1068,7 +1102,7 @@ struct AcpChatView: View {
     /// A composer wider than this stops being one object and starts being a
     /// band across the window; the references all cap it well short of a
     /// full-screen pane.
-    static let composerMaximumWidth: CGFloat = 860
+    static let composerMaximumWidth: CGFloat = AcpTranscriptMetrics.maximumColumnWidth
 
     /// The invitation that stands in for an empty transcript. It sits low in
     /// the vacated space rather than dead-centre, so the heading and the
@@ -1127,7 +1161,7 @@ struct AcpChatView: View {
                 Spacer(minLength: 0)
             }
             if !account.actions.isEmpty {
-                HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 6) {
                     Button(ChatAccountAccess.RecoveryAction.signIn.rawValue, action: onSignIn)
                         .buttonStyle(.borderedProminent)
                     Button(
@@ -1140,7 +1174,6 @@ struct AcpChatView: View {
                         action: onPreserveTranscript
                     )
                         .buttonStyle(.bordered)
-                    Spacer(minLength: 0)
                 }
                 .controlSize(.small)
             }
@@ -1288,14 +1321,28 @@ struct AcpChatView: View {
         conversation.addImageData(png, name: "Pasted image.png")
     }
 
-    private var queuedStrip: some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func queuedStrip(paneHeight: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                queueExpanded.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: queueExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                    Text("\(conversation.queued.count) queued follow-up\(conversation.queued.count == 1 ? "" : "s")")
+                        .font(.caption.weight(.medium))
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.kaisolaSecondary)
+            .accessibilityIdentifier("acp.queued.toggle")
+            .accessibilityValue(queueExpanded ? "expanded" : "collapsed")
+            .accessibilityHint(queueExpanded ? "Collapse queued follow-ups" : "Show all queued follow-ups")
             if conversation.isConnected, !conversation.isRunning {
                 HStack(spacing: 8) {
-                    Text("\(conversation.queued.count) preserved follow-up\(conversation.queued.count == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundStyle(.kaisolaSecondary)
-                    Spacer()
                     Button("Resume All") {
                         conversation.resumeQueuedFollowUps()
                     }
@@ -1306,47 +1353,58 @@ struct AcpChatView: View {
                 }
                 .padding(.horizontal, 8)
             }
-            ForEach(conversation.queued) { message in
-                HStack(spacing: 6) {
-                    Image(systemName: "clock").font(.caption2).foregroundStyle(.kaisolaSecondary)
-                    Text(message.text).font(.caption).lineLimit(1)
-                    Spacer()
-                    // Identified so the row's own contents, and whether it is
-                    // currently offering the steer action, are inspectable.
-                    // Offered only while a steering-capable adapter has a turn
-                    // running — the one window in which the request can do what
-                    // the button says. Otherwise this stays a plain queued row.
-                    if conversation.canInjectQueued
-                        || conversation.injectingQueuedIDs.contains(message.id) {
-                        Button {
-                            conversation.injectQueued(message.id)
-                        } label: {
-                            Image(systemName: "bolt.fill").font(.caption2)
+            if queueExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(conversation.queued) { message in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "clock").font(.caption2).foregroundStyle(.kaisolaSecondary)
+                                Text(message.text).font(.caption).lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Spacer()
+                                // Identified so the row's own contents, and whether it is
+                                // currently offering the steer action, are inspectable.
+                                // Offered only while a steering-capable adapter has a turn
+                                // running — the one window in which the request can do what
+                                // the button says. Otherwise this stays a plain queued row.
+                                if conversation.canInjectQueued
+                                    || conversation.injectingQueuedIDs.contains(message.id) {
+                                    Button {
+                                        conversation.injectQueued(message.id)
+                                    } label: {
+                                        Image(systemName: "bolt.fill").font(.caption2)
+                                            .frame(width: 24, height: 24)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                                    .disabled(conversation.injectingQueuedIDs.contains(message.id))
+                                    .help("Steer: send this into the running turn now")
+                                    .accessibilityIdentifier("acp.queued.\(message.id).steer")
+                                    .accessibilityLabel("Steer this queued follow-up into the running turn")
+                                }
+                                Button {
+                                    conversation.removeQueued(message.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill").font(.caption2)
+                                        .frame(width: 24, height: 24)
+                                }
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(.kaisolaSecondary)
+                                .disabled(conversation.injectingQueuedIDs.contains(message.id))
+                                .help("Remove this queued follow-up")
+                                .accessibilityIdentifier("acp.queued.\(message.id).remove")
+                                .accessibilityLabel("Remove this queued follow-up")
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("acp.queued.\(message.id)")
+                            .accessibilityLabel("Queued follow-up: \(message.text)")
                         }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
-                        .disabled(conversation.injectingQueuedIDs.contains(message.id))
-                        .help("Steer: send this into the running turn now")
-                        .accessibilityIdentifier("acp.queued.\(message.id).steer")
-                        .accessibilityLabel("Steer this queued follow-up into the running turn")
                     }
-                    Button {
-                        conversation.removeQueued(message.id)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").font(.caption2)
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.kaisolaSecondary)
-                    .disabled(conversation.injectingQueuedIDs.contains(message.id))
-                    .help("Remove this queued follow-up")
-                    .accessibilityIdentifier("acp.queued.\(message.id).remove")
-                    .accessibilityLabel("Remove this queued follow-up")
                 }
-                .padding(.horizontal, 8).padding(.vertical, 4)
-                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("acp.queued.\(message.id)")
-                .accessibilityLabel("Queued follow-up: \(message.text)")
+                .frame(maxHeight: min(132, max(0, paneHeight / 4)))
+                .fixedSize(horizontal: false, vertical: true)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1356,6 +1414,24 @@ struct AcpChatView: View {
         let text = draft
         if conversation.send(text) {
             draft = ""
+        }
+    }
+}
+
+enum AcpThinkingStatusPresentation {
+    static func shouldPresent(
+        _ status: AcpThinkingStatus,
+        among displayItems: [AcpTranscriptDisplayItem]
+    ) -> Bool {
+        !displayItems.contains { item in
+            guard case let .row(.tool(call)) = item,
+                  call.status == .inProgress else { return false }
+            return AcpThinkingStatus.derive(
+                isRunning: true,
+                isConnected: true,
+                hasPendingPermission: false,
+                lastRow: .tool(call)
+            ) == status
         }
     }
 }
@@ -1613,6 +1689,7 @@ struct TranscriptRowView: View {
                     }
                     if !parts.body.isEmpty {
                         Text(parts.body)
+                            .kaisolaReadingText()
                             .textSelection(.enabled)
                     }
                 }
@@ -1638,19 +1715,6 @@ struct TranscriptRowView: View {
             .accessibilityLabel("You said: \(text)")
         case let .message(_, text):
             VStack(alignment: .leading, spacing: 6) {
-                // The turn's final answer announces itself. Interim narration
-                // flows as plain prose; the one message that closes the
-                // exchange carries the title, so "where is the actual answer"
-                // has a visible landmark again (2026-08-26 feedback). Callout
-                // semibold in primary ink: the landmark must outrank the
-                // work-run marker's callout line by weight and ink, not lose
-                // to it at caption size.
-                if showsResponseChrome {
-                    Text("Response")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(.kaisolaPrimary)
-                        .accessibilityHidden(true)
-                }
                 AssistantMarkdownText(
                     text: text,
                     workspaceURL: workspaceURL,
@@ -1660,6 +1724,8 @@ struct TranscriptRowView: View {
             // The turn's final answer is the heading landmark VoiceOver's
             // rotor steps between.
             .accessibilityAddTraits(showsResponseChrome ? .isHeader : [])
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(showsResponseChrome ? "Response" : "Assistant message")
         case let .thought(_, text):
             // The quote block's left rule, in tertiary ink: an expanded
             // thought must stay separable from the answer around it.
@@ -1858,7 +1924,7 @@ struct WorkRunMarkerRow: View {
                 HStack(spacing: 7) {
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.kaisolaTertiary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(width: 13)
                         .accessibilityHidden(true)
                     // No failure suffix on the collapsed line (2026-08-26):
@@ -1872,6 +1938,7 @@ struct WorkRunMarkerRow: View {
                     Spacer(minLength: 0)
                 }
                 .contentShape(Rectangle())
+                .frame(minHeight: 30)
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
@@ -1897,7 +1964,6 @@ struct WorkRunMarkerRow: View {
                 .padding(.leading, 20)
             }
         }
-        .padding(.vertical, 1)
     }
 }
 
@@ -1978,9 +2044,7 @@ struct SubagentChipRow: View {
                 .padding(.leading, 20)
             }
         }
-        .environment(\.openURL, OpenURLAction { link in
-            AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
-        })
+        .acpTranscriptLinkRouting(workspaceURL: workspaceURL)
     }
 
     private var chip: some View {
@@ -2390,9 +2454,7 @@ struct ToolCallCard: View {
         .padding(.vertical, 1)
         .background { rowWash }
         .onHover { hovered = $0 }
-        .environment(\.openURL, OpenURLAction { link in
-            AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
-        })
+        .acpTranscriptLinkRouting(workspaceURL: workspaceURL)
     }
 
     /// The only fills a row carries, bled a few points into the page margin so
@@ -2910,6 +2972,7 @@ struct AcpPermissionBar: View {
     let allowOnce: () -> Void
     let createRule: () -> Void
     var enablesKeyboardShortcuts = true
+    var maximumDetailHeight: CGFloat = 220
 
     /// The exact payload stays one click away rather than in front of the
     /// decision. Collapsed by default; the summary above already carries the
@@ -2993,34 +3056,53 @@ struct AcpPermissionBar: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 380)
-            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxHeight: maximumDetailHeight)
+            .scrollIndicators(.visible)
 
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                denyButton
-                allowOnceButton
-                Button("Create Rule") { createRule() }
-                    .buttonStyle(.bordered)
-                    .tint(.green)
-                    .disabled(!allowsRule)
-                    .help(allowsRule
-                        ? "Allow once and save exactly the workspace, action, and resource shown above"
-                        : ruleUnavailableReason)
+            Divider()
+                .accessibilityHidden(true)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    permissionActions
+                }
+                VStack(alignment: .trailing, spacing: 8) {
+                    permissionActions
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
         .padding(12)
-        .background(.regularMaterial)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(KaisolaStatusTone.needsYou.foregroundColor.opacity(0.35))
-                .frame(height: 1)
+        .background(
+            Color(nsColor: .textBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(
+                    KaisolaStatusTone.needsYou.foregroundColor.opacity(0.24),
+                    lineWidth: KaisolaVisualSystem.hairline
+                )
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Permission request: \(review.title)")
         .accessibilityHint(review.allowOnceOptionID == nil
             ? "Use Escape to deny this request"
             : "Use Return to allow once or Escape to deny")
+    }
+
+    @ViewBuilder
+    private var permissionActions: some View {
+        denyButton.fixedSize()
+        allowOnceButton.fixedSize()
+        Button("Create Rule") { createRule() }
+            .fixedSize()
+            .buttonStyle(.bordered)
+            .disabled(!allowsRule)
+            .help(allowsRule
+                ? "Allow once and save exactly the workspace, action, and resource shown above"
+                : ruleUnavailableReason)
     }
 
     /// The decision, in words, at the top of the card. Every row wraps, so a

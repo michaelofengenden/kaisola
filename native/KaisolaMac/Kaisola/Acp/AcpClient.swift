@@ -1536,6 +1536,10 @@ actor AcpClient {
                 "modeId": .string(modeID),
             ]))
             return .accepted
+        } catch is CancellationError where Task.isCancelled {
+            // The owner abandoned this request. Preserve the existing outcome
+            // API without announcing a provider error for local cancellation.
+            return .refused
         } catch {
             eventHandler?(.error(errorText(error)))
             return .refused

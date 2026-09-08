@@ -123,14 +123,20 @@ struct AcpSubagentSummary: Equatable, Sendable {
     /// of lookback holds every real fan-out seen in practice.
     static let derivationWindow = 300
 
-    /// Counts spawns since the last user message — the turn the status row
-    /// describes — looking back at most `derivationWindow` rows. Returns nil
-    /// when the window has no subagents, so the status row says nothing
-    /// rather than "0 subagents".
-    static func derive(rows: [AcpTranscriptRow]) -> AcpSubagentSummary? {
+    /// Counts spawns in the active turn, including those before a steering
+    /// message, looking back at most `derivationWindow` rows. Returns nil when
+    /// the window has no subagents, so the status row says nothing rather than
+    /// "0 subagents".
+    static func derive(
+        rows: [AcpTranscriptRow],
+        activeTurnStartRowID: String? = nil
+    ) -> AcpSubagentSummary? {
         var summary = AcpSubagentSummary()
-        for row in rows.suffix(derivationWindow).reversed() {
-            if case .user = row { break }
+        for row in activeRows(
+            rows,
+            activeTurnStartRowID: activeTurnStartRowID,
+            limit: derivationWindow
+        ) {
             guard case let .tool(call) = row,
                   case let .subagent(phase) = AcpDelegatedWork.classify(call) else { continue }
             switch phase {
@@ -141,6 +147,44 @@ struct AcpSubagentSummary: Equatable, Sendable {
             }
         }
         return summary.total == 0 ? nil : summary
+    }
+
+    /// Tool calls belonging to the visible active turn. The boundary argument
+    /// is present so callers can retain one turn across steering messages.
+    static func activeToolIDs(
+        rows: [AcpTranscriptRow],
+        activeTurnStartRowID: String? = nil
+    ) -> Set<String> {
+        var ids: Set<String> = []
+        for row in activeRows(rows, activeTurnStartRowID: activeTurnStartRowID) {
+            if case let .tool(call) = row { ids.insert(call.id) }
+        }
+        return ids
+    }
+
+    private static func activeRows(
+        _ rows: [AcpTranscriptRow],
+        activeTurnStartRowID: String?,
+        limit: Int? = nil
+    ) -> [AcpTranscriptRow] {
+        if let activeTurnStartRowID {
+            guard let boundary = rows.firstIndex(where: { $0.id == activeTurnStartRowID }) else {
+                // A retained transcript tail may begin after the active prompt.
+                // Without that boundary, assigning tools to the live turn
+                // would make old work animate again.
+                return []
+            }
+            let activeRows = rows[boundary...]
+            return Array((limit.map { activeRows.suffix($0) } ?? activeRows).reversed())
+        }
+
+        var result: [AcpTranscriptRow] = []
+        let candidateRows = limit.map { rows.suffix($0) } ?? rows[...]
+        for row in candidateRows.reversed() {
+            if case .user = row { break }
+            result.append(row)
+        }
+        return result
     }
 
     /// One quiet clause for the status row. Leads with what is still moving;

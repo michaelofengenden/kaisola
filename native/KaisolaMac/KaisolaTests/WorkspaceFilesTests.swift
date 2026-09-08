@@ -3392,6 +3392,269 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(headingFont?.pointSize, 28)
     }
 
+    func testLiveMarkdownEmphasisSpansOneSoftBreakForEveryDelimiter() {
+        let fixtures: [(source: String, content: String, role: MarkdownEditingStyle.Role, marker: String)] = [
+            ("**bold across\na soft break**", "bold across\na soft break", .bold, "**"),
+            ("__bold across\na soft break__", "bold across\na soft break", .bold, "__"),
+            ("*italic across\na soft break*", "italic across\na soft break", .italic, "*"),
+            ("_italic across\na soft break_", "italic across\na soft break", .italic, "_"),
+        ]
+
+        for fixture in fixtures {
+            let before = Data(fixture.source.utf8)
+            let nsSource = fixture.source as NSString
+            let spans = MarkdownEditingStyle.spans(in: fixture.source)
+            let contentRange = nsSource.range(of: fixture.content)
+            let markerRanges = spans.filter { span in
+                span.role == .syntax
+                    && nsSource.substring(with: span.range) == fixture.marker
+            }
+
+            XCTAssertTrue(
+                spans.contains { $0.role == fixture.role && $0.range == contentRange },
+                "Expected \(fixture.marker) emphasis to retain its role across one soft break"
+            )
+            XCTAssertEqual(markerRanges.count, 2, "Both emphasis delimiters should collapse")
+            XCTAssertEqual(Data(fixture.source.utf8), before, "Scanning must preserve exact UTF-8")
+        }
+    }
+
+    func testLiveMarkdownEmphasisDoesNotCrossBlankLine() {
+        let source = "**first paragraph\n\nsecond paragraph**"
+        let spans = MarkdownEditingStyle.spans(in: source)
+
+        XCTAssertFalse(spans.contains { $0.role == .bold })
+        XCTAssertFalse(spans.contains { $0.role == .syntax })
+    }
+
+    func testLiveMarkdownEmphasisDoesNotCrossHeadingBoundaries() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                let sources = [
+                    "\(marker)first\(newline)# Heading\(newline)last\(marker)",
+                    "# \(marker)heading\(newline)ordinary paragraph\(marker)",
+                ]
+                for source in sources {
+                    let nsSource = source as NSString
+                    let spans = MarkdownEditingStyle.spans(in: source)
+                    XCTAssertFalse(
+                        spans.contains { $0.role == .bold || $0.role == .italic },
+                        "A heading ends the paragraph, even without a blank line: \(source)"
+                    )
+                    XCTAssertFalse(spans.contains {
+                        $0.role == .syntax && nsSource.substring(with: $0.range) == marker
+                    }, "Unmatched emphasis delimiters must remain visible: \(source)")
+                }
+            }
+        }
+    }
+
+    func testLiveMarkdownEmphasisDoesNotCrossFencedCodeBoundaries() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                for fence in ["```", "~~~"] {
+                    let source = "\(marker)first\(newline)\(fence)swift\(newline)let value = 1\(newline)\(fence)\(newline)last\(marker)"
+                    let nsSource = source as NSString
+                    let spans = MarkdownEditingStyle.spans(in: source)
+                    XCTAssertFalse(
+                        spans.contains { $0.role == .bold || $0.role == .italic },
+                        "A fenced block cannot be part of a surrounding emphasis span: \(source)"
+                    )
+                    XCTAssertFalse(spans.contains {
+                        $0.role == .syntax && nsSource.substring(with: $0.range) == marker
+                    }, "Unmatched emphasis delimiters outside the fence must remain visible")
+                }
+            }
+        }
+    }
+
+    func testLiveMarkdownEmphasisDoesNotCrossListItemBoundaries() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                let sources = [
+                    "\(marker)first\(newline)- item\(newline)last\(marker)",
+                    "- \(marker)first item\(newline)- second item\(marker)",
+                    "\(marker)first\(newline)1. item\(newline)last\(marker)",
+                ]
+                for source in sources {
+                    let nsSource = source as NSString
+                    let spans = MarkdownEditingStyle.spans(in: source)
+                    XCTAssertFalse(
+                        spans.contains { $0.role == .bold || $0.role == .italic },
+                        "Emphasis cannot pair delimiters from separate list blocks or items: \(source)"
+                    )
+                    XCTAssertFalse(spans.contains {
+                        $0.role == .syntax && nsSource.substring(with: $0.range) == marker
+                    }, "Unmatched list-adjacent emphasis delimiters must remain visible")
+                }
+            }
+        }
+    }
+
+    func testLiveMarkdownEmphasisKeepsSoftBreakInsideOneListItem() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                let content = "first line\(newline)  continued in this item"
+                let source = "- \(marker)\(content)\(marker)"
+                let nsSource = source as NSString
+                let spans = MarkdownEditingStyle.spans(in: source)
+                XCTAssertTrue(spans.contains {
+                    ($0.role == .bold || $0.role == .italic)
+                        && nsSource.substring(with: $0.range) == content
+                }, "A soft break within one list paragraph still permits emphasis")
+            }
+        }
+    }
+
+    func testLiveMarkdownEmphasisKeepsLazyContinuationInsideOneListItem() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                let content = "first line\(newline)unindented continuation"
+                let source = "- \(marker)\(content)\(marker)"
+                let nsSource = source as NSString
+                XCTAssertTrue(MarkdownEditingStyle.spans(in: source).contains {
+                    ($0.role == .bold || $0.role == .italic)
+                        && nsSource.substring(with: $0.range) == content
+                }, "A lazy continuation stays in the same list paragraph")
+
+                let separated = "- \(marker)first line\(newline)\(newline)new paragraph\(marker)"
+                XCTAssertFalse(MarkdownEditingStyle.spans(in: separated).contains {
+                    $0.role == .bold || $0.role == .italic
+                }, "A blank line ends the list paragraph's emphasis scope")
+            }
+        }
+    }
+
+    func testLiveMarkdownNonStartingOrderedMarkerDoesNotInterruptEmphasisParagraph() {
+        for marker in ["*", "**", "_", "__"] {
+            for newline in ["\n", "\r\n"] {
+                for orderedMarker in ["2.", "2)", "42."] {
+                    let content = "first line\(newline)\(orderedMarker) ordinary continuation"
+                    let source = "\(marker)\(content)\(marker)"
+                    let nsSource = source as NSString
+                    XCTAssertTrue(MarkdownEditingStyle.spans(in: source).contains {
+                        ($0.role == .bold || $0.role == .italic)
+                            && nsSource.substring(with: $0.range) == content
+                    }, "An ordered marker other than one cannot interrupt an existing paragraph")
+                }
+            }
+        }
+    }
+
+    func testLiveMarkdownUnmatchedParagraphDelimiterDoesNotConsumeHeadingEmphasis() {
+        for marker in ["*", "**", "_", "__"] {
+            let source = "\(marker)unmatched paragraph\n# \(marker)valid heading\(marker)\nlast\(marker)"
+            let nsSource = source as NSString
+            let emphasized = MarkdownEditingStyle.spans(in: source)
+                .filter { $0.role == .bold || $0.role == .italic }
+                .map { nsSource.substring(with: $0.range) }
+            XCTAssertEqual(emphasized, ["valid heading"])
+        }
+    }
+
+    func testLiveMarkdownEmphasisMayContainExplicitHardBreakWithinParagraph() {
+        let source = "**first line  \nsecond line**"
+        let nsSource = source as NSString
+        let spans = MarkdownEditingStyle.spans(in: source)
+
+        XCTAssertTrue(spans.contains {
+            $0.role == .bold
+                && nsSource.substring(with: $0.range) == "first line  \nsecond line"
+        })
+        XCTAssertEqual(
+            spans.filter {
+                $0.role == .syntax && nsSource.substring(with: $0.range) == "**"
+            }.count,
+            2
+        )
+    }
+
+    func testLiveMarkdownIntrawordUnderscoresStayLiteralInWordsAndLinkLabels() {
+        let source = "PULL_REQUEST_FEATURES.md and [PULL_REQUEST_FIXES.md](PULL_REQUEST_FIXES.md), but _real emphasis_."
+        let before = Data(source.utf8)
+        let nsSource = source as NSString
+        let spans = MarkdownEditingStyle.spans(in: source)
+        let italicText = spans
+            .filter { $0.role == .italic }
+            .map { nsSource.substring(with: $0.range) }
+
+        XCTAssertEqual(italicText, ["real emphasis"])
+        XCTAssertFalse(italicText.contains("REQUEST"))
+        XCTAssertEqual(Data(source.utf8), before)
+    }
+
+    func testLiveMarkdownAsteriskListMarkersAndWhitespaceDoNotBecomeEmphasis() {
+        let sources = [
+            "* first item\n* second item",
+            "* not emphasis *",
+            "** not bold **",
+            "_ not emphasis _",
+            "__ not bold __",
+        ]
+
+        for source in sources {
+            let spans = MarkdownEditingStyle.spans(in: source)
+            XCTAssertFalse(
+                spans.contains { $0.role == .bold || $0.role == .italic },
+                "Whitespace-flanked Markdown delimiters must stay literal: \(source)"
+            )
+        }
+    }
+
+    func testLiveMarkdownEmphasisHandlesCRLFButStopsAtCRLFBlankLine() {
+        let sameParagraph = "**first line\r\nsecond line**"
+        let splitParagraphs = "**first paragraph\r\n\r\nsecond paragraph**"
+
+        XCTAssertTrue(MarkdownEditingStyle.spans(in: sameParagraph).contains { $0.role == .bold })
+        XCTAssertFalse(MarkdownEditingStyle.spans(in: splitParagraphs).contains { $0.role == .bold })
+    }
+
+    func testLiveMarkdownSoftBreakKeepsLineCadenceWhileBlankLineSeparatesParagraphs() throws {
+        let source = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda\n"
+            + "continues the same authored paragraph\n\n"
+            + "Second paragraph.\n"
+        let storage = NSTextStorage(string: source)
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(
+            size: NSSize(width: 150, height: CGFloat.greatestFiniteMagnitude)
+        )
+        container.lineFragmentPadding = 0
+        storage.addLayoutManager(layoutManager)
+        layoutManager.addTextContainer(container)
+
+        let fullRange = NSRange(location: 0, length: storage.length)
+        storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
+        layoutManager.ensureLayout(for: container)
+
+        var fragments: [(characters: NSRange, minY: CGFloat)] = []
+        layoutManager.enumerateLineFragments(
+            forGlyphRange: NSRange(location: 0, length: layoutManager.numberOfGlyphs)
+        ) { _, usedRect, _, glyphRange, _ in
+            fragments.append((layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil), usedRect.minY))
+        }
+
+        let nsSource = source as NSString
+        let firstBreak = nsSource.range(of: "\n").location
+        let blankLine = nsSource.range(of: "\n\n").location
+        let wrapped = fragments.filter { NSMaxRange($0.characters) <= firstBreak + 1 }
+        let continuation = try XCTUnwrap(fragments.first {
+            NSLocationInRange(firstBreak + 1, $0.characters)
+        })
+        let secondParagraph = try XCTUnwrap(fragments.first {
+            NSLocationInRange(blankLine + 2, $0.characters)
+        })
+
+        XCTAssertGreaterThanOrEqual(wrapped.count, 2, "fixture must naturally wrap before its authored soft break")
+        let ordinaryLineGap = wrapped[1].minY - wrapped[0].minY
+        let lastWrapped = try XCTUnwrap(wrapped.last)
+        let softBreakGap = continuation.minY - lastWrapped.minY
+        let paragraphGap = secondParagraph.minY - continuation.minY
+
+        XCTAssertEqual(softBreakGap, ordinaryLineGap, accuracy: 0.75)
+        XCTAssertGreaterThan(paragraphGap, softBreakGap)
+        XCTAssertEqual(storage.string, source, "rendering must preserve every authored line feed")
+    }
+
     /// A drawn image replaces its whole reference. Leaving the alt text visible
     /// prints a stray link caption underneath the picture it names.
     func testLiveMarkdownCollapsesWholeLineImageReferencesIncludingAltText() throws {

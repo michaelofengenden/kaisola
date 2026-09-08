@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -5,6 +7,67 @@ import XCTest
 /// work marker, how the live tail stays visible, and which message earns the
 /// response chrome.
 final class AcpTranscriptDisplayTests: XCTestCase {
+
+    @MainActor
+    private func fittedSize<Content: View>(
+        _ content: Content,
+        textSize: AgentChatTextSize
+    ) -> NSSize {
+        let host = NSHostingView(rootView: content
+            .fixedSize()
+            .dynamicTypeSize(textSize.dynamicTypeSize))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1_000, height: 1_000),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        defer { NativeHostedTestWindows.keep(window) }
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        return host.fittingSize
+    }
+
+    @MainActor
+    func testExtraLargeChatTextIncreasesHostedTranscriptAndComposerGeometry() {
+        XCTAssertEqual(KaisolaChatTypography.scale(for: .small), 0.85)
+        XCTAssertEqual(KaisolaChatTypography.scale(for: .large), 1)
+        XCTAssertEqual(KaisolaChatTypography.scale(for: .xxxLarge), 1.3)
+        XCTAssertEqual(KaisolaChatTypography.scale(for: .accessibility2), 1.7)
+        let transcriptStandard = fittedSize(
+            Text("Readable conversation text").kaisolaReadingText(),
+            textSize: .standard
+        )
+        let transcriptExtraLarge = fittedSize(
+            Text("Readable conversation text").kaisolaReadingText(),
+            textSize: .extraLarge
+        )
+        XCTAssertGreaterThan(
+            transcriptExtraLarge.height,
+            transcriptStandard.height * 1.35,
+            "the 170% chat setting must materially enlarge hosted transcript text"
+        )
+
+        let composerStandard = fittedSize(
+            TextField("Message the agent", text: .constant("Composer text"))
+                .textFieldStyle(.plain)
+                .kaisolaReadingText(),
+            textSize: .standard
+        )
+        let composerExtraLarge = fittedSize(
+            TextField("Message the agent", text: .constant("Composer text"))
+                .textFieldStyle(.plain)
+                .kaisolaReadingText(),
+            textSize: .extraLarge
+        )
+        XCTAssertGreaterThan(
+            composerExtraLarge.height,
+            composerStandard.height * 1.35,
+            "the composer must follow the same 170% chat setting"
+        )
+    }
+
     private func tool(
         _ id: String,
         kind: String = "execute",
@@ -159,6 +222,76 @@ final class AcpTranscriptDisplayTests: XCTestCase {
         ]
         let finals = AcpTranscriptDisplay.finalResponseMessageIDs(rows: rows)
         XCTAssertEqual(finals, ["m2", "m3"], "notification boundaries are not turn boundaries")
+    }
+
+    func testRunningTurnKeepsResponseChromeOnCompletedTurnsOnly() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u1", text: "first", failed: false),
+            .message(id: "m1", text: "first answer"),
+            .user(id: "u2", text: "second", failed: false),
+            .message(id: "m2", text: "interim narration"),
+            tool("work"),
+            .message(id: "m3", text: "still streaming"),
+        ]
+
+        XCTAssertEqual(
+            AcpTranscriptDisplay.finalResponseMessageIDs(
+                rows: rows,
+                isRunning: true,
+                activeTurnStartRowID: "user-u2"
+            ),
+            ["m1"]
+        )
+        XCTAssertEqual(
+            AcpTranscriptDisplay.finalResponseMessageIDs(rows: rows),
+            ["m1", "m3"],
+            "completion retains the established final-message behavior"
+        )
+    }
+
+    func testSteeringAndHarnessNoticesDoNotMoveTheActiveTurnBoundary() {
+        let notification = "<task-notification><summary>worker done</summary></task-notification>"
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u1", text: "first", failed: false),
+            .message(id: "m1", text: "first answer"),
+            .user(id: "u2", text: "active prompt", failed: false),
+            .message(id: "m2", text: "working"),
+            .user(id: "notice", text: notification, failed: false),
+            .message(id: "m3", text: "after notice"),
+            .user(id: "steer", text: "please also check tests", failed: false),
+            .message(id: "m4", text: "still working"),
+        ]
+
+        XCTAssertEqual(
+            AcpTranscriptDisplay.finalResponseMessageIDs(
+                rows: rows,
+                isRunning: true,
+                activeTurnStartRowID: "user-u2"
+            ),
+            ["m1"]
+        )
+    }
+
+    func testRunningTailWithPagedOutActiveBoundaryHasNoFinalResponseChrome() {
+        let visibleTail: [AcpTranscriptRow] = [
+            .message(id: "m2", text: "interim narration"),
+            tool("work"),
+            .message(id: "m3", text: "still streaming"),
+        ]
+
+        XCTAssertEqual(
+            AcpTranscriptDisplay.finalResponseMessageIDs(
+                rows: visibleTail,
+                isRunning: true,
+                activeTurnStartRowID: "user-paged-out"
+            ),
+            []
+        )
+        XCTAssertEqual(
+            AcpTranscriptDisplay.finalResponseMessageIDs(rows: visibleTail, isRunning: true),
+            [],
+            "the compatibility fallback must not promote the streaming tail"
+        )
     }
 
     /// The collapsed line stays quiet about failures on purpose (2026-08-26):

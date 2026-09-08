@@ -210,6 +210,122 @@ final class MeshStagedTests: XCTestCase {
         XCTAssertEqual(blockedMesh.hookReceipts.last?.blocked, true)
     }
 
+    @MainActor
+    func testMeshSubmissionWithoutRecipientsSkipsBeforeSubmitHooksAcrossEmptyLifecycles() async {
+        let recorder = HookCallRecorder()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "empty-mesh-audit",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { configuration, payload in
+            await recorder.record(configuration.id, payload: payload)
+            return .init(exitStatus: 0, standardOutput: "", standardError: "")
+        }
+
+        for lifecycle in NativeMeshLifecycle.allCases {
+            let mesh = MeshSession(
+                id: "mesh-empty-\(lifecycle.rawValue)",
+                baseDirectory: FileManager.default.temporaryDirectory,
+                lifecycle: lifecycle,
+                hookHost: host
+            )
+
+            let accepted = await mesh.submit("must not reach a hook")
+
+            XCTAssertFalse(accepted, "\(lifecycle.rawValue) has no recipient")
+            XCTAssertTrue(mesh.hookReceipts.isEmpty, "\(lifecycle.rawValue) must not record a hook receipt")
+        }
+
+        let executionCount = await recorder.count
+        XCTAssertEqual(executionCount, 0, "an empty Mesh must reject before invoking beforeSubmit")
+    }
+
+    @MainActor
+    func testSuspendedMeshWithRetainedColumnsSkipsBeforeSubmitHook() async {
+        let recorder = HookCallRecorder()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "suspended-mesh-audit",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { configuration, payload in
+            await recorder.record(configuration.id, payload: payload)
+            return .init(exitStatus: 0, standardOutput: "", standardError: "")
+        }
+        let mesh = MeshSession(
+            id: "mesh-suspended-with-columns",
+            baseDirectory: FileManager.default.temporaryDirectory,
+            hookHost: host
+        )
+        mesh.loadVisualFixture(agents: [Self.agents[0]])
+        await mesh.suspend()
+        XCTAssertEqual(mesh.lifecycle, .suspended)
+        XCTAssertFalse(mesh.columns.isEmpty, "suspension preserves column identity for restoration")
+
+        let accepted = await mesh.submit("must not reach a hook")
+
+        XCTAssertFalse(accepted)
+        XCTAssertTrue(mesh.hookReceipts.isEmpty)
+        let executionCount = await recorder.count
+        XCTAssertEqual(executionCount, 0, "a suspended Mesh must reject before invoking beforeSubmit")
+    }
+
+    @MainActor
+    func testSuspensionDuringBeforeSubmitHookPreservesStagedDraft() async {
+        let gate = MeshSubmitHookGate()
+        let entered = AsyncStream<Void>.makeStream()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "suspend-during-submit",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 5_000,
+            failurePolicy: .failClosed
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { _, _ in
+            entered.continuation.yield(())
+            entered.continuation.finish()
+            await gate.wait()
+            return .init(exitStatus: 0, standardOutput: "", standardError: "")
+        }
+        let mesh = MeshSession(
+            baseDirectory: FileManager.default.temporaryDirectory,
+            mode: .staged,
+            purpose: .build,
+            hookHost: host
+        )
+        mesh.loadVisualFixture(agents: Array(Self.agents.prefix(2)))
+        mesh.draft = "Keep this request until its recipient is available."
+        let originalDraft = mesh.draft
+        let originalRowIDs = mesh.columns.map { $0.conversation.rows.map(\.id) }
+        let submission = Task { @MainActor in
+            let accepted = await mesh.submit(originalDraft)
+            if accepted { mesh.draft = "" }
+            return accepted
+        }
+        var iterator = entered.stream.makeAsyncIterator()
+        await iterator.next()
+        await mesh.suspend()
+        await gate.release()
+        let accepted = await submission.value
+
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(mesh.draft, originalDraft)
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 0)
+        XCTAssertEqual(mesh.columns.map { $0.conversation.rows.map(\.id) }, originalRowIDs)
+        XCTAssertEqual(mesh.lifecycle, .suspended)
+    }
+
     func testLifecycleHookPayloadAndReceiptRetentionStayBounded() async {
         let hook = MeshLifecycleHookConfiguration(
             id: "audit",
@@ -846,6 +962,22 @@ private actor HookCallRecorder {
 
     func record(_ id: String, payload: Data) {
         calls.append((id, payload))
+    }
+}
+
+private actor MeshSubmitHookGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

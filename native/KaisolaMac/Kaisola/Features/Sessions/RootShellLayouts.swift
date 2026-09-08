@@ -1,4 +1,127 @@
+import AppKit
 import SwiftUI
+
+/// Presentation geometry only. Stored pane identities and resize weights
+/// remain the source of truth when a window becomes wide enough again.
+enum SessionPaneAdaptiveSizing {
+    enum Mode: Equatable { case columns, stacked, focused }
+    static let minimumWidth: CGFloat = 220
+    static let minimumHeight: CGFloat = 150
+
+    static func mode(size: CGSize, rowCounts: [Int], divider: CGFloat) -> Mode {
+        guard !rowCounts.isEmpty else { return .focused }
+        let columnHeights = rowCounts.map { rowMinimum(count: $0, divider: divider) }
+        let columnDividers = CGFloat(max(0, rowCounts.count - 1)) * divider
+        if size.width >= CGFloat(rowCounts.count) * minimumWidth + columnDividers,
+           size.height >= (columnHeights.max() ?? minimumHeight) {
+            return .columns
+        }
+        if size.width >= minimumWidth,
+           size.height >= columnHeights.reduce(0, +) + columnDividers {
+            return .stacked
+        }
+        return .focused
+    }
+
+    static func rowMinimum(count: Int, divider: CGFloat) -> CGFloat {
+        CGFloat(max(1, count)) * minimumHeight + CGFloat(max(0, count - 1)) * divider
+    }
+
+    static func resizeDelta(
+        points: CGFloat, leadingExtent: CGFloat, trailingExtent: CGFloat,
+        leadingWeight: Double, trailingWeight: Double,
+        leadingMinimum: CGFloat, trailingMinimum: CGFloat
+    ) -> Double {
+        let pairExtent = leadingExtent + trailingExtent
+        guard pairExtent >= leadingMinimum + trailingMinimum, pairExtent > 0 else { return 0 }
+        let target = min(pairExtent - trailingMinimum, max(leadingMinimum, leadingExtent + points))
+        return Double(target / pairExtent) * (leadingWeight + trailingWeight) - leadingWeight
+    }
+
+    static func extents(available: CGFloat, weights: [Double], minima: [CGFloat]) -> [CGFloat] {
+        guard !weights.isEmpty, weights.count == minima.count else { return [] }
+        let budget = max(0, available)
+        let minimumTotal = minima.reduce(0, +)
+        if budget <= minimumTotal {
+            return minima.map { minimumTotal > 0 ? budget * $0 / minimumTotal : 0 }
+        }
+        let normalized = weights.map { $0.isFinite ? max(0.01, $0) : 1 }
+        var pending = Array(weights.indices)
+        var remaining = budget
+        var result = Array(repeating: CGFloat.zero, count: weights.count)
+        while !pending.isEmpty {
+            let totalWeight = pending.reduce(0.0) { $0 + normalized[$1] }
+            let constrained = pending.filter {
+                remaining * CGFloat(normalized[$0] / totalWeight) < minima[$0]
+            }
+            if constrained.isEmpty {
+                for index in pending {
+                    result[index] = remaining * CGFloat(normalized[index] / totalWeight)
+                }
+                break
+            }
+            for index in constrained {
+                result[index] = minima[index]
+                remaining -= minima[index]
+            }
+            let fixed = Set(constrained)
+            pending.removeAll { fixed.contains($0) }
+        }
+        return result
+    }
+}
+
+/// Remembers the editing control beneath a temporary command overlay without
+/// retaining the view, its window, or a terminal session.
+@MainActor
+final class CommandOverlayFocusState {
+    private weak var window: NSWindow?
+    private weak var responder: NSResponder?
+    private var textSelection: NSRange?
+
+    func capture(in window: NSWindow) {
+        self.window = window
+        textSelection = (window.firstResponder as? NSTextView)?.selectedRange()
+        if let editor = window.firstResponder as? NSTextView,
+           editor.isFieldEditor,
+           let control = editor.delegate as? NSResponder {
+            responder = control
+        } else {
+            responder = window.firstResponder
+        }
+    }
+
+    func restoreIfUnclaimed() {
+        defer {
+            window = nil
+            responder = nil
+            textSelection = nil
+        }
+        guard let window, let responder, window.attachedSheet == nil else { return }
+        let currentResponder: NSResponder?
+        if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+            currentResponder = editor.delegate as? NSResponder
+        } else {
+            currentResponder = window.firstResponder
+        }
+        let originalControlIsFocused = currentResponder === responder
+        guard originalControlIsFocused || currentResponder == nil || currentResponder === window else { return }
+        if let view = responder as? NSView, view.window !== window { return }
+        guard originalControlIsFocused || window.makeFirstResponder(responder) else { return }
+        // AppKit selects all of a text field when focus returns. Restore the
+        // user's caret or selection, including when SwiftUI refocused the
+        // original field before this deferred restoration ran.
+        if let textSelection, textSelection.location != NSNotFound,
+           let editor = window.firstResponder as? NSTextView {
+            let length = (editor.string as NSString).length
+            let location = min(textSelection.location, length)
+            editor.setSelectedRange(NSRange(
+                location: location,
+                length: min(textSelection.length, length - location)
+            ))
+        }
+    }
+}
 
 /// The navigation shells do not own application state. RootShellView injects
 /// one action model into either presentation, so switching layouts cannot grow
@@ -117,9 +240,8 @@ struct RootLeftTreeShell<Sidebar: View, Detail: View>: View {
 /// hairline dividers around the band — the tabs sit directly on the window
 /// glass and the workspace below is flush.
 struct RootMergedTopBarShell<Bar: View, Detail: View, Footer: View>: View {
-    /// The single bar's height. The old 36pt session strip moved to 40 so the
-    /// tabs breathe.
-    static var barHeight: CGFloat { 40 }
+    /// Match the workspace identity row and its comfortable pointer targets.
+    static var barHeight: CGFloat { NativeWorkspaceChrome.sessionHeaderHeight }
 
     let actions: RootShellActionModel
     private let bar: (RootShellActionModel) -> Bar

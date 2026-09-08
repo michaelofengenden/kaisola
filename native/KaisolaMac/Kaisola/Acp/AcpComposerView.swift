@@ -1,15 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// The ACP composer: one rounded card holding the message field and a row of
-/// chips, in the grammar Claude Code and Codex both settled on.
-///
-/// The card is the whole control. Nothing inside it gets its own box — the
-/// field has no second background, and the chips are naked text that only
-/// acquire a surface under the pointer — so the eye reads one object with a
-/// row of settings along its bottom edge rather than a toolbar bolted to a
-/// text box. Hairline dividers, not gaps, separate the chips: they are peers
-/// on one rail, and a gap would have implied grouping that does not exist.
+/// One writing surface with a quiet settings row. Narrow panes move settings
+/// above the action row, keeping attachments, stop, and send within reach.
 struct AcpComposerCard: View {
     @ObservedObject var conversation: AcpConversation
     @Binding var draft: String
@@ -19,6 +12,7 @@ struct AcpComposerCard: View {
     /// True while the conversation has produced nothing, which is the only
     /// thing that changes about the card: its placeholder.
     var isNewConversation = false
+    var maximumDraftLines = 8
     let send: () -> Void
     var onKeyboardFocus: (() -> Void)?
 
@@ -77,8 +71,8 @@ struct AcpComposerCard: View {
     private var placeholder: String {
         if conversation.isRunning { return "Queue a follow-up…" }
         return isNewConversation
-            ? "Describe what to build, or attach images"
-            : "Ask for follow-up changes or attach images"
+            ? "Describe your task"
+            : "Message the agent"
     }
 
     var body: some View {
@@ -87,36 +81,34 @@ struct AcpComposerCard: View {
 
             // Body, matching the transcript's paragraphs: what you type and
             // what comes back are the same size.
-            TextField(placeholder, text: $draft, axis: .vertical)
+            TextField(placeholder, text: $draft, axis: maximumDraftLines == 1 ? .horizontal : .vertical)
                 .textFieldStyle(.plain)
-                .font(.body)
-                .lineLimit(1...8)
+                .kaisolaReadingText()
+                .lineLimit(1...max(1, maximumDraftLines))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .focused($focused)
                 .onChange(of: focused) { _, isFocused in
                     if isFocused { onKeyboardFocus?() }
                 }
                 .onSubmit(send)
-                .padding(.horizontal, 13)
-                .padding(.top, 11)
-                .padding(.bottom, 9)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
                 .accessibilityLabel("Message the agent")
                 .accessibilityIdentifier("acp.composer.field")
 
             controlRow
-                .padding(.horizontal, 7)
-                .padding(.bottom, 7)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
         }
-        // `paneRadius`, one rung under the pane that clips the chat:
-        // `panelRadius` made the composer the roundest shape in the pane —
-        // rounder than its own container, an inversion of the corner ladder
-        // that read as a bulbous pill against the pane's tighter corners.
-        .background(cardFill, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.paneRadius, style: .continuous))
+        .background(cardFill, in: RoundedRectangle(cornerRadius: AcpTranscriptMetrics.composerRadius, style: .continuous))
         .overlay {
             // The focused/unfocused split the pane focus ring already uses:
             // an accent stroke while the field holds focus, a hairline
             // separator otherwise. A flat full-weight border under Glass read
             // as a floating grey box.
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.paneRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: AcpTranscriptMetrics.composerRadius, style: .continuous)
                 .strokeBorder(
                     focused
                         ? Color.accentColor.opacity(0.30)
@@ -126,9 +118,7 @@ struct AcpComposerCard: View {
                         : KaisolaVisualSystem.hairline
                 )
         }
-        // 0.34 → 0.18 dark (2026-08-26): the composer sits INSIDE the chrome
-        // card, and its shadow must not out-weigh the card's own 0.18 float.
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.18 : 0.07), radius: 6, y: 2)
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.12 : 0.035), radius: 10, y: 3)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
@@ -147,7 +137,7 @@ struct AcpComposerCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
                     Button("Use \(fallback.actualLabel)") {
                         conversation.acceptModelFallback()
                     }
@@ -206,39 +196,53 @@ struct AcpComposerCard: View {
 
     // MARK: - Control row
 
-    /// The reference's arrangement: what the agent is *allowed* to do sits on
-    /// the left beside the paperclip, because it is the answer that has a wrong
-    /// value; what it will be *spent on* sits on the right, next to send.
     private var controlRow: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 4) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
                 attachmentMenu
-                if let posture = AcpPermissionPostureMap.current(
-                    modes: conversation.modes,
-                    currentID: conversation.currentModeID
-                ) {
-                    chipDivider
-                    permissionChip(posture)
+                permissionControl
+                Spacer(minLength: 12)
+                runProfileChip
+                settingsPill.fixedSize()
+                trailingControls
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                settingsPill
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 6) {
+                    attachmentMenu
+                    Menu {
+                        runProfileChip
+                        permissionControl
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(width: 26, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Run profile and permissions")
+                    .accessibilityLabel("Run profile and permissions")
+                    .accessibilityIdentifier("acp.composer.more-settings")
+                    Spacer(minLength: 0)
+                    trailingControls
                 }
             }
-            .fixedSize()
-
-            Spacer(minLength: 8)
-
-            runProfileChip
-            settingsPill
-                .layoutPriority(1)
-            trailingControls
-                .fixedSize()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var chipDivider: some View {
-        Rectangle()
-            .fill(Color(nsColor: .separatorColor))
-            .frame(width: KaisolaVisualSystem.focusStroke, height: 15)
-            .padding(.horizontal, 2)
-            .accessibilityHidden(true)
+    @ViewBuilder
+    private var permissionControl: some View {
+        if let posture = AcpPermissionPostureMap.current(
+            modes: conversation.modes,
+            currentID: conversation.currentModeID
+        ) {
+            permissionChip(posture)
+        }
     }
 
     /// Visible before the first prompt because capability advertisement has
@@ -304,7 +308,7 @@ struct AcpComposerCard: View {
                     Image(systemName: "plus").font(.system(size: 12, weight: .medium))
                 }
             }
-            .frame(width: 24, height: 24)
+            .frame(width: 28, height: 28)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -420,7 +424,7 @@ struct AcpComposerCard: View {
                 QuietIdentityMarkView(identity: identity, size: 13)
             }
         }
-        .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
+        .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.12))
         .disabled(conversation.pendingConfigOptionID != nil || conversation.pendingModelFallback != nil)
         .help(conversation.pendingConfigOptionID == nil
             ? "Agent, model, and the settings this chat runs on"
@@ -584,7 +588,7 @@ struct AcpComposerCard: View {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Color.primary)
-                        .frame(width: 26, height: 26)
+                        .frame(width: 28, height: 28)
                         .background(Color.secondary.opacity(0.18), in: Circle())
                 }
                 .buttonStyle(.plain)
@@ -596,7 +600,7 @@ struct AcpComposerCard: View {
                 Image(systemName: sendAction == .queue ? "plus" : "arrow.up")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(Color.white.opacity(sendEnabled ? 1 : 0.7))
-                    .frame(width: 26, height: 26)
+                    .frame(width: 28, height: 28)
                     .background(
                         sendEnabled ? Color.accentColor : Color.kaisolaDisabled,
                         in: Circle()
@@ -802,9 +806,7 @@ struct AcpComposerChipButtonStyle: ButtonStyle {
     }
 }
 
-/// The heading a chat wears before it has said anything: "What should we build
-/// in <project>?", with the project name dotted-underlined so it reads as the
-/// one variable in the sentence rather than as a link.
+/// A short invitation grounded in the current project.
 struct AcpEmptyStateHeadline: View {
     let heading: AcpEmptyState.Heading
 
@@ -812,7 +814,7 @@ struct AcpEmptyStateHeadline: View {
         // A text style, not a point size, so accessibility text sizes scale
         // the headline with everything else.
         Text(attributed)
-            .font(.system(.largeTitle, design: .default).weight(.regular))
+            .font(.system(.title, design: .default).weight(.medium))
             .multilineTextAlignment(.center)
             .foregroundStyle(.primary)
             .padding(.horizontal, 24)
@@ -822,9 +824,7 @@ struct AcpEmptyStateHeadline: View {
     private var attributed: AttributedString {
         var result = AttributedString(heading.lead)
         if !heading.project.isEmpty {
-            var project = AttributedString(heading.project)
-            project.underlineStyle = Text.LineStyle(pattern: .dot, color: nil)
-            result += project
+            result += AttributedString(heading.project)
         }
         result += AttributedString(heading.tail)
         return result

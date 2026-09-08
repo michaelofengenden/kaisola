@@ -87,10 +87,10 @@
 - [x] Run independent direct peer and root adversarial reviews; deduplicate and fix actionable findings. The companion reviewer was unavailable, so direct GPT-6 Astra/GPT-5.6 Sol peers supplied the independent reviews.
 - [x] Run native builds, selected behavioral tests, and rendered UI checks. Repeat the distribution build and preflight on final version metadata during delivery.
 - [x] Recheck original dirty-file hashes and production process ownership. Stage explicit scoped paths and verify that the seven pre-existing settings/CommandRegistry patches are absent. SettingsView may contain only the separately owned native-defaults caption hunk.
-- [ ] Near 00:20 UTC, choose the next unclaimed version using current repo metadata, update changelog/version, and commit only scoped changes.
-- [ ] Push the reviewed branch and save a durable version. Do not imply a public release unless its actual publication boundary is performed.
+- [x] Near 00:20 UTC, choose the next unclaimed version using current repo metadata, update changelog/version, and commit only scoped changes.
+- [x] Push the reviewed branch and save a durable version. Do not imply a public release unless its actual publication boundary is performed.
 - [x] Build and verify the canonical local candidate, install safely when production process ownership permits, and inspect the installed app.
-- [ ] Record exact commit, version, installation state, exercised UI paths, and any unresolved limitations.
+- [x] Record exact commit, version, installation state, exercised UI paths, and any unresolved limitations.
 
 
 ## Verification scope
@@ -100,3 +100,9 @@ The focused behavioral cohorts and real PTY smoke checks passed. Live checks cov
 Light and dark captures were inspected. Existing theme, Reduce Motion, Reduce Transparency and Increased Contrast branches were preserved and reviewed; system accessibility preferences were not changed, so full accessibility-mode rendering is not claimed. Live provider inference and a live multi-agent Mesh run were not exercised. Markdown source bytes remain unchanged; soft LF still occupies a physical line in TextKit rather than reflowing as a space.
 
 Local performance artifacts are under `.build/september-redesign`. Optimized transcript derivation CPU measurements are separate from terminal cadence measurements and do not establish end-to-end chat FPS. The signed 0.1.151 candidate (build 1196002) passed distribution preflight and the complete optimized terminal gate against public feed floor 1196001. The final narrow-sidebar label refinement was built and checked during local delivery. Installed-app receipts and the local archive are recorded under the same artifact directory.
+
+## Local delivery
+
+Version 0.1.151 (build 1196002) was signed, installed at `/Applications/Kaisola.app`, and archived with a verified restore. The implementation was pushed as `95b9c58f5e41532834b22b79391f56ffc4029e7c`; draft PR #913 holds the review. The installed preflight and optimized terminal gate passed. The original checkout remains unchanged and its pre-existing settings patch is identified separately in the local delivery receipt.
+
+The first two native CI jobs failed while compiling a status-row test that calls a SwiftUI view helper from a nonisolated method. The test now explicitly runs on the main actor. This correction changes test isolation only; the installed app code is unchanged. The final CI rerun status is separate from the local app verification.

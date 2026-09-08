@@ -128,6 +128,7 @@ final class AcpThinkingStatusTests: XCTestCase {
         XCTAssertTrue(AcpThinkingStatusPresentation.shouldPresent(thought, among: completedItems))
     }
 
+    @MainActor
     func testDuplicateWordStillRendersElapsedOrSubagentMetadata() {
         XCTAssertFalse(AcpThinkingStatusRow.shouldRender(
             showsStatusWord: false,

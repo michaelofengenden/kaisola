@@ -9,19 +9,71 @@ import XCTest
 /// horizontal scrollbar. These pin the measured minimum, the deck that takes
 /// over below it, and what survives the swap.
 final class MeshColumnDeckTests: XCTestCase {
-    /// Mesh pane widths, not window widths — the sidebar and the workspace rail
-    /// take a growing share of the window before the columns see any of it.
-    /// These three are what the `min`, `typical`, and `full` visual fixtures
-    /// actually hand the deck, read off the running app.
+    /// Representative Mesh content widths after navigation and Files take
+    /// their space. The wide case models a 1920pt display; a smaller local
+    /// display may constrain that fixture to a narrower focused deck.
     private let narrowPaneWidth: CGFloat = 321
     private let typicalPaneWidth: CGFloat = 921
-    private let fullScreenPaneWidth: CGFloat = 1_289
+    private let fullScreenPaneWidth: CGFloat = 1_476
+
+    func testEmptyMeshPresentationMatchesEveryLifecycle() {
+        XCTAssertEqual(
+            MeshEmptyPresentation.forLifecycle(.provisioning),
+            .init(
+                title: "Starting agents…",
+                message: nil,
+                symbol: nil,
+                showsProgress: true,
+                offersAgentSettings: false
+            )
+        )
+        XCTAssertEqual(
+            MeshEmptyPresentation.forLifecycle(.active),
+            .init(
+                title: "No agents could start",
+                message: "Choose an available agent in Settings, then start a new Mesh.",
+                symbol: "person.2.slash",
+                showsProgress: false,
+                offersAgentSettings: true
+            )
+        )
+        XCTAssertEqual(
+            MeshEmptyPresentation.forLifecycle(.suspended),
+            .init(
+                title: "Mesh is suspended",
+                message: "This Mesh has no active agent sessions.",
+                symbol: "pause.circle",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        )
+        XCTAssertEqual(
+            MeshEmptyPresentation.forLifecycle(.pendingDeletion),
+            .init(
+                title: "Removing Mesh…",
+                message: "Kaisola is safely closing this Mesh.",
+                symbol: "trash",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        )
+        XCTAssertEqual(
+            MeshEmptyPresentation.forLifecycle(.recoveryRequired),
+            .init(
+                title: "Mesh recovery needed",
+                message: "Kaisola preserved this run's Git manifest but could not safely reattach every worktree. Nothing was deleted.",
+                symbol: "externaldrive.badge.exclamationmark",
+                showsProgress: false,
+                offersAgentSettings: false
+            )
+        )
+    }
 
     // MARK: - The measured minimum
 
     func testMinimumColumnWidthHoldsAnUnwrappedCodeLine() {
         let font = NSFont.monospacedSystemFont(
-            ofSize: MeshColumnWidth.captionPointSize,
+            ofSize: MeshColumnWidth.codePointSize,
             weight: .regular
         )
         let line = String(repeating: "0", count: MeshColumnWidth.codeLineCharacters)

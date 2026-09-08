@@ -1089,7 +1089,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(spacing: 16) {
                 SettingsCard(title: "Typography", symbol: "textformat") {
-                    SettingsRow(title: "Terminal.app defaults", detail: "11 pt regular, native colors and spacing", symbol: "macwindow") {
+                    SettingsRow(title: "Native defaults", detail: "\(Int(NativePreviewSettings.terminalFontDefault)) pt regular, native colors and spacing", symbol: "macwindow") {
                         Button("Use Defaults") { settings.applyTerminalAppDefaults() }
                             .buttonStyle(.bordered)
                             .controlSize(.small)

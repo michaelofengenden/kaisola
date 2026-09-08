@@ -112,7 +112,27 @@ enum AcpTranscriptDisplay {
     /// user's, or the transcript ends. Interim narration flows as plain
     /// prose, and a harness notification is not the user talking: one human
     /// exchange has one final answer, not one per background-task event.
-    static func finalResponseMessageIDs(rows: [AcpTranscriptRow]) -> Set<String> {
+    static func finalResponseMessageIDs(
+        rows: [AcpTranscriptRow],
+        isRunning: Bool = false,
+        activeTurnStartRowID: String? = nil
+    ) -> Set<String> {
+        if isRunning, let activeTurnStartRowID {
+            guard let boundary = rows.firstIndex(where: { $0.id == activeTurnStartRowID }) else {
+                // A retained tail can start after the active prompt. Without
+                // the boundary, every visible assistant paragraph is still a
+                // candidate for the unfinished turn, so none earns chrome.
+                return []
+            }
+            return completedFinalResponseMessageIDs(rows: Array(rows[..<boundary]), includeTail: true)
+        }
+        return completedFinalResponseMessageIDs(rows: rows, includeTail: !isRunning)
+    }
+
+    private static func completedFinalResponseMessageIDs(
+        rows: [AcpTranscriptRow],
+        includeTail: Bool
+    ) -> Set<String> {
         var ids: Set<String> = []
         var pendingMessageID: String?
         for row in rows {
@@ -127,7 +147,7 @@ enum AcpTranscriptDisplay {
                 break
             }
         }
-        if let id = pendingMessageID { ids.insert(id) }
+        if includeTail, let id = pendingMessageID { ids.insert(id) }
         return ids
     }
 

@@ -1,4 +1,6 @@
 import AppKit
+import Combine
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -7,6 +9,181 @@ import XCTest
 /// no line, a trailing `:LINE` (literal or percent-encoded `%3A`) becomes an
 /// `Int` line, and directory / non-numeric-colon URLs pass through untouched.
 final class TerminalLinkRoutingTests: XCTestCase {
+    private struct TranscriptLinkTrigger: View {
+        let link: URL
+        @Environment(\.openURL) private var openURL
+
+        var body: some View {
+            Text("Mounted transcript link")
+                .onAppear {
+                    DispatchQueue.main.async { openURL(link) }
+                }
+        }
+    }
+
+    @MainActor
+    func testScopedLinkReachesOnlyItsSourceWindow() {
+        let source = NSWindow()
+        let other = NSWindow()
+        let notification = Notification(
+            name: .kaisolaOpenFileLink,
+            userInfo: [TerminalLinkNotificationRouting.sourceWindowKey: source]
+        )
+        XCTAssertTrue(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: source))
+        XCTAssertFalse(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: other))
+        XCTAssertFalse(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: nil))
+    }
+
+    @MainActor
+    func testLegacyUnscopedLinkNotificationsKeepTheirRouting() {
+        let notification = Notification(
+            name: .kaisolaOpenFileLink,
+            userInfo: ["url": URL(fileURLWithPath: "/tmp/example.swift")]
+        )
+        XCTAssertTrue(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: NSWindow()))
+    }
+
+    @MainActor
+    func testTranscriptFileLinkPublishesItsSourceWindowAndRoutesOnlyThere() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Example.swift")
+        try Data("// fixture".utf8).write(to: file)
+        let source = NSWindow()
+        let other = NSWindow()
+        var received: Notification?
+        let observation = NotificationCenter.default.publisher(for: .kaisolaOpenFileLink).sink { received = $0 }
+        defer { observation.cancel() }
+
+        var components = URLComponents(url: file, resolvingAgainstBaseURL: false)
+        components?.fragment = "L9"
+        let citedFile = try XCTUnwrap(components?.url)
+        AcpTranscriptLinkRouting.open(
+            citedFile,
+            workspaceURL: workspace,
+            sourceWindow: source
+        )
+
+        let notification = try XCTUnwrap(received)
+        XCTAssertTrue(notification.userInfo?[TerminalLinkNotificationRouting.sourceWindowKey] as? NSWindow === source)
+        XCTAssertEqual(notification.userInfo?["url"] as? URL, file)
+        XCTAssertEqual(notification.userInfo?["line"] as? Int, 9)
+        XCTAssertTrue(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: source))
+        XCTAssertFalse(TerminalLinkNotificationRouting.shouldHandle(notification, receivingWindow: other))
+    }
+
+    @MainActor
+    func testDetachedTranscriptFileLinkIsDiscardedWithoutPublishingNavigation() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-detached-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Example.swift")
+        try Data("// fixture".utf8).write(to: file)
+        var received: Notification?
+        let observation = NotificationCenter.default.publisher(for: .kaisolaOpenFileLink).sink { received = $0 }
+        defer { observation.cancel() }
+
+        AcpTranscriptLinkRouting.open(
+            file,
+            workspaceURL: workspace,
+            sourceWindow: nil
+        )
+
+        XCTAssertNil(received)
+    }
+
+    @MainActor
+    func testMarkdownEditorLinkCallbackCarriesOwningWindow() throws {
+        let source = NSWindow()
+        let textView = MarkdownNativeTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        textView.string = "[Example](Example.swift)"
+        source.contentView = textView
+        let coordinator = MarkdownRenderedEditor.Coordinator(
+            text: .constant(textView.string),
+            zoom: .constant(1)
+        )
+        coordinator.textView = textView
+        var callbackWindow: NSWindow?
+        coordinator.onOpenLink = { _, window in callbackWindow = window }
+
+        coordinator.followLink(at: 2)
+
+        XCTAssertTrue(callbackWindow === source)
+    }
+
+    @MainActor
+    func testHostedTranscriptLinkEnvironmentCapturesOwningWindow() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-hosted-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Hosted.swift")
+        try Data("// fixture".utf8).write(to: file)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 240),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = NSHostingView(
+            rootView: TranscriptLinkTrigger(link: file)
+                .acpTranscriptLinkRouting(workspaceURL: workspace)
+        )
+        var received: Notification?
+        let observation = NotificationCenter.default.publisher(for: .kaisolaOpenFileLink).sink { received = $0 }
+        defer {
+            observation.cancel()
+            window.close()
+        }
+
+        window.orderFrontRegardless()
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        let notification = try XCTUnwrap(received)
+        XCTAssertTrue(notification.userInfo?[TerminalLinkNotificationRouting.sourceWindowKey] as? NSWindow === window)
+    }
+
+    @MainActor
+    func testTerminalFileLinkPublishesSourceWindowAndPreservesLocation() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("kaisola-link-\(UUID().uuidString).swift")
+        try Data("// fixture".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let source = NSWindow()
+        let terminal = ReadOnlyTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        source.contentView = terminal
+        var received: Notification?
+        let observation = NotificationCenter.default.publisher(for: .kaisolaOpenFileLink).sink { received = $0 }
+        defer { observation.cancel() }
+        NativeTerminalSurface.Coordinator().requestOpenLink(
+            source: terminal,
+            link: file.absoluteString + "#L7",
+            params: [:]
+        )
+        let notification = try XCTUnwrap(received)
+        XCTAssertTrue(notification.userInfo?[TerminalLinkNotificationRouting.sourceWindowKey] as? NSWindow === source)
+        XCTAssertEqual(notification.userInfo?["url"] as? URL, file)
+        XCTAssertEqual(notification.userInfo?["line"] as? Int, 7)
+    }
+
+    @MainActor
+    func testTerminalLocalhostLinkPublishesSourceWindowAndPreservesURL() throws {
+        let source = NSWindow()
+        let terminal = ReadOnlyTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        source.contentView = terminal
+        var received: Notification?
+        let observation = NotificationCenter.default.publisher(for: .kaisolaOpenBrowserCard).sink { received = $0 }
+        defer { observation.cancel() }
+        let url = try XCTUnwrap(URL(string: "http://localhost:5173/path?preview=1"))
+        NativeTerminalSurface.Coordinator().requestOpenLink(source: terminal, link: url.absoluteString, params: [:])
+        let notification = try XCTUnwrap(received)
+        XCTAssertTrue(notification.userInfo?[TerminalLinkNotificationRouting.sourceWindowKey] as? NSWindow === source)
+        XCTAssertEqual(notification.object as? URL, url)
+    }
+
     private func parse(_ string: String) throws -> (path: String, line: Int?) {
         let url = try XCTUnwrap(URL(string: string))
         return NativeTerminalSurface.Coordinator.parseFileLink(url)

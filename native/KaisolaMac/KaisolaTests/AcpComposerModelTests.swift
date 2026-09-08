@@ -1059,6 +1059,119 @@ extension AcpComposerModelTests {
         XCTAssertNil(AcpConversation.loadPersistedModeID(for: draftKey))
     }
 
+    @MainActor
+    func testCancelledModeRestorationStopsAdapterAndPreservesRememberedChoice() async throws {
+        let draftKey = "cancelled-mode-restore-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(for: draftKey, currentDefaults: .standard, migratedDefaults: nil)
+        }
+        UserDefaults.standard.set("bypassPermissions", forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!)
+        let transport = PermissionModeConversationTransport(holdFirstSetModeUntilSecond: true)
+        let conversation = AcpConversation(
+            title: "Cancelled restore", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", clientFactory: { AcpClient(transport: transport) }, draftKey: draftKey,
+            initialDraft: "keep this draft", initialQueuedPrompts: ["keep this follow-up"]
+        )
+        let startup = Task { await conversation.start() }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await transport.modeRequests().isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let requests = await transport.modeRequests()
+        XCTAssertEqual(requests, ["bypassPermissions"])
+        startup.cancel()
+        await startup.value
+
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertTrue(conversation.canRestart)
+        XCTAssertNil(conversation.providerStartupFailure)
+        XCTAssertEqual(conversation.statusMessage, "Agent startup was cancelled.")
+        XCTAssertEqual(conversation.loadDraft(), "keep this draft")
+        XCTAssertEqual(conversation.queued.map(\.text), ["keep this follow-up"])
+        XCTAssertEqual(AcpConversation.loadPersistedModeID(for: draftKey), "bypassPermissions")
+        let terminationCount = await transport.terminationCount()
+        XCTAssertGreaterThan(terminationCount, 0, "the post-handshake adapter belongs to the cancelled startup")
+        _ = await conversation.stop()
+    }
+
+    @MainActor
+    func testCancelledStartupCannotRestartWhileAdapterTerminationIsPending() async throws {
+        let draftKey = "cancelled-cleanup-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(for: draftKey, currentDefaults: .standard, migratedDefaults: nil)
+        }
+        UserDefaults.standard.set("bypassPermissions", forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!)
+        let transport = PermissionModeConversationTransport(
+            holdFirstSetModeUntilSecond: true, holdTermination: true
+        )
+        var clientCreations = 0
+        let conversation = AcpConversation(
+            title: "Cancelled cleanup", command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            clientFactory: {
+                clientCreations += 1
+                return AcpClient(transport: transport)
+            },
+            draftKey: draftKey
+        )
+        let startup = Task { await conversation.start() }
+        let requestDeadline = ContinuousClock.now + .seconds(2)
+        while await transport.modeRequests().isEmpty, ContinuousClock.now < requestDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        startup.cancel()
+        let cleanupDeadline = ContinuousClock.now + .seconds(2)
+        while await transport.terminationCount() == 0, ContinuousClock.now < cleanupDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(conversation.canRestart, "the previous startup still owns adapter cleanup")
+        // Invoke the action only when its eligibility guard is closed, so the
+        // expected RED cannot strand a second termination waiter in this test.
+        if !conversation.canRestart {
+            await conversation.restart()
+            XCTAssertEqual(clientCreations, 1)
+        }
+        await transport.releaseTermination()
+        await startup.value
+        XCTAssertTrue(conversation.canRestart)
+        XCTAssertEqual(clientCreations, 1)
+        _ = await conversation.stop()
+    }
+
+    @MainActor
+    func testCancelledBooleanRestorationStopsAdapterWithoutChangingRememberedValue() async throws {
+        let draftKey = "cancelled-boolean-restore-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(for: draftKey, currentDefaults: .standard, migratedDefaults: nil)
+        }
+        UserDefaults.standard.set(
+            try JSONEncoder().encode(["brave_mode": true]),
+            forKey: AcpConversation.persistedBooleanConfigDefaultsKeys(for: draftKey).first!
+        )
+        let transport = BooleanConfigConversationTransport(holdChanges: true)
+        let conversation = AcpConversation(
+            title: "Cancelled restore", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", clientFactory: { AcpClient(transport: transport) }, draftKey: draftKey
+        )
+        let startup = Task { await conversation.start() }
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await transport.setValues().isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let requests = await transport.setValues()
+        XCTAssertEqual(requests, [true])
+        startup.cancel()
+        await startup.value
+
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertTrue(conversation.canRestart)
+        XCTAssertNil(conversation.providerStartupFailure)
+        XCTAssertEqual(conversation.statusMessage, "Agent startup was cancelled.")
+        XCTAssertEqual(AcpConversation.loadPersistedBooleanConfigValues(for: draftKey), ["brave_mode": true])
+        let terminationCount = await transport.terminationCount()
+        XCTAssertGreaterThan(terminationCount, 0, "cancelling a config restore must stop the initialized adapter")
+        _ = await conversation.stop()
+    }
+
     /// A remembered mode the adapter no longer declares is never sent: the
     /// adapter's own current mode stands rather than a guessed restoration.
     @MainActor
@@ -1775,6 +1888,7 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
 /// the conversation infer success from its own request.
 private actor BooleanConfigConversationTransport: AcpByteTransport {
     private var outbound: [Data] = []
+    private var terminations = 0
     private var waiter: CheckedContinuation<Data?, Never>?
     private var enabled = false
     private var requestedValues: [Bool] = []
@@ -1854,7 +1968,10 @@ private actor BooleanConfigConversationTransport: AcpByteTransport {
         return await withCheckedContinuation { waiter = $0 }
     }
 
+    func terminationCount() -> Int { terminations }
+
     func terminate() async {
+        terminations += 1
         waiter?.resume(returning: nil)
         waiter = nil
     }
@@ -1909,6 +2026,9 @@ private actor BooleanConfigConversationTransport: AcpByteTransport {
 /// per-chat mode persistence is proven across two conversation lifetimes.
 private actor PermissionModeConversationTransport: AcpByteTransport {
     private var outbound: [Data] = []
+    private var terminations = 0
+    private var holdTermination: Bool
+    private var terminationWaiter: CheckedContinuation<Void, Never>?
     private var waiter: CheckedContinuation<Data?, Never>?
     private var requestedModeIDs: [String] = []
     private let rejectedModeIDs: Set<String>
@@ -1921,8 +2041,10 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
         rejectedModeIDs: Set<String> = [],
         advertiseLoadSession: Bool = false,
         announceModeOnLoad: String? = nil,
-        holdFirstSetModeUntilSecond: Bool = false
+        holdFirstSetModeUntilSecond: Bool = false,
+        holdTermination: Bool = false
     ) {
+        self.holdTermination = holdTermination
         self.rejectedModeIDs = rejectedModeIDs
         self.advertiseLoadSession = advertiseLoadSession
         self.announceModeOnLoad = announceModeOnLoad
@@ -2016,7 +2138,17 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
         return await withCheckedContinuation { waiter = $0 }
     }
 
+    func terminationCount() -> Int { terminations }
+
+    func releaseTermination() {
+        holdTermination = false
+        terminationWaiter?.resume()
+        terminationWaiter = nil
+    }
+
     func terminate() async {
+        terminations += 1
+        if holdTermination { await withCheckedContinuation { terminationWaiter = $0 } }
         waiter?.resume(returning: nil)
         waiter = nil
     }

@@ -157,10 +157,8 @@ enum WorkspaceRailRowGrammar {
     static func selectionFillOpacity(dark: Bool) -> Double {
         QuietSelectionPill.fillOpacity(dark: dark)
     }
-    /// Safari-spaced rows: 4.5pt of air packs a tree row to ≈25pt, between the
-    /// sidebar's 26pt session rows and the old 21pt cram — and keeps the shared
-    /// pill radius under the documented lozenge ratio on the rail's own rows.
-    static let rowVerticalPadding: CGFloat = 4.5
+    /// Readable filenames with enough air for a comfortable source-list row.
+    static let rowVerticalPadding: CGFloat = 6
 }
 
 struct WorkspaceRailView: View {
@@ -177,6 +175,7 @@ struct WorkspaceRailView: View {
 
     @EnvironmentObject private var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
@@ -257,6 +256,7 @@ struct WorkspaceRailView: View {
                             nodeRows(for: root, depth: 0)
                         }
                         .padding(.vertical, 6)
+                        .padding(.horizontal, 4)
                     }
                     .scrollBounceBehavior(.basedOnSize)
                 }
@@ -285,7 +285,15 @@ struct WorkspaceRailView: View {
                                         .foregroundStyle(
                                             isSelected(node) ? QuietSelectionPill.ink : Color.kaisolaSecondary
                                         )
-                                    fileName(path, selected: isSelected(node))
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        fileName(node.name, selected: isSelected(node))
+                                        let parentPath = (path as NSString).deletingLastPathComponent
+                                        Text(parentPath.isEmpty ? "Project root" : parentPath)
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.kaisolaSecondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
                                     Spacer(minLength: 0)
                                 }
                                 .padding(.horizontal, 10)
@@ -296,13 +304,14 @@ struct WorkspaceRailView: View {
                                         ? Color.accentColor.opacity(
                                             WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                                         )
-                                        : .clear,
+                                        : Color.primary.opacity(hoveredRow == node.id ? QuietSelectionPill.hoverWashOpacity : 0),
                                     in: ShellTabShape.shape(
                                         cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                                     )
                                 )
                                 .contentShape(Rectangle())
                             }
+                            .help(path)
                             .buttonStyle(.plain)
                             .accessibilityLabel(path)
                             .focused($focusedRow, equals: node.id)
@@ -317,6 +326,7 @@ struct WorkspaceRailView: View {
                         }
                     }
                     .padding(.vertical, 5)
+                    .padding(.horizontal, 4)
                 }
                 .scrollBounceBehavior(.basedOnSize)
             }
@@ -439,6 +449,7 @@ struct WorkspaceRailView: View {
         } message: { failure in
             Text(failure.message)
         }
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Project files")
     }
 
@@ -446,26 +457,33 @@ struct WorkspaceRailView: View {
         GeometryReader { geometry in
             let layout = WorkspaceRailHeaderLayout.resolve(availableWidth: geometry.size.width)
             HStack(spacing: WorkspaceRailHeaderLayout.itemSpacing) {
-                // A running mutation replaces the magnifier in its own slot;
-                // an extra sibling used to push the row past the compressed
-                // rail's width the moment anything was mutating.
-                if isMutating {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
-                        .accessibilityLabel("Updating project files")
-                } else {
-                    Image(systemName: "magnifyingglass")
-                        .font(.caption)
-                        .foregroundStyle(.kaisolaSecondary)
-                        .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
+                HStack(spacing: WorkspaceRailHeaderLayout.itemSpacing) {
+                    // The progress indicator shares the search glyph's slot.
+                    if isMutating {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
+                            .accessibilityLabel("Updating project files")
+                    } else {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.kaisolaSecondary)
+                            .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
+                            .accessibilityHidden(true)
+                    }
+                    TextField(layout.searchPlaceholder, text: $searchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .frame(minWidth: WorkspaceRailHeaderLayout.searchMinimumWidth)
+                        .accessibilityLabel("Search project files")
                 }
-                TextField(layout.searchPlaceholder, text: $searchText)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1)
-                    .frame(minWidth: WorkspaceRailHeaderLayout.searchMinimumWidth)
-                    .layoutPriority(1)
-                    .accessibilityLabel("Search files")
+                .padding(.horizontal, WorkspaceRailHeaderLayout.capsulePadding)
+                .frame(height: 30)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: KaisolaVisualSystem.hairline))
+                .layoutPriority(1)
                 if layout.mode == .compact {
                     compactHeaderMenu
                 } else {
@@ -473,16 +491,10 @@ struct WorkspaceRailView: View {
                 }
                 hideRailButton
             }
-            .padding(.horizontal, WorkspaceRailHeaderLayout.capsulePadding)
-            .frame(height: 30)
-            // A control surface, not a grey wash: Liquid Glass on macOS 26,
-            // a light material below — either way the capsule reads white
-            // over the rail's frost instead of a quaternary grey.
-            .kaisolaControlSurface(interactive: false)
             .padding(.horizontal, WorkspaceRailHeaderLayout.outerPadding)
-            .padding(.vertical, 6)
+            .padding(.vertical, 7)
         }
-        .frame(height: 42)
+        .frame(height: 44)
     }
 
     private var compactHeaderMenu: some View {
@@ -499,10 +511,11 @@ struct WorkspaceRailView: View {
             Button("Refresh Files") { refresh() }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.caption.weight(.semibold))
-                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 20)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 24)
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .fixedSize()
         .help("File actions")
         .accessibilityLabel("File actions")
@@ -517,9 +530,11 @@ struct WorkspaceRailView: View {
                     .disabled(isMutating)
             } label: {
                 Image(systemName: "plus")
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(height: 24)
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .fixedSize()
             .help("New file or folder")
             .accessibilityLabel("New project item")
@@ -527,7 +542,8 @@ struct WorkspaceRailView: View {
                 followsAgentFiles.toggle()
             } label: {
                 Image(systemName: "scope")
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(height: 24)
                     .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.kaisolaSecondary)
             }
             .buttonStyle(.borderless)
@@ -541,7 +557,8 @@ struct WorkspaceRailView: View {
             .accessibilityValue(followsAgentFiles ? "On" : "Off")
             Button(action: { refresh() }) {
                 Image(systemName: "arrow.clockwise")
-                    .font(.caption)
+                    .font(.system(size: 12))
+                    .frame(height: 24)
             }
             .buttonStyle(.borderless)
             .help("Refresh files")
@@ -554,9 +571,9 @@ struct WorkspaceRailView: View {
     private var hideRailButton: some View {
         Button(action: close) {
             Image(systemName: "minus")
-                .font(.caption.weight(.semibold))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.kaisolaSecondary)
-                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 20)
+                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 24)
         }
         .buttonStyle(.borderless)
         .help("Hide \(root.lastPathComponent) files (Command-B)")
@@ -1019,7 +1036,7 @@ struct WorkspaceRailView: View {
                     ? Color.accentColor.opacity(
                         WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
                     )
-                    : .clear,
+                    : Color.primary.opacity(hoveredRow == node.id ? QuietSelectionPill.hoverWashOpacity : 0),
                 in: ShellTabShape.shape(
                     cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius
                 )
@@ -1106,7 +1123,7 @@ struct WorkspaceRailView: View {
     /// ink at semibold, exactly what a selected chat's title does across the
     /// window. Resting rows keep plain primary.
     private func fileName(_ name: String, selected: Bool = false) -> some View {
-        FadingFileName(text: name, font: selected ? .callout.weight(.semibold) : .callout)
+        FadingFileName(text: name, font: .system(size: 13, weight: selected ? .medium : .regular))
             .foregroundStyle(selected ? QuietSelectionPill.ink : Color.primary)
     }
 
@@ -1129,7 +1146,7 @@ struct WorkspaceRailView: View {
         .help("File options")
         .accessibilityLabel("Options for \(node.name)")
         .opacity(revealed ? 1 : 0)
-        .animation(.easeInOut(duration: KaisolaVisualSystem.stateDuration), value: revealed)
+        .animation(reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration), value: revealed)
     }
 
     @ViewBuilder

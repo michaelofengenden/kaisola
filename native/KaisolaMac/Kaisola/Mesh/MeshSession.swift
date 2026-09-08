@@ -647,6 +647,11 @@ final class MeshSession: ObservableObject, Identifiable {
     @Published private(set) var hookReceipts: [MeshLifecycleHookReceipt] = []
     @Published private(set) var hookNotice: String?
     @Published private(set) var hookSubmissionInProgress = false
+    /// One authority for both the UI and the hook-aware submission path. A
+    /// lifecycle without a live recipient must reject before any hook runs.
+    var canSubmit: Bool {
+        lifecycle == .active && !columns.isEmpty && !isSuspended && !isDestroyed
+    }
     @Published var draft: String {
         didSet { onDraftChanged?(draft) }
     }
@@ -1627,7 +1632,7 @@ final class MeshSession: ObservableObject, Identifiable {
     @discardableResult
     func submit(_ text: String) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !hookSubmissionInProgress else { return false }
+        guard canSubmit, !trimmed.isEmpty, !hookSubmissionInProgress else { return false }
         hookSubmissionInProgress = true
         defer { hookSubmissionInProgress = false }
         let decision = await invokeHook(.init(
@@ -1636,7 +1641,7 @@ final class MeshSession: ObservableObject, Identifiable {
             projectID: projectID,
             fields: ["prompt": trimmed]
         ))
-        guard decision.allowed else { return false }
+        guard decision.allowed, canSubmit else { return false }
         switch (purpose, mode) {
         case (.idea, _): return sendIdea(trimmed)
         case (.build, .staged): return sendStaged(trimmed)

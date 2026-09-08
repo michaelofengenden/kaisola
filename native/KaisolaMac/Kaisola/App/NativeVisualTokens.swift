@@ -98,21 +98,26 @@ enum ChromeCardElevation {
 /// a larger event than the next artifact inside the same reply. Mesh columns
 /// are narrow and keep their own tighter literals on purpose.
 enum AcpTranscriptMetrics {
+    /// Messages and the composer share a reading measure, even on wide screens.
+    static let maximumColumnWidth: CGFloat = 780
+    static let readingPointSize: CGFloat = 15
+    static let codePointSize: CGFloat = 12
+    static let composerRadius: CGFloat = 20
     /// Across a turn boundary — before a user message, and before the reply
     /// that follows one.
-    static let turnSpacing: CGFloat = 20
+    static let turnSpacing: CGFloat = 28
     /// Between consecutive assistant artifacts: message, tool call, plan.
-    static let intraTurnSpacing: CGFloat = 8
+    static let intraTurnSpacing: CGFloat = 10
     /// Between consecutive work rows. A burst of tool calls is one activity,
     /// the way Claude Code and the Codex app log it: a tight run of quiet
     /// lines, not a stack of separated cards. Prose keeps `intraTurnSpacing`
     /// on both sides of the run, so the log reads as one block between
     /// paragraphs.
     static let workRunSpacing: CGFloat = 3
-    static let pagePadding: CGFloat = 20
-    static let horizontalPadding: CGFloat = 22
+    static let pagePadding: CGFloat = 28
+    static let horizontalPadding: CGFloat = 24
     /// Between blocks inside one rendered assistant message.
-    static let messageBlockSpacing: CGFloat = 12
+    static let messageBlockSpacing: CGFloat = 14
 
     /// The rhythm's three voices. Everything that is not the user's own
     /// message sits on the assistant's side of the conversation; within that
@@ -144,16 +149,10 @@ enum AcpBubble {
     /// the old full-width band; longer prompts wrap instead of stretching.
     static let maximumWidth: CGFloat = 560
     /// A bubble is wider than it is tall.
-    static let horizontalPadding: CGFloat = 13
-    static let verticalPadding: CGFloat = 9
-    /// The bubble used `cardRadius`, which outranks the pane that clips the
-    /// whole chat — an inversion of the corner ladder — and on a one-line
-    /// prompt (~35pt tall) a 16pt arc consumed nearly the full height, so the
-    /// corners read as blown-out lobes and a failed bubble's red border was
-    /// four red arcs. Ten points stays under `paneRadius`, and under half the
-    /// one-line height, so the shape reads as a rounded rectangle at every
-    /// length.
-    static let cornerRadius: CGFloat = 10
+    static let horizontalPadding: CGFloat = 16
+    static let verticalPadding: CGFloat = 12
+    /// The prompt has its own soft outline on the uninterrupted conversation canvas.
+    static let cornerRadius: CGFloat = 16
 
     /// Light: a quiet ink wash, quaternary-weight. Dark: a near-black lift
     /// above the pane — opaque, like the composer card, so a pasted block
@@ -1823,7 +1822,47 @@ private struct KaisolaControlSurfaceModifier: ViewModifier {
     }
 }
 
+enum KaisolaChatTypography {
+    static func scale(for size: DynamicTypeSize) -> CGFloat {
+        switch size {
+        case .xSmall: 0.76
+        case .small: 0.85
+        case .medium: 0.93
+        case .large: 1
+        case .xLarge: 1.1
+        case .xxLarge: 1.2
+        case .xxxLarge: 1.3
+        case .accessibility1: 1.5
+        case .accessibility2: 1.7
+        case .accessibility3: 2
+        case .accessibility4: 2.35
+        case .accessibility5: 2.7
+        @unknown default: 1
+        }
+    }
+
+    static func pointSize(_ base: CGFloat, for size: DynamicTypeSize) -> CGFloat {
+        base * scale(for: size)
+    }
+}
+
+private struct KaisolaReadingTextModifier: ViewModifier {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    func body(content: Content) -> some View {
+        content.font(.system(size: KaisolaChatTypography.pointSize(
+            AcpTranscriptMetrics.readingPointSize,
+            for: dynamicTypeSize
+        )))
+    }
+}
+
 extension View {
+    /// A comfortable reading size that still follows the conversation zoom.
+    func kaisolaReadingText() -> some View {
+        modifier(KaisolaReadingTextModifier())
+    }
+
     /// Enforces Reduce Motion for a complete native presentation tree. Keep it
     /// on every independently hosted root rather than relying on each child to
     /// remember the preference.

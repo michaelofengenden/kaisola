@@ -108,6 +108,37 @@ enum QuietRailLaneFixture {
 /// project order once the active project is pinned out of that list
 /// (`QuietRailOrder`).
 final class QuietIdentityMarkTests: XCTestCase {
+    func testChatAndTerminalWithTheSameDisplayedTitleAreQualified() {
+        let title = "Codex · september-2026-ui"
+        let labels = QuietRailLabels.labels(for: [title, title], kinds: [.chat, .terminal])
+        XCTAssertEqual(labels.map(\.text), ["Chat · " + title, "Terminal · " + title])
+        XCTAssertEqual(labels.map(\.qualifiedTitle), ["Chat · " + title, "Terminal · " + title])
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+    }
+
+    func testCrossKindCustomTitleQualificationPreservesOriginalUTF8() {
+        let original = "  Custom · café / Review\t "
+        let labels = QuietRailLabels.labels(for: [original, original], kinds: [.chat, .terminal])
+        for (label, prefix) in zip(labels, ["Chat · ", "Terminal · "]) {
+            XCTAssertTrue(label.text.hasPrefix(prefix))
+            XCTAssertEqual(Array(label.text.utf8.dropFirst(prefix.utf8.count)), Array(original.utf8))
+            XCTAssertEqual(label.qualifiedTitle, prefix + original)
+            XCTAssertTrue(label.droppedLead.isEmpty)
+        }
+    }
+
+    func testNoncollidingAndSameKindTitlesKeepTheirExistingLabels() {
+        let distinct = ["Fix layout", "Review the parser"]
+        XCTAssertEqual(
+            QuietRailLabels.labels(for: distinct, kinds: [.chat, .terminal]),
+            QuietRailLabels.labels(for: distinct)
+        )
+        let duplicate = ["Authored · Review", "Authored · Review"]
+        XCTAssertEqual(
+            QuietRailLabels.labels(for: duplicate, kinds: [.chat, .chat]),
+            QuietRailLabels.labels(for: duplicate)
+        )
+    }
 
     // MARK: - Identity mapping
 
@@ -990,7 +1021,6 @@ final class QuietIdentityMarkTests: XCTestCase {
             24,
             "below 24pt the row stops being a comfortable pointer target"
         )
-        XCTAssertLessThan(QuietRailMetrics.titleText, 13, "the session title did not shrink")
         XCTAssertGreaterThanOrEqual(
             QuietRailMetrics.titleText,
             11,
@@ -1075,12 +1105,12 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the resting width sits at 196 as of 2026-08-28, by request —
-        // "at least 20% less wide" than the 245 that 2026-08-26 set, which is
-        // 196 on the nose and matches the Files rail's own default. What this
-        // release still owes is that the rail stays inside its own bounds and
-        // the title lane it buys is real.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 180)
+        // The studio redesign intentionally widens the default. Keep its
+        // bounds contract without pinning the superseded 180pt preference.
+        XCTAssertGreaterThanOrEqual(
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            NativeWorkspaceChrome.projectSidebarMinimumWidth
+        )
     }
 
     // MARK: - Header "+" containment
@@ -1241,6 +1271,14 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// Exactly one row wears the pill, and which one is a rule rather than a
     /// rendering accident. Both ways it can break are invisible in a screenshot
     /// of the happy path.
+    func testMissingDraftCannotSuppressTheSelectedSurfaceRow() {
+        XCTAssertFalse(QuietRowSelection.isDraftSelected(isActive: true, draftID: nil, selectedDraftID: nil))
+        XCTAssertFalse(QuietRowSelection.isDraftSelected(isActive: true, draftID: nil, selectedDraftID: "stale"))
+        XCTAssertFalse(QuietRowSelection.isDraftSelected(isActive: false, draftID: "draft", selectedDraftID: "draft"))
+        XCTAssertFalse(QuietRowSelection.isDraftSelected(isActive: true, draftID: "draft", selectedDraftID: "another"))
+        XCTAssertTrue(QuietRowSelection.isDraftSelected(isActive: true, draftID: "draft", selectedDraftID: "draft"))
+    }
+
     func testExactlyOneSurfaceRowIsSelected() {
         // Nothing on screen: no row is selected, and no row is invented.
         XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: nil))

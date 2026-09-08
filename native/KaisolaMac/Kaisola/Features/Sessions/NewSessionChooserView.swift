@@ -62,7 +62,7 @@ enum NewSessionChooserPresentation {
                 NewSessionPrimaryOption(
                     choice: .agentTerminalCategory,
                     title: "Agent Terminal",
-                    detail: "Start an agent CLI in its own terminal.",
+                    detail: "Start an agent in a terminal.",
                     symbol: "chevron.left.forwardslash.chevron.right",
                     isEnabled: terminalControlAvailable,
                     disabledReason: terminalControlAvailable ? nil : terminalUnavailableReason
@@ -74,7 +74,7 @@ enum NewSessionChooserPresentation {
                 NewSessionPrimaryOption(
                     choice: .chatCategory,
                     title: "Chat",
-                    detail: "Work with an agent in a native conversation.",
+                    detail: "Chat with an agent.",
                     symbol: "bubble.left.and.text.bubble.right",
                     isEnabled: true,
                     disabledReason: nil
@@ -85,7 +85,7 @@ enum NewSessionChooserPresentation {
             NewSessionPrimaryOption(
                 choice: .mesh,
                 title: "Mesh",
-                detail: "Open an all-agent collaborative workspace.",
+                detail: "Let several agents work together.",
                 symbol: "circle.hexagongrid.fill",
                 isEnabled: true,
                 disabledReason: nil
@@ -126,14 +126,66 @@ struct NewSessionChooserView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 20) {
+            ViewThatFits(in: .vertical) {
+                invitationContent
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ScrollView {
+                    invitationContent
+                        // Leave room for the custom rounded keyboard stroke.
+                        .padding(2)
+                }
+            }
+            navigationActions
+        }
+        .padding(16)
+        // A ceiling, not a fixed size: the content column can legitimately be
+        // 220pt with Files and a document open, and a fixed 500 clipped the
+        // grid instead of letting it reflow.
+        .frame(maxWidth: 560)
+        .background {
+            // Opaque on purpose: the translucent card read as grey over the
+            // workspace glass. Solid controlBackgroundColor is white in light
+            // appearance and the matching dark surface in dark.
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .overlay {
+                    RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
+                        .stroke(Color.primary.opacity(0.11), lineWidth: KaisolaVisualSystem.hairline)
+                }
+        }
+        .onAppear(perform: focusFirstEnabledChoice)
+        .onExitCommand {
+            // Escape backs out one level before it cancels anything: on an
+            // agent sub-screen the expected exit is "back", and the
+            // empty-workspace instance (showsCancel == false) previously had
+            // no keyboard exit from that screen at all.
+            if screen != .primary {
+                screen = .primary
+                focusFirstEnabledChoice()
+            } else if showsCancel, !isLaunching {
+                cancel()
+            }
+        }
+        .onChange(of: terminalControlAvailable) { _, available in
+            guard available, screen == .agentTerminal else { return }
+            focusFirstAgent(in: catalog.terminalAgents)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Start a session in \(projectName)")
+    }
+
+    private var invitationContent: some View {
+        VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Start a session")
-                    .font(.title2.weight(.semibold))
+                    .font(.system(size: 24, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
-                Text("Choose what this tab should become in \(projectName).")
-                    .font(.callout)
+                Text("Choose how to work in \(projectName).")
+                    .font(.system(size: 13))
                     .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Group {
@@ -162,105 +214,92 @@ struct NewSessionChooserView: View {
                 }
             }
 
-            HStack {
-                if isLaunching {
+            if isLaunching {
+                HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
                     Text("Starting session…")
                         .foregroundStyle(.kaisolaSecondary)
-                } else if let launchFailureMessage {
-                    Label {
-                        Text(launchFailureMessage)
-                            .foregroundStyle(.kaisolaPrimary)
-                    } icon: {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(Color.orange)
-                    }
-                        .accessibilityIdentifier("new-session-launch-failed")
                 }
-                if screen != .primary {
-                    // Same grammar as Cancel across the row: two buttons, one
-                    // style. Plain text here read as an inert status label.
-                    Button("Back") {
-                        screen = .primary
-                        focusFirstEnabledChoice()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isLaunching)
+                .font(.system(size: 12))
+            } else if let launchFailureMessage {
+                Label {
+                    Text(launchFailureMessage)
+                        .foregroundStyle(.kaisolaPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Color.orange)
                 }
-                Spacer()
-                if showsCancel {
-                    Button("Cancel", role: .cancel, action: cancel)
-                        .keyboardShortcut(.cancelAction)
-                        .disabled(isLaunching)
-                }
+                .font(.system(size: 12))
+                .accessibilityIdentifier("new-session-launch-failed")
             }
-            .font(.callout)
         }
-        .padding(24)
-        // A ceiling, not a fixed size: the content column can legitimately be
-        // 220pt with Files and a document open, and a fixed 500 clipped the
-        // grid instead of letting it reflow.
-        .frame(maxWidth: 500)
-        .background {
-            // Opaque on purpose: the translucent card read as grey over the
-            // workspace glass. Solid controlBackgroundColor is white in light
-            // appearance and the matching dark surface in dark.
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-                .overlay {
-                    RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
-                        .stroke(Color.primary.opacity(0.11), lineWidth: KaisolaVisualSystem.hairline)
-                }
-        }
-        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 6)
-        .onAppear(perform: focusFirstEnabledChoice)
-        .onExitCommand {
-            // Escape backs out one level before it cancels anything: on an
-            // agent sub-screen the expected exit is "back", and the
-            // empty-workspace instance (showsCancel == false) previously had
-            // no keyboard exit from that screen at all.
+    }
+
+    private var navigationActions: some View {
+        HStack {
             if screen != .primary {
-                screen = .primary
-                focusFirstEnabledChoice()
-            } else if showsCancel, !isLaunching {
-                cancel()
+                // Same grammar as Cancel across the row: two buttons, one
+                // style. Plain text here read as an inert status label.
+                Button("Back") {
+                    screen = .primary
+                    focusFirstEnabledChoice()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isLaunching)
+            }
+            Spacer()
+            if showsCancel {
+                Button("Cancel", role: .cancel, action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isLaunching)
             }
         }
-        .onChange(of: terminalControlAvailable) { _, available in
-            guard available, screen == .agentTerminal else { return }
-            focusFirstAgent(in: catalog.terminalAgents)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Start a session in \(projectName)")
+        .font(.callout)
     }
 
     private var primaryChoices: some View {
-        // Adaptive so a narrow content column reflows to one column instead
-        // of clipping the second.
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 190))], spacing: 10) {
-            ForEach(primaryOptions) { option in
-                Button {
-                    select(option.choice)
-                } label: {
-                    choiceLabel(
-                        title: option.title,
-                        detail: option.disabledReason ?? option.detail,
-                        symbol: option.symbol,
-                        isEnabled: option.isEnabled && !isLaunching
-                    )
+        // An explicit flexible single-column fallback has no minimum card
+        // width, so it also fits a 220pt pane after the host and card insets.
+        ViewThatFits(in: .horizontal) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                ForEach(primaryOptions) { option in
+                    primaryChoice(option)
                 }
-                .buttonStyle(NewSessionChoiceButtonStyle(
-                    isFocused: focusedPrimaryChoice == option.choice
-                ))
-                .disabled(!option.isEnabled || isLaunching)
-                .focusable()
-                .focused($focusedPrimaryChoice, equals: option.choice)
-                .help(option.disabledReason ?? option.detail)
-                .accessibilityLabel(option.title)
-                .accessibilityHint(option.disabledReason ?? option.detail)
+            }
+            .frame(minWidth: 440)
+
+            VStack(spacing: 8) {
+                ForEach(primaryOptions) { option in
+                    primaryChoice(option, compact: true)
+                }
             }
         }
+    }
+
+    private func primaryChoice(_ option: NewSessionPrimaryOption, compact: Bool = false) -> some View {
+        Button {
+            select(option.choice)
+        } label: {
+            choiceLabel(
+                title: option.title,
+                detail: option.disabledReason ?? option.detail,
+                symbol: option.symbol,
+                isEnabled: option.isEnabled && !isLaunching,
+                compact: compact
+            )
+        }
+        .buttonStyle(NewSessionChoiceButtonStyle(
+            isFocused: focusedPrimaryChoice == option.choice
+        ))
+        .disabled(!option.isEnabled || isLaunching)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focusedPrimaryChoice, equals: option.choice)
+        .help(option.disabledReason ?? option.detail)
+        .accessibilityLabel(option.title)
+        .accessibilityHint(option.disabledReason ?? option.detail)
     }
 
     private func agentChoices(
@@ -272,12 +311,12 @@ struct NewSessionChooserView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Choose an agent for \(title)")
-                .font(.headline)
+                .font(.system(size: 13, weight: .semibold))
             ForEach(agents) { agent in
                 Button {
                     choose(choice(agent.id))
                 } label: {
-                    HStack(spacing: 12) {
+                    HStack(spacing: 10) {
                         // The same disabled ink as the primary cards: without
                         // it a row disabled mid-launch (or with control lost)
                         // renders pixel-identical to a clickable one.
@@ -287,7 +326,8 @@ struct NewSessionChooserView: View {
                             )
                             .frame(width: 20)
                         Text(agent.name)
-                            .font(.callout.weight(.medium))
+                            .font(.system(size: 13, weight: .medium))
+                            .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(
                                 isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled)
                             )
@@ -296,8 +336,9 @@ struct NewSessionChooserView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.kaisolaTertiary)
                     }
-                    .padding(.horizontal, 14)
-                    .frame(height: 42)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 12)
+                    .frame(minHeight: 44)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NewSessionChoiceButtonStyle(
@@ -305,6 +346,7 @@ struct NewSessionChooserView: View {
                 ))
                 .disabled(!isEnabled)
                 .focusable()
+                .focusEffectDisabled()
                 .focused($focusedAgentID, equals: agent.id)
                 .help(isEnabled ? "Start \(agent.name)" : NewSessionChooserPresentation.terminalUnavailableReason)
                 .accessibilityLabel("\(title) with \(agent.name)")
@@ -321,30 +363,28 @@ struct NewSessionChooserView: View {
         title: String,
         detail: String,
         symbol: String,
-        isEnabled: Bool = true
+        isEnabled: Bool = true,
+        compact: Bool = false
     ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: symbol)
-                .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(isEnabled ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.kaisolaDisabled))
-                .frame(width: 22, height: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                // A disabled card dims its own title, never the explanation:
-                // the detail line IS the reason the card is disabled, and a
-                // whole-card opacity used to push it below the readable floor.
+        VStack(alignment: .leading, spacing: compact ? 4 : 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(isEnabled ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.kaisolaDisabled))
+                    .frame(width: 20)
                 Text(title)
-                    .font(.callout.weight(.semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled))
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 0)
+            Text(detail)
+                .font(.system(size: 12))
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .multilineTextAlignment(.leading)
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: compact ? 66 : 90, alignment: .topLeading)
         .contentShape(Rectangle())
     }
 
@@ -399,6 +439,7 @@ struct NewSessionChoiceButtonStyle: ButtonStyle {
         let configuration: Configuration
         let isFocused: Bool
         @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
         @State private var hovered = false
 
         var body: some View {
@@ -448,7 +489,7 @@ struct NewSessionChoiceButtonStyle: ButtonStyle {
                 // detail line instead (see `choiceLabel`).
                 .opacity(configuration.isPressed ? 0.88 : 1)
                 .animation(
-                    .easeOut(duration: KaisolaVisualSystem.hoverDuration),
+                    reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration),
                     value: hovering
                 )
                 .onHover { hovered = $0 }

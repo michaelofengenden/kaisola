@@ -396,6 +396,45 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    @MainActor
+    func testConversationSummaryChecksInspectOnlyTheDirtySurface() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [], usesRootProjectIdentity: true)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        fixture.model.loadVisualMeshFixture(workspace: fixture.root, agentCount: 2)
+        fixture.model.loadVisualMixedSessionFixture(workspace: fixture.root)
+        try await Task.sleep(for: .milliseconds(50))
+
+        let chat = try XCTUnwrap(fixture.model.chats.first { $0.id == "visual-chat" })
+        var inspections: [String] = []
+        fixture.model.onSurfaceSummaryInspectionForTesting = { inspections.append($0) }
+        var shellPublications = 0
+        let shellWatcher = fixture.model.objectWillChange.sink { _ in shellPublications += 1 }
+        defer { shellWatcher.cancel() }
+
+        chat.conversation.receiveTurnItemForTesting(.message(id: "stream", text: "first chunk"))
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(inspections, ["chat:visual-chat"])
+        XCTAssertEqual(shellPublications, 0, "transcript-only output must not invalidate the shell")
+
+        inspections.removeAll()
+        chat.conversation.receivePermissionForTesting(AcpPermissionRequest(
+            id: 73,
+            sessionID: "summary-test",
+            title: "Review a file",
+            options: [
+                .init(id: "allow", name: "Allow once", kind: "allow_once"),
+                .init(id: "deny", name: "Deny", kind: "reject_once"),
+            ]
+        ))
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(inspections, ["chat:visual-chat"])
+        XCTAssertEqual(shellPublications, 1, "a permission badge change must invalidate the shell once")
+        await fixture.model.disconnect()
+    }
+
     func testSecondaryBrokerBurstPublishesOnlyItsTerminalCard() async throws {
         let fixture = try Fixture(failingConnectAttempts: [])
         defer { fixture.cleanUp() }

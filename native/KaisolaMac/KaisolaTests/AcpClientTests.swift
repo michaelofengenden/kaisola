@@ -3687,6 +3687,75 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
+    func testCancelledStartupIsNeutralAndCanRestartWithoutLosingLocalState() async throws {
+        let cancelledTransport = CancellableInitializeAcpTransport()
+        let recoveredTransport = ScriptedAcpTransport()
+        let clients = [
+            AcpClient(transport: cancelledTransport),
+            AcpClient(transport: recoveredTransport),
+        ]
+        var clientIndex = 0
+        let conversation = AcpConversation(
+            title: "Cancelled startup",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "OpenAI",
+                accountLabel: "Project/default",
+                defaultSettingsSectionID: "accounts"
+            ),
+            clientFactory: {
+                defer { clientIndex += 1 }
+                return clients[clientIndex]
+            },
+            initialDraft: "unfinished draft",
+            initialQueuedPrompts: ["preserved follow-up"]
+        )
+
+        let startup = Task { await conversation.start() }
+        await cancelledTransport.waitForInitialize()
+        startup.cancel()
+        await startup.value
+
+        XCTAssertNil(conversation.providerStartupFailure)
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertTrue(conversation.canRestart)
+        XCTAssertEqual(conversation.statusMessage, "Agent startup was cancelled.")
+        XCTAssertEqual(conversation.loadDraft(), "unfinished draft")
+        XCTAssertEqual(conversation.queued.map(\.text), ["preserved follow-up"])
+
+        await conversation.restart()
+
+        XCTAssertTrue(conversation.isConnected)
+        XCTAssertFalse(conversation.isReconnecting)
+        XCTAssertNil(conversation.providerStartupFailure)
+    }
+
+    @MainActor
+    func testAdapterCancellationErrorWithoutLocalTaskCancellationRemainsProviderFailure() async {
+        let conversation = AcpConversation(
+            title: "Adapter cancellation failure",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "OpenAI",
+                accountLabel: "Project/default",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: ProviderCancellationAcpTransport())
+        )
+
+        await conversation.start()
+
+        XCTAssertNotNil(conversation.providerStartupFailure)
+        XCTAssertTrue(conversation.statusMessage?.contains("OpenAI") == true)
+    }
+
+    @MainActor
     func testAdapterWithoutRequestedModelHidesFallbackControl() async {
         let transport = ScriptedAcpTransport(currentModelID: "sonnet")
         let conversation = AcpConversation(
@@ -4803,6 +4872,54 @@ private actor ProviderFailureAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {}
     func receive(maximumBytes: Int) async throws -> Data? { nil }
     func terminate() async {}
+    func exitCode() async -> Int32? { nil }
+}
+
+private actor ProviderCancellationAcpTransport: AcpByteTransport {
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
+        throw CancellationError()
+    }
+
+    func send(_ data: Data) async throws {}
+    func receive(maximumBytes: Int) async throws -> Data? { nil }
+    func terminate() async {}
+    func exitCode() async -> Int32? { nil }
+}
+
+/// Holds the initialize reply until its owning task is cancelled. This drives
+/// the real AcpClient cancellation and cleanup path rather than substituting a
+/// conversation-level error.
+private actor CancellableInitializeAcpTransport: AcpByteTransport {
+    private var receiveWaiter: CheckedContinuation<Data?, Never>?
+    private var initializeWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sawInitialize = false
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        let frame = data.last == 0x0A ? data.dropLast() : data[...]
+        guard let request = try? JSONDecoder().decode(JSONValue.self, from: Data(frame)).objectValue,
+              request["method"]?.stringValue == "initialize" else { return }
+        sawInitialize = true
+        let waiters = initializeWaiters
+        initializeWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitForInitialize() async {
+        if sawInitialize { return }
+        await withCheckedContinuation { initializeWaiters.append($0) }
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        await withCheckedContinuation { receiveWaiter = $0 }
+    }
+
+    func terminate() async {
+        receiveWaiter?.resume(returning: nil)
+        receiveWaiter = nil
+    }
+
     func exitCode() async -> Int32? { nil }
 }
 

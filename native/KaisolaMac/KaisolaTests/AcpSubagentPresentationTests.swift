@@ -107,6 +107,49 @@ final class AcpSubagentPresentationTests: XCTestCase {
         )
     }
 
+    func testSteeringKeepsEarlierSubagentsInTheActiveTurn() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u1", text: "start", failed: false),
+            .tool(spawn(id: "before-steer", status: .inProgress)),
+            .user(id: "steer", text: "also inspect the compact layout", failed: false),
+            .message(id: "m1", text: "continuing"),
+            .tool(spawn(id: "after-steer", status: .inProgress)),
+        ]
+
+        let boundary = "user-u1"
+        XCTAssertEqual(
+            AcpSubagentSummary.derive(
+                rows: rows,
+                activeTurnStartRowID: boundary
+            )?.working,
+            2,
+            "delivered steering remains inside the original active turn"
+        )
+        XCTAssertEqual(
+            AcpSubagentSummary.activeToolIDs(
+                rows: rows,
+                activeTurnStartRowID: boundary
+            ),
+            ["before-steer", "after-steer"],
+            "a live subagent spawned before steering must not become previous-turn"
+        )
+
+        XCTAssertNil(
+            AcpSubagentSummary.derive(
+                rows: Array(rows.dropFirst()),
+                activeTurnStartRowID: boundary
+            ),
+            "a paged-out active boundary cannot safely claim visible subagents"
+        )
+        XCTAssertEqual(
+            AcpSubagentSummary.activeToolIDs(
+                rows: Array(rows.dropFirst()),
+                activeTurnStartRowID: boundary
+            ),
+            []
+        )
+    }
+
     func testTailFollowReengagesOnlyWithinTheDeclaredDistance() {
         XCTAssertTrue(AcpTranscriptFollowPolicy.follows(afterUserScrollDistance: 0))
         XCTAssertTrue(AcpTranscriptFollowPolicy.follows(

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.151 (2026-09-08)
+
+- Chats have a centered reading column, larger native type, clearer code and tables, and a quieter composer. Queued follow-ups stay compact until expanded, and permission details scroll while their decisions remain reachable.
+- Project and session navigation has more readable rows, clearer selection, and distinct chat and terminal names. Search prefers exact commands and filenames, and dismissing it preserves the draft's insertion point.
+- Small windows rearrange split panes without changing the saved layout or stopping hidden sessions. Divider dragging respects each pane's usable size, and the composer adapts while preserving its draft and cursor.
+- Running feedback follows the active prompt through steering and subagent work. Intentional startup cancellation cleans up without inventing an account failure, and Mesh keeps the draft when a recipient becomes unavailable during a submission hook.
+- Markdown editing uses native document type, consistent line spacing, accurate emphasis boundaries, and clickable change markers. File links stay in the window that opened them, and editing preserves the document's source bytes.
+- Streaming work avoids rebuilding closed search indexes, scanning unrelated session summaries, and repeating bounded Markdown snapshot work. Existing terminal themes and saved font choices remain respected; fresh native defaults use 12-point text.
+
 ## 0.1.150 — 2026-08-29
 
 - The window buttons are macOS's again, untouched. Three releases in a row tried to reposition them into a Safari-style inset and each shipped a differently wrong window; the report that ended it was a real 0.1.149 window whose buttons sat at three uneven positions the code itself had put them in, next to a Finder that was even. The premise was false from the start — on windows that carry a toolbar, macOS already insets the buttons, which is the exact look the feature was chasing — and no reading of a live window is guaranteed to catch the layout mid-flight rather than settled, so there was never a safe moment to impose our own. The whole mechanism is deleted. The buttons cannot be wrong if nothing moves them, and a fresh launch verifies it: identical positions and spacing to Finder, measured through the accessibility API.

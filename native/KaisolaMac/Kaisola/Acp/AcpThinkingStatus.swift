@@ -84,6 +84,9 @@ struct AcpThinkingStatusRow: View {
     /// allows (`UsageSettingsTab` precedent); never `.animation`. Nil (and in
     /// fixtures) renders no clock, keeping captures deterministic.
     var startedAt: Date?
+    /// False when the immediately preceding visible tool row already says the
+    /// same thing. Elapsed time and delegated-work metadata remain useful.
+    var showsStatusWord = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// "33s", then "4m 12s", then "1h 03m" — one number doing the work.
@@ -93,6 +96,14 @@ struct AcpThinkingStatusRow: View {
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m \(seconds % 60)s" }
         return "\(minutes / 60)h \(String(format: "%02d", minutes % 60))m"
+    }
+
+    static func shouldRender(
+        showsStatusWord: Bool,
+        hasSubagentDetail: Bool,
+        hasElapsedTime: Bool
+    ) -> Bool {
+        showsStatusWord || hasSubagentDetail || hasElapsedTime
     }
 
     /// The CI capture must never photograph a mid-sweep frame. Structural,
@@ -118,36 +129,47 @@ struct AcpThinkingStatusRow: View {
         // fallback deliberately adds no spinner either — the session card
         // header already carries the Reduce Motion hourglass for this fact,
         // and two indicators for one fact is the mistake being retired.
-        HStack(spacing: 7) {
-            if reduceMotion || fixture {
-                Text(status.word + "…")
-                    .font(Font(Self.font as CTFont))
-                    .foregroundStyle(.kaisolaSecondary)
-            } else {
-                ShimmerTextView(text: status.word + "…", font: Self.font, animated: true)
-                    .fixedSize()
-            }
-            if let startedAt, !fixture {
-                TimelineView(.periodic(from: startedAt, by: 1)) { context in
-                    Text("· " + Self.elapsedLabel(from: startedAt, to: context.date))
-                        .font(.callout)
-                        .foregroundStyle(.kaisolaTertiary)
-                        .monospacedDigit()
+        Group {
+            if Self.shouldRender(
+                showsStatusWord: showsStatusWord,
+                hasSubagentDetail: subagentDetail != nil,
+                hasElapsedTime: startedAt != nil && !fixture
+            ) {
+                HStack(spacing: 7) {
+                    if showsStatusWord {
+                        if reduceMotion || fixture {
+                            Text(status.word + "…")
+                                .font(Font(Self.font as CTFont))
+                                .foregroundStyle(.kaisolaSecondary)
+                        } else {
+                            ShimmerTextView(text: status.word + "…", font: Self.font, animated: true)
+                                .fixedSize()
+                        }
+                    }
+                    if let startedAt, !fixture {
+                        TimelineView(.periodic(from: startedAt, by: 1)) { context in
+                            Text((showsStatusWord ? "· " : "") + Self.elapsedLabel(from: startedAt, to: context.date))
+                                .font(.callout)
+                                .foregroundStyle(.kaisolaTertiary)
+                                .monospacedDigit()
+                        }
+                    }
+                    if let subagentDetail {
+                        let hasLeadingClause = showsStatusWord || (startedAt != nil && !fixture)
+                        Text((hasLeadingClause ? "· " : "") + subagentDetail)
+                            .font(.callout)
+                            .foregroundStyle(.kaisolaSecondary)
+                            .lineLimit(1)
+                    }
                 }
-            }
-            if let subagentDetail {
-                Text("· " + subagentDetail)
-                    .font(.callout)
-                    .foregroundStyle(.kaisolaSecondary)
-                    .lineLimit(1)
+                .padding(.vertical, 2)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    subagentDetail.map { "\(status.spoken), \($0)" } ?? status.spoken
+                )
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityIdentifier("acp.thinkingStatus")
             }
         }
-        .padding(.vertical, 2)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
-            subagentDetail.map { "\(status.spoken), \($0)" } ?? status.spoken
-        )
-        .accessibilityAddTraits(.updatesFrequently)
-        .accessibilityIdentifier("acp.thinkingStatus")
     }
 }

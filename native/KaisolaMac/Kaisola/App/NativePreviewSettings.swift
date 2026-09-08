@@ -62,9 +62,9 @@ enum ToolCallDensity: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// Semantic chat zoom. Using Dynamic Type rather than scaling the finished
-/// view keeps wrapping, selection, disclosure controls, and scroll geometry
-/// native at every level.
+/// Semantic chat zoom. Chat typography resolves these environment values to
+/// explicit macOS font sizes; scaling the fonts keeps wrapping, selection,
+/// disclosure controls, and scroll geometry native at every level.
 enum AgentChatTextSize: String, CaseIterable, Identifiable, Sendable {
     case compact
     case standard
@@ -985,8 +985,8 @@ final class NativePreviewSettings: ObservableObject {
     }
 
     static let terminalFontRange: ClosedRange<Double> = 9...22
-    /// macOS Terminal's current Basic profile uses 11 pt regular text.
-    static let terminalFontDefault: Double = 11
+    /// Matches the readable code treatment while keeping terminal density.
+    static let terminalFontDefault: Double = 12
 
     /// Terminal font family ("System Mono" sentinel = SF Mono) and weight.
     @Published var terminalFontFamily: String {

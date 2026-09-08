@@ -1,6 +1,24 @@
 import AppKit
 import SwiftTerm
 
+/// Terminal-originated navigation belongs to the AppKit window clicked.
+/// Other existing producers omit this metadata and retain their routing.
+enum TerminalLinkNotificationRouting {
+    static let sourceWindowKey = "kaisolaSourceWindow"
+
+    @MainActor
+    static func shouldHandle(_ notification: Notification, receivingWindow: NSWindow?) -> Bool {
+        guard let source = notification.userInfo?[sourceWindowKey] else {
+            // Chat and Markdown currently post unscoped navigation. Preserve
+            // that existing contract until those producers capture a window.
+            return true
+        }
+        guard let sourceWindow = source as? NSWindow,
+              let receivingWindow else { return false }
+        return sourceWindow === receivingWindow
+    }
+}
+
 /// Owns stream replay, geometry, link routing, and delegate callbacks for one terminal surface.
 extension NativeTerminalSurface {
     @MainActor
@@ -1049,7 +1067,12 @@ extension NativeTerminalSurface {
             switch target {
             case .web(let url):
                 if LocalhostDetector.isLocalDevURL(url) {
-                    NotificationCenter.default.post(name: .kaisolaOpenBrowserCard, object: url)
+                    guard let sourceWindow = source.window else { return }
+                    NotificationCenter.default.post(
+                        name: .kaisolaOpenBrowserCard,
+                        object: url,
+                        userInfo: [TerminalLinkNotificationRouting.sourceWindowKey: sourceWindow]
+                    )
                     return
                 }
                 NSWorkspace.shared.open(url)
@@ -1070,7 +1093,11 @@ extension NativeTerminalSurface {
                 )
                 switch resolved {
                 case let .found(url):
-                    var userInfo: [AnyHashable: Any] = ["url": url]
+                    guard let sourceWindow = source.window else { return }
+                    var userInfo: [AnyHashable: Any] = [
+                        "url": url,
+                        TerminalLinkNotificationRouting.sourceWindowKey: sourceWindow,
+                    ]
                     if let line { userInfo["line"] = line }
                     userInfo["workspaceHint"] = workingDirectory
                         ?? url.deletingLastPathComponent()

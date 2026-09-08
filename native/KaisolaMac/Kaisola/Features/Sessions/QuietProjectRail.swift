@@ -294,26 +294,12 @@ enum QuietSessionOrderCommit {
 
 // MARK: - Metrics
 
-/// Every size the rail uses. Text bottoms out at 10.5pt — no *label* in the
-/// sidebar is smaller than the time label; symbol glyphs (the hover chevron and
-/// `+`) may be smaller, since they carry no reading load.
+/// Readable source-list typography and comfortable native pointer targets.
+/// Project headings remain a step below the sessions they contain.
 enum QuietRailMetrics {
-    /// Project names read one step *below* the surfaces inside them.
-    ///
-    /// They used to match the session titles at 13pt and beat them on both ink
-    /// (primary against secondary) and weight (bold against regular), so the
-    /// folder names were the loudest text in a column that exists to point at
-    /// the things inside the folders. 11pt secondary is the ordinary grammar for
-    /// a group heading — Finder and Safari both do it — and it costs nothing,
-    /// because which project is active was always carried by weight alone.
-    static let headerText: CGFloat = 11
-    /// Session titles are the leaves. 13 → 12 keeps them the column's largest
-    /// text — they carry the only real reading — while closing most of the
-    /// gap to the 11pt project heading, so a session sits *under* its project
-    /// instead of shouting over it, and stays a point over the 11pt
-    /// accessibility floor the rail holds itself to.
-    static let titleText: CGFloat = 12
-    static let secondaryText: CGFloat = 10.5
+    static let headerText: CGFloat = 12
+    static let titleText: CGFloat = 13
+    static let secondaryText: CGFloat = 11
     static let chevronText: CGFloat = 9
     static let plusText: CGFloat = 10
     /// The stacked-tile project mark. Drawn a shade larger than the old folder
@@ -371,18 +357,9 @@ enum QuietRailMetrics {
     /// reads — it is one full slot of hierarchy instead of two, which is the
     /// same trade v1.1.8 made at 210 for the same reason.
     static let sessionIndent: CGFloat = 28
-    /// The project lane's cadence: compact projects, the active header, and
-    /// the Add Project footer all measure 32pt.
-    static let rowHeight: CGFloat = 32
-    /// Sessions get their own, tighter cadence. One 32pt cadence for every
-    /// row is what made a project and the sessions inside it read as
-    /// siblings: same height, same mark, larger text on the child. A 12pt
-    /// title needs ~14.3pt of line, so 26 still leaves air above and below —
-    /// a comfortable pointer target (macOS source lists sit between 24 and
-    /// 28) — and the height step now carries hierarchy alongside the indent.
-    /// Do not take this under 24: below that the pill stops reading as a row
-    /// and the "open beside" control loses its 16pt slot's breathing room.
-    static let sessionRowHeight: CGFloat = 26
+    /// Projects establish the grouping; sessions retain a tighter cadence.
+    static let rowHeight: CGFloat = 36
+    static let sessionRowHeight: CGFloat = 30
     /// How far a selected session's pill starts ahead of its identity mark.
     ///
     /// The pill used to run the full column, painting tens of points of fill to
@@ -565,7 +542,7 @@ enum QuietRowBudget {
     /// token in the lane, it repeats a fact the status dot already colours,
     /// and hover and VoiceOver still carry it. The dot stays — six points, and
     /// it is the row's only live state. Above this width nothing changes.
-    static let timeLabelMinimumSidebarWidth: CGFloat = 160
+    static let timeLabelMinimumSidebarWidth: CGFloat = 190
 
     /// Whether a rail this wide can afford the time-in-state label.
     static func showsTimeLabel(sidebarWidth: CGFloat) -> Bool {
@@ -688,6 +665,7 @@ private struct QuietProjectGroup: View {
     let meshMenu: (MeshSession) -> AnyView
     let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
     /// The header's `+` control tracks its own pointer separately from the
     /// group hover: the group flag decides whether the control *exists*, this
@@ -724,13 +702,13 @@ private struct QuietProjectGroup: View {
         hoverGeneration &+= 1
         if inside {
             guard !hovering else { return }
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = true }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = true }
             return
         }
         let generation = hoverGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + QuietRailMetrics.hoverGrace) {
             guard generation == hoverGeneration, hovering else { return }
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = false }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = false }
         }
     }
 
@@ -752,7 +730,11 @@ private struct QuietProjectGroup: View {
         // multiple tabs." The rail already knew the whole visible set; it was
         // collapsing it to a single id before drawing.
         let onScreen = onScreenSurfaceIDs(chats: chats, meshes: meshes, sessions: sessions)
-        let draftSelected = isActive && draft?.id == selectedDraftID
+        let draftSelected = QuietRowSelection.isDraftSelected(
+            isActive: isActive,
+            draftID: draft?.id,
+            selectedDraftID: selectedDraftID
+        )
         let selected = draftSelected
             ? nil
             : QuietRowSelection.selectedID(
@@ -923,7 +905,7 @@ private struct QuietProjectGroup: View {
             // its label, because nesting one Button inside another gives the
             // outer control ownership of the click.
             Button {
-                withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
             } label: {
                 HStack(spacing: 0) {
                     QuietProjectMarkView(tint: tint)
@@ -1008,7 +990,7 @@ private struct QuietProjectGroup: View {
                             }
                             .contentShape(Rectangle())
                             .animation(
-                                .easeOut(duration: KaisolaVisualSystem.hoverDuration),
+                                reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration),
                                 value: launchHovering
                             )
                     }
@@ -1072,7 +1054,7 @@ private struct QuietProjectGroup: View {
             // activate action. It keeps its slot when hidden so the row's
             // contents do not shift under the pointer on hover.
             Button {
-                withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
             } label: {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
@@ -1099,7 +1081,7 @@ private struct QuietProjectGroup: View {
             setHover: setHover,
             isActive: isActive,
             expandLabel: isExpanded ? "Collapse" : "Expand",
-            toggle: { withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() } },
+            toggle: { withAnimation(reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() } },
             moveUp: { model.moveProject(id: project.id, delta: -1) },
             moveDown: { model.moveProject(id: project.id, delta: 1) },
             menu: { projectMenu(project) },
@@ -1121,7 +1103,7 @@ private struct QuietProjectGroup: View {
     private func activate() {
         if !isActive { model.activateProject(id: project.id) }
         if !isExpanded {
-            withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded = true }
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded = true }
         }
     }
 
@@ -1224,7 +1206,8 @@ private struct QuietProjectGroup: View {
     ) -> [String] {
         guard isActive else { return [] }
         let ids = chats.map(\.id) + meshes.map(\.id) + sessions.map(\.id)
-        return ids.filter { model.isSurfaceVisible($0) }
+        let visibleIDs = Set(model.paneLayout(for: project.id).sessionIDs)
+        return ids.filter { visibleIDs.contains($0) }
     }
 
     /// The title a session row carries on its own, before the group's other
@@ -1252,20 +1235,24 @@ private struct QuietProjectGroup: View {
     ) -> [String: QuietRailLabel] {
         var ids: [String] = []
         var titles: [String] = []
+        var kinds: [QuietRailLabels.SurfaceKind] = []
         for chat in chats {
             ids.append(chat.id)
             titles.append(chat.conversation.title)
+            kinds.append(.chat)
         }
         for mesh in meshes {
             ids.append(mesh.id)
             titles.append(mesh.title)
+            kinds.append(.mesh)
         }
         for (index, record) in sessions.enumerated() {
             ids.append(record.id)
             titles.append(sessionTitle(record, ordinal: index + 1))
+            kinds.append(.terminal)
         }
         var map: [String: QuietRailLabel] = [:]
-        for (id, label) in zip(ids, QuietRailLabels.labels(for: titles)) where map[id] == nil {
+        for (id, label) in zip(ids, QuietRailLabels.labels(for: titles, kinds: kinds)) where map[id] == nil {
             map[id] = label
         }
         return map
@@ -1575,6 +1562,11 @@ enum QuietRowEmphasis {
 /// layout from the last time you were in it. Callers pass only the ids that
 /// belong to the project actually on screen.
 enum QuietRowSelection {
+    static func isDraftSelected(isActive: Bool, draftID: String?, selectedDraftID: String?) -> Bool {
+        guard isActive, let draftID else { return false }
+        return draftID == selectedDraftID
+    }
+
     /// - Parameters:
     ///   - visibleIDs: surfaces of the active project that are on screen, in
     ///     the order the rail draws them.
@@ -1861,9 +1853,10 @@ private struct QuietRowBody: View {
                     .help("Open beside (⌘-click the row)")
                     .accessibilityHidden(true)
             }
-            // An empty label must not reserve a lane slot; `Text("")` still
-            // costs the lane a gap.
-            if !timeLabel.isEmpty {
+            // Unknown elapsed time has no visible value. Keep its explanation
+            // in the row's tooltip and accessibility value without displaying
+            // a dash that looks like a remove control.
+            if !timeLabel.isEmpty && timeLabel != "—" {
                 Text(timeLabel)
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
                     .foregroundStyle(.kaisolaTertiary)
@@ -1928,6 +1921,7 @@ private struct QuietNewSessionRowView: View {
     let cancel: () -> Void
     let groupHover: (Bool) -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
 
     var body: some View {
@@ -1991,7 +1985,7 @@ private struct QuietNewSessionRowView: View {
         .accessibilityAction(named: Text("Cancel New Session")) { cancel() }
         .onHover { inside in
             groupHover(inside)
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
         .help("Choose a session type")
         .contextMenu {
@@ -2036,6 +2030,7 @@ private struct QuietSurfaceRowView: View {
     let reveal: () -> Void
     let menu: () -> AnyView
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
 
     var body: some View {
@@ -2081,7 +2076,7 @@ private struct QuietSurfaceRowView: View {
         .accessibilityAction(named: Text("Open beside")) { reveal() }
         .onHover { inside in
             groupHover(inside)
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
         .help(helpText)
         .contextMenu { menu() }
@@ -2094,7 +2089,7 @@ private struct QuietSurfaceRowView: View {
     /// is a scanning economy for the eye, and VoiceOver reads one row at a time
     /// with no siblings in view to supply the missing words.
     private var accessibilityLabel: String {
-        QuietSurfaceRowSemantics.accessibilityLabel(title: title, status: status)
+        QuietSurfaceRowSemantics.accessibilityLabel(title: label.qualifiedTitle ?? title, status: status)
     }
 
     /// A row drawing less than its whole title has to be able to say the rest
@@ -2102,8 +2097,9 @@ private struct QuietSurfaceRowView: View {
     /// but only for those rows. The expanded time meaning then follows the
     /// same base details for every row.
     private var helpText: String {
-        let base = label.elidesTitle
-            ? (tooltip.isEmpty ? title : "\(title) · \(tooltip)")
+        let fullTitle = label.qualifiedTitle ?? title
+        let base = label.elidesTitle || label.qualifiedTitle != nil
+            ? (tooltip.isEmpty ? fullTitle : "\(fullTitle) · \(tooltip)")
             : tooltip
         return QuietSurfaceRowSemantics.tooltip(base: base, time: timeInState)
     }

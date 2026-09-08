@@ -4,6 +4,55 @@ import XCTest
 
 @MainActor
 final class CommandRegistryTests: XCTestCase {
+    private func rankingItem(_ id: String, _ title: String) -> PaletteItem {
+        PaletteItem(id: id, title: title, subtitle: "", systemImage: "doc", run: {})
+    }
+
+    func testPaletteFilesActionBeatsLooseLongPathMatch() {
+        let items = [
+            rankingItem("file.spec", "docs/superpowers/specs/2026-08-06-obsidian-md-filetree-session-restore-design.md"),
+            rankingItem("command.files", "Show or Hide Files"),
+        ]
+        XCTAssertEqual(CommandPaletteRanking.ranked(items, query: "files").first?.id, "command.files")
+        XCTAssertEqual(CommandPaletteRanking.ranked(items, query: "fil").first?.id, "command.files")
+    }
+
+    func testPaletteExactFilenameSurvivesActionPreference() {
+        let items = [
+            rankingItem("command.open", "Open AcpConversation.swift"),
+            rankingItem("file.conversation", "native/KaisolaMac/Kaisola/Acp/AcpConversation.swift"),
+        ]
+        XCTAssertEqual(
+            CommandPaletteRanking.ranked(items, query: "AcpConversation.swift").first?.id,
+            "file.conversation"
+        )
+        XCTAssertEqual(
+            CommandPaletteRanking.ranked(items, query: "native/KaisolaMac/Kaisola/Acp/AcpConversation.swift").first?.id,
+            "file.conversation"
+        )
+    }
+
+    func testPaletteSettingsActionBeatsMatchingFiles() {
+        let items = [
+            rankingItem("file.settings", "Sources/Settings.swift"),
+            rankingItem("command.settings", "Settings"),
+        ]
+        XCTAssertEqual(CommandPaletteRanking.ranked(items, query: "settings").first?.id, "command.settings")
+    }
+
+    func testPaletteUnmatchedQueryProducesNoResults() {
+        XCTAssertTrue(CommandPaletteRanking.ranked([
+            rankingItem("command.files", "Show or Hide Files"),
+            rankingItem("file.settings", "Sources/Settings.swift"),
+        ], query: "qzxqzx").isEmpty)
+    }
+
+    func testPaletteEqualMatchesRetainInputOrder() {
+        let items = [rankingItem("first", "Settings"), rankingItem("second", "Settings")]
+        XCTAssertEqual(CommandPaletteRanking.ranked(items, query: "settings").map(\.id), ["first", "second"])
+        XCTAssertEqual(CommandPaletteRanking.ranked(Array(items.reversed()), query: "settings").map(\.id), ["second", "first"])
+    }
+
     /// XCTest invokes lifecycle overrides outside the class's MainActor even
     /// though every test method is isolated there. The runner serializes this
     /// instance, so this one fixture URL is safe to bridge across that boundary.

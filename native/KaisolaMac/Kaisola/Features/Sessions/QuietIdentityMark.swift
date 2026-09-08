@@ -431,11 +431,15 @@ struct QuietRailLabel: Equatable {
     /// still say the whole title on hover and to VoiceOver: the elision is a
     /// scanning economy, never a loss of the value.
     let droppedLead: String
+    /// A collision qualifier and the complete original title, shared by
+    /// assistive technology and hover help. Nil for ordinary row labels.
+    let qualifiedTitle: String?
 
-    init(text: String, truncation: Truncation = .tail, droppedLead: String = "") {
+    init(text: String, truncation: Truncation = .tail, droppedLead: String = "", qualifiedTitle: String? = nil) {
         self.text = text
         self.truncation = truncation
         self.droppedLead = droppedLead
+        self.qualifiedTitle = qualifiedTitle
     }
 
     /// A title nothing had to be done to.
@@ -469,6 +473,35 @@ struct QuietRailLabel: Equatable {
 /// runs on every body pass; see `QuietRowBudget.ambiguousTitleCharacters` for
 /// where the count comes from and how it is held to the real lane.
 enum QuietRailLabels {
+    enum SurfaceKind {
+        case chat
+        case terminal
+        case mesh
+    }
+
+    static func labels(for titles: [String], kinds: [SurfaceKind]) -> [QuietRailLabel] {
+        var result = labels(for: titles)
+        guard kinds.count == titles.count else { return result }
+        let groups = Dictionary(grouping: result.indices, by: { result[$0].text })
+        for indices in groups.values {
+            guard indices.contains(where: { kinds[$0] == .chat }),
+                  indices.contains(where: { kinds[$0] == .terminal }) else { continue }
+            for index in indices {
+                let prefix: String
+                switch kinds[index] {
+                case .chat: prefix = "Chat · "
+                case .terminal: prefix = "Terminal · "
+                case .mesh: continue
+                }
+                // Keep the complete supplied title, including authored spaces
+                // and punctuation. This qualifies a collision, not its origin.
+                let qualified = prefix + titles[index]
+                result[index] = QuietRailLabel(text: qualified, qualifiedTitle: qualified)
+            }
+        }
+        return result
+    }
+
     /// Separators a lead may end on: the marks people actually type between a
     /// title's segments. A run of plain words is NOT a boundary — dropping
     /// "MATLAB kernel " off the front of a title because two rows happen to

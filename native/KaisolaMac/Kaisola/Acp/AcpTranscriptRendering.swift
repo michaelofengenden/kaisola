@@ -152,6 +152,7 @@ struct AcpTranscriptSearchState: Equatable, Sendable {
     }
 
     mutating func refresh(rows: [AcpTranscriptRow]) {
+        guard isPresented else { return }
         let selected = selectedIndex.flatMap { matches.indices.contains($0) ? matches[$0] : nil }
         rebuild(rows: rows, preserving: selected)
     }
@@ -763,7 +764,11 @@ enum AcpTranscriptInlineRendering {
 
 enum AcpTranscriptLinkRouting {
     @MainActor
-    static func open(_ link: URL, workspaceURL: URL?) -> OpenURLAction.Result {
+    static func open(
+        _ link: URL,
+        workspaceURL: URL?,
+        sourceWindow: NSWindow? = nil
+    ) -> OpenURLAction.Result {
         guard let workspaceURL else { return .discarded }
         let documentURL = workspaceURL.appendingPathComponent(".kaisola-transcript.md")
         switch WorkspacePreviewLinkPolicy.decision(
@@ -775,9 +780,11 @@ enum AcpTranscriptLinkRouting {
             NSWorkspace.shared.open(url)
             return .handled
         case let .workspaceFile(url, line):
+            guard let sourceWindow else { return .discarded }
             var userInfo: [AnyHashable: Any] = [
                 "url": url,
                 "workspaceHint": workspaceURL,
+                TerminalLinkNotificationRouting.sourceWindowKey: sourceWindow,
             ]
             if let line { userInfo["line"] = line }
             NotificationCenter.default.post(
@@ -793,6 +800,70 @@ enum AcpTranscriptLinkRouting {
             )
             return .discarded
         }
+    }
+}
+
+/// Installs transcript link routing with the AppKit window that actually owns
+/// this SwiftUI subtree. The weak reference prevents a lazy transcript row
+/// from retaining a window after that window closes.
+@MainActor
+private final class AcpTranscriptSourceWindow: ObservableObject {
+    weak var window: NSWindow?
+}
+
+private struct AcpTranscriptWindowProbe: NSViewRepresentable {
+    let source: AcpTranscriptSourceWindow
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.setAccessibilityElement(false)
+        view.source = source
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        nsView.source = source
+        source.window = nsView.window
+    }
+
+    @MainActor
+    final class ProbeView: NSView {
+        weak var source: AcpTranscriptSourceWindow?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            source?.window = window
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+private struct AcpTranscriptLinkRoutingModifier: ViewModifier {
+    let workspaceURL: URL?
+    @StateObject private var source = AcpTranscriptSourceWindow()
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.openURL, OpenURLAction { link in
+                AcpTranscriptLinkRouting.open(
+                    link,
+                    workspaceURL: workspaceURL,
+                    sourceWindow: source.window
+                )
+            })
+            .background {
+                AcpTranscriptWindowProbe(source: source)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+    }
+}
+
+extension View {
+    func acpTranscriptLinkRouting(workspaceURL: URL?) -> some View {
+        modifier(AcpTranscriptLinkRoutingModifier(workspaceURL: workspaceURL))
     }
 }
 
@@ -827,15 +898,15 @@ struct AssistantMarkdownText: View {
     @State private var characterLimit = AcpChatRendering.assistantCharacterLimit
     @State private var lineLimit = AcpChatRendering.assistantLineLimit
 
-    private var rendered: AcpBoundedText {
-        AcpChatRendering.bounded(
+    var body: some View {
+        // Content, footer, and update observers share one bounded snapshot
+        // instead of rescanning the growing answer for each access.
+        let rendered = AcpChatRendering.bounded(
             text,
             characterLimit: characterLimit,
             lineLimit: lineLimit
         )
-    }
 
-    var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Group {
                 if renderer.blocks.isEmpty, !rendered.text.isEmpty {
@@ -903,9 +974,7 @@ struct AssistantMarkdownText: View {
             }
             }
         }
-        .environment(\.openURL, OpenURLAction { link in
-            AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
-        })
+        .acpTranscriptLinkRouting(workspaceURL: workspaceURL)
         .onAppear { renderer.submit(rendered.text) }
         .onChange(of: rendered.text) { _, source in renderer.submit(source) }
     }
@@ -914,6 +983,11 @@ struct AssistantMarkdownText: View {
 private struct AcpTranscriptBlockView: View, Equatable {
     let block: MarkdownSourceBlock
     let workspaceURL: URL?
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.block == rhs.block && lhs.workspaceURL == rhs.workspaceURL
+    }
 
     var body: some View {
         switch block.block {
@@ -929,7 +1003,7 @@ private struct AcpTranscriptBlockView: View, Equatable {
             // Leading comes from the message container, so lists and quotes
             // breathe at the same rhythm as the prose around them.
             Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
-                .font(.body)
+                .kaisolaReadingText()
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .image(source, alt, _, _, _):
             Label(alt ?? source, systemImage: "photo")
@@ -939,11 +1013,12 @@ private struct AcpTranscriptBlockView: View, Equatable {
         case let .listItem(indent, marker, text):
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(marker)
-                    .font(.system(.body, design: .monospaced))
+                    .fontDesign(.monospaced)
                     .foregroundStyle(.kaisolaSecondary)
                     .frame(minWidth: 17, alignment: .trailing)
                 Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
             }
+            .kaisolaReadingText()
             .padding(.leading, CGFloat(indent) * 18)
         case let .quote(text):
             HStack(alignment: .top, spacing: 10) {
@@ -954,6 +1029,7 @@ private struct AcpTranscriptBlockView: View, Equatable {
                     .italic()
                     .foregroundStyle(.kaisolaSecondary)
             }
+            .kaisolaReadingText()
             .padding(.vertical, 2)
         case let .code(language, text):
             AcpTranscriptCodeBlock(languageName: language, text: text)
@@ -970,12 +1046,17 @@ private struct AcpTranscriptBlockView: View, Equatable {
     }
 
     private func headingFont(_ level: Int) -> Font {
+        let style: (base: CGFloat, weight: Font.Weight)
         switch level {
-        case 1: .title2.bold()
-        case 2: .title3.bold()
-        case 3: .headline
-        default: .subheadline.weight(.semibold)
+        case 1: style = (22, .bold)
+        case 2: style = (19, .bold)
+        case 3: style = (16, .semibold)
+        default: style = (14, .semibold)
         }
+        return .system(
+            size: KaisolaChatTypography.pointSize(style.base, for: dynamicTypeSize),
+            weight: style.weight
+        )
     }
 }
 
@@ -983,6 +1064,7 @@ private struct AcpTranscriptCodeBlock: View {
     let languageName: String?
     let text: String
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var copied = false
 
     private var highlighted: AttributedString {
@@ -1019,11 +1101,17 @@ private struct AcpTranscriptCodeBlock: View {
                 .accessibilityLabel(copied ? "Code copied" : "Copy code")
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.quaternary.opacity(0.45))
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(colorScheme == .dark ? 0.05 : 0.025))
             ScrollView([.horizontal, .vertical]) {
                 Text(highlighted)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.system(
+                        size: KaisolaChatTypography.pointSize(
+                            AcpTranscriptMetrics.codePointSize,
+                            for: dynamicTypeSize
+                        ),
+                        design: .monospaced
+                    ))
                     .lineSpacing(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
@@ -1036,11 +1124,14 @@ private struct AcpTranscriptCodeBlock: View {
                     // a later refactor could move.
                     .textSelection(.enabled)
             }
+            // The conversation follows its bottom edge. Code has its own
+            // reading origin and must not inherit that centered horizontal anchor.
+            .defaultScrollAnchor(.topLeading)
             .frame(maxHeight: 420)
         }
-        .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+        .background(.black.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
             .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
         .accessibilityElement(children: .contain)
     }
@@ -1051,6 +1142,7 @@ private struct AcpTranscriptTable: View {
     let rows: [[String]]
     let omittedRows: Int
     let workspaceURL: URL?
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1067,8 +1159,8 @@ private struct AcpTranscriptTable: View {
                 // identical shape, and the coincident antialiasing ate the
                 // stroke along the four corner arcs — a border that read as
                 // broken exactly at the corners.
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
             }
             if omittedRows > 0 {
@@ -1085,10 +1177,13 @@ private struct AcpTranscriptTable: View {
     private func cells(_ values: [String], header: Bool) -> some View {
         ForEach(Array(values.enumerated()), id: \.offset) { _, value in
             Text(AcpTranscriptInlineRendering.attributed(value, workspaceURL: workspaceURL))
-                .font(.caption.weight(header ? .semibold : .regular))
+                .font(.system(
+                    size: KaisolaChatTypography.pointSize(13, for: dynamicTypeSize),
+                    weight: header ? .semibold : .regular
+                ))
                 .frame(minWidth: 92, maxWidth: 260, alignment: .leading)
                 .padding(.horizontal, 9)
-                .padding(.vertical, 7)
+                .padding(.vertical, 8)
                 .background(header ? Color.primary.opacity(0.07) : .clear)
                 .overlay(alignment: .trailing) {
                     Rectangle()

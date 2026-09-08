@@ -103,23 +103,26 @@ struct MarkdownEditingStyle: Sendable {
         func collect(
             _ pattern: String,
             options: NSRegularExpression.Options = [],
+            ranges: [NSRange]? = nil,
             role: (NSTextCheckingResult) -> Role?,
             contentGroup: Int = 0,
             syntaxGroups: [Int] = []
         ) {
             guard let expression = try? NSRegularExpression(pattern: pattern, options: options) else { return }
-            expression.enumerateMatches(in: source, range: fullRange) { match, _, _ in
-                guard let match,
-                      let resolvedRole = role(match),
-                      contentGroup < match.numberOfRanges else { return }
-                let range = match.range(at: contentGroup)
-                if range.location != NSNotFound, range.length > 0 {
-                    result.append(Span(range: range, role: resolvedRole))
-                }
-                for group in syntaxGroups where group < match.numberOfRanges {
-                    let syntaxRange = match.range(at: group)
-                    if syntaxRange.location != NSNotFound, syntaxRange.length > 0 {
-                        result.append(Span(range: syntaxRange, role: .syntax))
+            for searchRange in ranges ?? [fullRange] {
+                expression.enumerateMatches(in: source, range: searchRange) { match, _, _ in
+                    guard let match,
+                          let resolvedRole = role(match),
+                          contentGroup < match.numberOfRanges else { return }
+                    let range = match.range(at: contentGroup)
+                    if range.location != NSNotFound, range.length > 0 {
+                        result.append(Span(range: range, role: resolvedRole))
+                    }
+                    for group in syntaxGroups where group < match.numberOfRanges {
+                        let syntaxRange = match.range(at: group)
+                        if syntaxRange.location != NSNotFound, syntaxRange.length > 0 {
+                            result.append(Span(range: syntaxRange, role: .syntax))
+                        }
                     }
                 }
             }
@@ -127,10 +130,94 @@ struct MarkdownEditingStyle: Sendable {
 
         // Inline roles are applied first. Block roles that overlap them are
         // appended later and therefore remain visually dominant.
-        collect(#"(?<!\*)(\*\*)([^*\n]+)(\*\*)(?!\*)"#, role: { _ in .bold }, contentGroup: 2, syntaxGroups: [1, 3])
-        collect(#"(?<!_)(__)([^_\n]+)(__)(?!_)"#, role: { _ in .bold }, contentGroup: 2, syntaxGroups: [1, 3])
-        collect(#"(?<!\*)(\*)([^*\n]+)(\*)(?!\*)"#, role: { _ in .italic }, contentGroup: 2, syntaxGroups: [1, 3])
-        collect(#"(?<!_)(_)([^_\n]+)(_)(?!_)"#, role: { _ in .italic }, contentGroup: 2, syntaxGroups: [1, 3])
+        // Match emphasis independently within source blocks. A heading, fence,
+        // or new list item can end a paragraph without a blank line. Searching
+        // each exact UTF-16 range also prevents an unmatched delimiter in one
+        // block from consuming a valid pair in the next. Fenced code is literal.
+        let nsSource = source as NSString
+        let listStartExpression = try? NSRegularExpression(
+            pattern: #"(?m)^ {0,3}([-+*]|[0-9]{1,9}[.)])[ \t]+(?=\S)"#
+        )
+        var emphasisRanges: [NSRange] = []
+        var lastRangeIsListParagraph = false
+        for block in MarkdownSourceDocument.blocks(in: source) {
+            if case .code = block.block {
+                lastRangeIsListParagraph = false
+                continue
+            }
+            var range = block.range
+            var isListParagraph = false
+            if case .listItem = block.block { isListParagraph = true }
+            if case .paragraph = block.block,
+               lastRangeIsListParagraph,
+               let previous = emphasisRanges.last {
+                let gap = nsSource.substring(with: NSRange(
+                    location: NSMaxRange(previous),
+                    length: range.location - NSMaxRange(previous)
+                ))
+                // A plain line immediately after a list item can be its lazy
+                // continuation; requiring indentation would split valid emphasis.
+                if gap == "\n" || gap == "\r\n" {
+                    emphasisRanges.removeLast()
+                    range = NSRange(location: previous.location, length: NSMaxRange(range) - previous.location)
+                    isListParagraph = true
+                }
+            }
+            var start = range.location
+            // The source projection can keep paragraph-to-list transitions in
+            // one range. Split those here without changing that shared parser.
+            for match in listStartExpression?.matches(in: source, range: range) ?? [] {
+                if match.range.location == start {
+                    isListParagraph = true
+                    continue
+                }
+                let marker = nsSource.substring(with: match.range(at: 1))
+                // Only an ordered list starting at one interrupts a paragraph.
+                if !isListParagraph, marker.first?.isNumber == true,
+                   marker != "1.", marker != "1)" { continue }
+                emphasisRanges.append(NSRange(location: start, length: match.range.location - start))
+                start = match.range.location
+                isListParagraph = true
+            }
+            emphasisRanges.append(NSRange(location: start, length: NSMaxRange(range) - start))
+            lastRangeIsListParagraph = isListParagraph
+        }
+        // Soft and explicit hard breaks remain valid within one paragraph.
+        // Underscores refuse intraword positions, keeping filenames literal.
+        let emphasisContentWithoutAsterisk = #"((?:(?!\r?\n[ \t]*\r?\n)[^*])+?)"#
+        let emphasisContentWithoutUnderscore = #"((?:(?!\r?\n[ \t]*\r?\n)[^_])+?)"#
+        collect(
+            #"(?<!\*)(\*\*)(?![ \t\r\n])"# + emphasisContentWithoutAsterisk
+                + #"(?<![ \t\r\n])(\*\*)(?!\*)"#,
+            ranges: emphasisRanges,
+            role: { _ in .bold },
+            contentGroup: 2,
+            syntaxGroups: [1, 3]
+        )
+        collect(
+            #"(?<![\p{L}\p{N}_])(__)(?![ \t\r\n])"# + emphasisContentWithoutUnderscore
+                + #"(?<![ \t\r\n])(__)(?![\p{L}\p{N}_])"#,
+            ranges: emphasisRanges,
+            role: { _ in .bold },
+            contentGroup: 2,
+            syntaxGroups: [1, 3]
+        )
+        collect(
+            #"(?<!\*)(\*)(?![ \t\r\n])"# + emphasisContentWithoutAsterisk
+                + #"(?<![ \t\r\n])(\*)(?!\*)"#,
+            ranges: emphasisRanges,
+            role: { _ in .italic },
+            contentGroup: 2,
+            syntaxGroups: [1, 3]
+        )
+        collect(
+            #"(?<![\p{L}\p{N}_])(_)(?![ \t\r\n])"# + emphasisContentWithoutUnderscore
+                + #"(?<![ \t\r\n])(_)(?![\p{L}\p{N}_])"#,
+            ranges: emphasisRanges,
+            role: { _ in .italic },
+            contentGroup: 2,
+            syntaxGroups: [1, 3]
+        )
         collect(#"(`)([^`\n]+)(`)"#, role: { _ in .inlineCode }, contentGroup: 2, syntaxGroups: [1, 3])
         // Wikilinks: the name reads as a link, the double brackets collapse
         // like any other syntax until the cursor's line reveals them.
@@ -216,18 +303,14 @@ struct MarkdownEditingStyle: Sendable {
 
     static let bodySize: CGFloat = 16
 
-    /// The reading face: the system serif (New York) at body size, LessWrong-
-    /// style. Falls back to the plain system font if the serif design is
-    /// unavailable (it ships on every supported macOS).
+    /// The reading face follows the rest of the native studio: San Francisco
+    /// at a comfortable document size. Emphasis composes from this base below.
     static func bodyFont(size: CGFloat = bodySize, weight: NSFont.Weight = .regular) -> NSFont {
-        let base = NSFont.systemFont(ofSize: size, weight: weight)
-        guard let descriptor = base.fontDescriptor.withDesign(.serif),
-              let serif = NSFont(descriptor: descriptor, size: size) else { return base }
-        return serif
+        NSFont.systemFont(ofSize: size, weight: weight)
     }
 
     /// Trait composition (2026-08-06 spec 1a): emphasis composes onto the face
-    /// already resolved at that range — serif bold in body, sans bold in a
+    /// already resolved at that range — body bold, sans bold in a
     /// table cell, bold+italic nesting — instead of stamping a static font.
     static func composed(base: NSFont, bold: Bool = false, italic: Bool = false) -> NSFont {
         var traits = base.fontDescriptor.symbolicTraits
@@ -239,10 +322,12 @@ struct MarkdownEditingStyle: Sendable {
 
     static var bodyParagraphStyle: NSParagraphStyle {
         let paragraph = NSMutableParagraphStyle()
-        // ~1.5 effective leading on the 16pt serif — the reading rhythm the
-        // whole treatment hangs on.
+        // A single source LF is a CommonMark soft break, but TextKit sees it as
+        // a paragraph boundary. Keep its cadence equal to an ordinary wrapped
+        // line; the authored blank line between Markdown paragraphs supplies
+        // the larger visual separation without changing any source character.
         paragraph.lineSpacing = 6
-        paragraph.paragraphSpacing = 10
+        paragraph.paragraphSpacing = 0
         return paragraph
     }
 
@@ -265,8 +350,8 @@ struct MarkdownEditingStyle: Sendable {
     static func attributes(for role: Role) -> [NSAttributedString.Key: Any] {
         switch role {
         case let .heading(level):
-            // Headings stay sans against the serif body — the same contrast
-            // LessWrong plays — with tightened tracking on the display sizes.
+            // Larger headings use tighter tracking to keep the reading
+            // hierarchy clear within the native document face.
             let sizes: [CGFloat] = [0, 28, 23, 20, 17, 16, 15]
             let clamped = min(6, max(1, level))
             var attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(
@@ -276,7 +361,7 @@ struct MarkdownEditingStyle: Sendable {
             if clamped <= 2 { attributes[.kern] = -0.3 }
             return attributes
         case .quote:
-            // Full-size serif italic (not dimmed): a quotation reads as prose
+            // Full-size italic (not dimmed): a quotation reads as prose
             // with the drawn accent bar carrying the demarcation.
             return [.font: composed(base: bodyFont(), italic: true)]
         case .codeBlock:
@@ -339,7 +424,7 @@ struct MarkdownEditingStyle: Sendable {
 /// measured as a unit), and overlapping results merge so a range is never
 /// painted twice in one pass.
 /// The reading column (2026-08-06 spec §1b): text caps at ~70 characters of
-/// the serif body and centers when the pane is wider, LessWrong-style. All
+/// the document body and centers when the pane is wider. All
 /// math is in UNMAGNIFIED document points — the text view's bounds are
 /// already document-space under NSScrollView magnification, so zoom scales
 /// the measure with the type and never double-applies.
@@ -1127,7 +1212,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
     var imageRevision: Int = 0
     var navigationRevision: UInt64 = 0
     var automaticallyFocus = false
-    var onOpenLink: ((URL) -> Void)? = nil
+    var onOpenLink: ((URL, NSWindow?) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, zoom: $zoom)
@@ -1306,7 +1391,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         var markdownURL: URL?
         var workspaceRoot: URL?
         var onError: ((String) -> Void)?
-        var onOpenLink: ((URL) -> Void)?
+        var onOpenLink: ((URL, NSWindow?) -> Void)?
         var isApplyingExternalValue = false
         /// Guards the attribute pass so a restyle cannot be mistaken for a user
         /// edit and start the save/journal machinery.
@@ -1587,7 +1672,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 ?? URL(string: destination.addingPercentEncoding(
                     withAllowedCharacters: .urlPathAllowed
                 ) ?? destination) else { return }
-            onOpenLink(url)
+            onOpenLink(url, textView.window)
         }
 
         // MARK: Styling

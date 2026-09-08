@@ -843,7 +843,7 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         settings.applyTerminalAppDefaults()
 
-        XCTAssertEqual(settings.terminalFontSize, 11)
+        XCTAssertEqual(settings.terminalFontSize, NativePreviewSettings.terminalFontDefault)
         XCTAssertEqual(settings.terminalFontFamily, TerminalFontOptions.systemMonoSentinel)
         XCTAssertEqual(settings.terminalFontWeight, "regular")
         XCTAssertEqual(settings.terminalLineSpacing, 1)

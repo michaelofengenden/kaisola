@@ -286,6 +286,7 @@ final class AcpTranscriptPagingTests: XCTestCase {
             ]),
         ]
         var state = AcpTranscriptSearchState()
+        state.present()
 
         state.updateQuery("needle", rows: rows)
 
@@ -309,6 +310,7 @@ final class AcpTranscriptPagingTests: XCTestCase {
             enabledMCPServerNames: []
         )
         var state = AcpTranscriptSearchState()
+        state.present()
 
         state.updateQuery("model-search-token", rows: [
             .runProfileAudit(id: "audit", snapshot: profile),
@@ -320,6 +322,7 @@ final class AcpTranscriptPagingTests: XCTestCase {
 
     func testTranscriptSearchRefreshPreservesSelectionDuringStreaming() {
         var state = AcpTranscriptSearchState()
+        state.present()
         state.updateQuery("ship", rows: [
             .message(id: "one", text: "ship it"),
             .message(id: "two", text: "waiting"),
@@ -343,6 +346,7 @@ final class AcpTranscriptPagingTests: XCTestCase {
         conversation.seedRowsForTesting(rows)
         let readingAnchor = try XCTUnwrap(conversation.visibleRows.first?.id)
         var search = AcpTranscriptSearchState()
+        search.present()
         search.updateQuery("needle", rows: conversation.visibleRows)
         XCTAssertEqual(search.matchCount, 0)
         XCTAssertEqual(search.statusText(hasHiddenEarlierRows: true), "No matches loaded")
@@ -503,6 +507,29 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertFalse(state.isPresented)
         XCTAssertNil(state.currentRowID)
         XCTAssertEqual(state.query, "needle", "reopening Find should retain the last query")
+    }
+
+    func testClosedTranscriptSearchDoesNotReindexStreamedRowsUntilReopened() {
+        var state = AcpTranscriptSearchState()
+        state.present()
+        state.updateQuery("needle", rows: [.message(id: "one", text: "needle")])
+        XCTAssertEqual(state.matchCount, 1)
+
+        state.dismiss()
+        state.refresh(rows: [
+            .message(id: "one", text: "needle"),
+            .message(id: "two", text: "another needle"),
+        ])
+
+        XCTAssertEqual(state.query, "needle")
+        XCTAssertEqual(state.matchCount, 1, "closed Find must not rebuild for streamed content")
+
+        state.present()
+        state.refresh(rows: [
+            .message(id: "one", text: "needle"),
+            .message(id: "two", text: "another needle"),
+        ])
+        XCTAssertEqual(state.matchCount, 2, "reopening Find indexes the current transcript")
     }
 
     private static func firstScrollView(in view: NSView) -> NSScrollView? {

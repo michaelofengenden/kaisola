@@ -999,9 +999,9 @@ struct MarkdownDocumentView: View {
     /// Command-clicking a Markdown link follows it under the same policy the
     /// rendered document used: project files open in Kaisola, external schemes
     /// go to the system browser, everything else is refused.
-    private func open(_ link: URL) {
+    private func open(_ link: URL, sourceWindow: NSWindow?) {
         if link.scheme == MarkdownLinkTargets.wikiScheme {
-            openWikilink(link)
+            openWikilink(link, sourceWindow: sourceWindow)
             return
         }
         switch WorkspacePreviewLinkPolicy.decision(
@@ -1012,10 +1012,12 @@ struct MarkdownDocumentView: View {
         case let .external(url):
             NSWorkspace.shared.open(url)
         case let .workspaceFile(url, line):
+            guard let sourceWindow else { return }
             var userInfo: [AnyHashable: Any] = [
                 "url": url,
                 "workspaceHint": workspaceRoot
                     ?? documentURL.deletingLastPathComponent(),
+                TerminalLinkNotificationRouting.sourceWindowKey: sourceWindow,
             ]
             if let line { userInfo["line"] = line }
             NotificationCenter.default.post(
@@ -1034,20 +1036,28 @@ struct MarkdownDocumentView: View {
     /// invalidation-aware) at click time — never during styling, so typing
     /// and cursor movement pay nothing for wikilinks. An unresolvable name
     /// is inert.
-    private func openWikilink(_ link: URL) {
+    private func openWikilink(_ link: URL, sourceWindow: NSWindow?) {
         // `URL.path` already percent-decodes; decoding again corrupts names
         // that legitimately contain %XX-shaped text.
         let name = String(link.path.dropFirst())
         let root = workspaceRoot ?? documentURL.deletingLastPathComponent()
-        Task { @MainActor in
+        guard let sourceWindow else { return }
+        Task { @MainActor [weak sourceWindow] in
             let files = await ProjectFileIndex.shared.files(for: root)
+            // Resolution may outlive the click's preview window. Do not route
+            // the result into whichever window happens to be active later.
+            guard let sourceWindow, sourceWindow.isVisible else { return }
             guard let target = WikilinkResolver.resolve(name, inFiles: files, root: root) else {
                 return
             }
             NotificationCenter.default.post(
                 name: .kaisolaOpenFileLink,
                 object: nil,
-                userInfo: ["url": target, "workspaceHint": root]
+                userInfo: [
+                    "url": target,
+                    "workspaceHint": root,
+                    TerminalLinkNotificationRouting.sourceWindowKey: sourceWindow,
+                ]
             )
         }
     }

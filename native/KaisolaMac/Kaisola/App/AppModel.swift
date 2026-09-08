@@ -719,6 +719,8 @@ final class AppModel: ObservableObject {
     }
     private var chatSurfaceSummaries: [String: ChatSurfaceSummary] = [:]
     private var surfaceSummaryCheckScheduled = false
+    private var dirtyChatSurfaceIDs: Set<String> = []
+    private var dirtyMeshSurfaceIDs: Set<String> = []
     /// The same idea for Mesh. The shell shows a title, a running dot, a stage
     /// word, and builds a run-target list from column worktrees. `MeshView`
     /// renders the columns and their transcripts, but it holds the session as
@@ -731,6 +733,9 @@ final class AppModel: ObservableObject {
         let columnTargets: [String]
     }
     private var meshSurfaceSummaries: [String: MeshSurfaceSummary] = [:]
+    /// Optional focused-test probe. Nil in production, so summary inspection
+    /// carries no bookkeeping beyond the work the scheduler already performs.
+    var onSurfaceSummaryInspectionForTesting: ((String) -> Void)?
 
     /// A project grouping for the sidebar/tabs: a stable id, a display name,
     /// its optional local directory, and its live sessions. Explicitly-opened
@@ -3970,9 +3975,7 @@ final class AppModel: ObservableObject {
                     usageCenter: usageCenter
                 )
                 wireMeshPersistence(mesh)
-                surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-                    self?.scheduleSurfaceSummaryCheck()
-                }
+                observeMeshSurface(mesh)
                 meshes.append(mesh)
 
                 var states: [MeshSession.RestoredColumnState] = []
@@ -3999,7 +4002,7 @@ final class AppModel: ObservableObject {
                 guard restoreCompletion == .completed else {
                     meshes.removeAll { $0.id == mesh.id }
                     Self.claimedRestoredMeshIDs.remove(mesh.id)
-                    surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                    removeSurfaceObserver(mesh.id)
                     meshLifecycleCoordinator.forget(meshID: mesh.id)
                     continue
                 }
@@ -4026,7 +4029,7 @@ final class AppModel: ObservableObject {
                         )
                         meshes.removeAll { $0.id == mesh.id }
                         Self.claimedRestoredMeshIDs.remove(mesh.id)
-                        surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                        removeSurfaceObserver(mesh.id)
                         meshLifecycleCoordinator.forget(meshID: mesh.id)
                         await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
                         provisionedTranscriptIDsByMeshID.removeValue(forKey: mesh.id)
@@ -4547,9 +4550,7 @@ final class AppModel: ObservableObject {
             self?.scheduleChatResumeInvalidation(chatID)
         }
         chats.append(handle)
-        surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
-            self?.scheduleSurfaceSummaryCheck()
-        }
+        observeChatSurface(handle)
         reconcileChatAccountAvailability(for: handle)
         if requiresAccountResolution, accountAccess.phase == .resolving {
             usageCenter.refreshPlanUsage(workspace: directory, force: false)
@@ -4621,7 +4622,7 @@ final class AppModel: ObservableObject {
             sourceID: usageSourceID,
             forgetWhenLast: false
         )
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
         unifiedSessionCards.remove(chatID, from: projectID)
@@ -4691,7 +4692,7 @@ final class AppModel: ObservableObject {
             sourceID: usageSourceID,
             forgetWhenLast: true
         )
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
@@ -4831,6 +4832,16 @@ final class AppModel: ObservableObject {
     /// It also collapses a burst: a streaming turn publishes rows and
     /// contentVersion for every chunk, and several conversations can stream at
     /// once. One comparison per turn answers all of them.
+    private func scheduleSurfaceSummaryCheck(chatID: String) {
+        dirtyChatSurfaceIDs.insert(chatID)
+        scheduleSurfaceSummaryCheck()
+    }
+
+    private func scheduleSurfaceSummaryCheck(meshID: String) {
+        dirtyMeshSurfaceIDs.insert(meshID)
+        scheduleSurfaceSummaryCheck()
+    }
+
     private func scheduleSurfaceSummaryCheck() {
         guard !surfaceSummaryCheckScheduled else { return }
         surfaceSummaryCheckScheduled = true
@@ -4848,41 +4859,87 @@ final class AppModel: ObservableObject {
     /// running, several times that. Nothing outside the chat surface renders a
     /// transcript, so almost all of it announced a change no observer could see.
     private func publishIfSurfacesChanged() {
-        var summaries: [String: ChatSurfaceSummary] = [:]
-        summaries.reserveCapacity(chats.count)
-        for chat in chats {
-            let conversation = chat.conversation
-            summaries[chat.id] = ChatSurfaceSummary(
-                title: conversation.title,
-                isRunning: conversation.isRunning,
-                isConnected: conversation.isConnected,
-                statusMessage: conversation.statusMessage,
-                pendingPermissionCount: conversation.pendingPermissionCount,
-                queuedCount: conversation.queued.count,
-                hasRows: !conversation.rows.isEmpty,
-                usage: conversation.usage
-            )
+        let chatIDs = dirtyChatSurfaceIDs
+        let meshIDs = dirtyMeshSurfaceIDs
+        dirtyChatSurfaceIDs.removeAll(keepingCapacity: true)
+        dirtyMeshSurfaceIDs.removeAll(keepingCapacity: true)
+        var changed = false
+
+        for chatID in chatIDs {
+            guard let chat = chats.first(where: { $0.id == chatID }) else {
+                if chatSurfaceSummaries.removeValue(forKey: chatID) != nil { changed = true }
+                continue
+            }
+            onSurfaceSummaryInspectionForTesting?("chat:\(chat.id)")
+            let summary = chatSurfaceSummary(chat)
+            if chatSurfaceSummaries[chatID] != summary {
+                chatSurfaceSummaries[chatID] = summary
+                changed = true
+            }
         }
-        var meshSummaries: [String: MeshSurfaceSummary] = [:]
-        meshSummaries.reserveCapacity(meshes.count)
-        for mesh in meshes {
-            meshSummaries[mesh.id] = MeshSurfaceSummary(
-                title: mesh.title,
-                anyRunning: mesh.anyRunning,
-                stage: mesh.stage,
-                // The shell builds run targets from column worktrees, which move
-                // when a column is configured rather than when one streams.
-                columnTargets: mesh.columns.map { column in
-                    "\(column.worktreePath ?? "")|\(column.branch ?? "")"
-                }
-            )
+
+        for meshID in meshIDs {
+            guard let mesh = meshes.first(where: { $0.id == meshID }) else {
+                if meshSurfaceSummaries.removeValue(forKey: meshID) != nil { changed = true }
+                continue
+            }
+            onSurfaceSummaryInspectionForTesting?("mesh:\(mesh.id)")
+            let summary = meshSurfaceSummary(mesh)
+            if meshSurfaceSummaries[meshID] != summary {
+                meshSurfaceSummaries[meshID] = summary
+                changed = true
+            }
         }
-        guard summaries != chatSurfaceSummaries || meshSummaries != meshSurfaceSummaries else {
-            return
+        if changed { objectWillChange.send() }
+    }
+
+    private func chatSurfaceSummary(_ chat: AcpChatHandle) -> ChatSurfaceSummary {
+        let conversation = chat.conversation
+        return ChatSurfaceSummary(
+            title: conversation.title,
+            isRunning: conversation.isRunning,
+            isConnected: conversation.isConnected,
+            statusMessage: conversation.statusMessage,
+            pendingPermissionCount: conversation.pendingPermissionCount,
+            queuedCount: conversation.queued.count,
+            hasRows: !conversation.rows.isEmpty,
+            usage: conversation.usage
+        )
+    }
+
+    private func meshSurfaceSummary(_ mesh: MeshSession) -> MeshSurfaceSummary {
+        MeshSurfaceSummary(
+            title: mesh.title,
+            anyRunning: mesh.anyRunning,
+            stage: mesh.stage,
+            columnTargets: mesh.columns.map { column in
+                "\(column.worktreePath ?? "")|\(column.branch ?? "")"
+            }
+        )
+    }
+
+    private func observeChatSurface(_ chat: AcpChatHandle) {
+        let chatID = chat.id
+        chatSurfaceSummaries[chatID] = chatSurfaceSummary(chat)
+        surfaceObservers[chatID] = chat.conversation.objectWillChange.sink { [weak self] _ in
+            self?.scheduleSurfaceSummaryCheck(chatID: chatID)
         }
-        chatSurfaceSummaries = summaries
-        meshSurfaceSummaries = meshSummaries
-        objectWillChange.send()
+    }
+
+    private func observeMeshSurface(_ mesh: MeshSession) {
+        let meshID = mesh.id
+        meshSurfaceSummaries[meshID] = meshSurfaceSummary(mesh)
+        surfaceObservers[meshID] = mesh.objectWillChange.sink { [weak self] _ in
+            self?.scheduleSurfaceSummaryCheck(meshID: meshID)
+        }
+    }
+
+    private func removeSurfaceObserver(_ surfaceID: String) {
+        surfaceObservers.removeValue(forKey: surfaceID)?.cancel()
+        chatSurfaceSummaries.removeValue(forKey: surfaceID)
+        meshSurfaceSummaries.removeValue(forKey: surfaceID)
+        dirtyChatSurfaceIDs.remove(surfaceID)
+        dirtyMeshSurfaceIDs.remove(surfaceID)
     }
 
     private func scheduleChatResumeInvalidation(_ chatID: String) {
@@ -4919,7 +4976,7 @@ final class AppModel: ObservableObject {
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
         usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         enqueueTranscriptSessionID(nil, chatID: chatID)
         guard appendChat(
             id: chatID,
@@ -5076,7 +5133,7 @@ final class AppModel: ObservableObject {
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
         usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -5136,7 +5193,7 @@ final class AppModel: ObservableObject {
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
         usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -5187,7 +5244,7 @@ final class AppModel: ObservableObject {
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
         usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
-        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        removeSurfaceObserver(chatID)
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -5291,9 +5348,7 @@ final class AppModel: ObservableObject {
             usageCenter: usageCenter
         )
         wireMeshPersistence(mesh, creatingNewColumns: true)
-        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.scheduleSurfaceSummaryCheck()
-        }
+        observeMeshSurface(mesh)
         meshes.append(mesh)
         selectedMeshID = mesh.id
         selectedChatID = nil
@@ -5331,7 +5386,7 @@ final class AppModel: ObservableObject {
         ))
         meshes.removeAll { $0.id == meshID }
         Self.claimedRestoredMeshIDs.remove(meshID)
-        surfaceObservers.removeValue(forKey: meshID)?.cancel()
+        removeSurfaceObserver(meshID)
         if selectedMeshID == meshID { selectedMeshID = nil }
         unifiedSessionCards.remove(meshID, from: projectID)
         meshLifecycleCoordinator.forget(meshID: meshID)
@@ -5411,7 +5466,7 @@ final class AppModel: ObservableObject {
             }
             meshes.removeAll { $0.id == meshID }
             Self.claimedRestoredMeshIDs.remove(meshID)
-            surfaceObservers.removeValue(forKey: meshID)?.cancel()
+            removeSurfaceObserver(meshID)
             if selectedMeshID == meshID { selectedMeshID = nil }
             unifiedSessionCards.remove(meshID, from: projectID)
             meshLifecycleCoordinator.forget(meshID: meshID)
@@ -5603,9 +5658,7 @@ final class AppModel: ObservableObject {
         }
         _ = removeRecentlyClosedPane(id: surfaceID)
         wireMeshPersistence(mesh)
-        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.scheduleSurfaceSummaryCheck()
-        }
+        observeMeshSurface(mesh)
         meshes.append(mesh)
         keepsClaim = true
         selectMesh(mesh.id)
@@ -5919,6 +5972,10 @@ final class AppModel: ObservableObject {
         }
         meshes.removeAll()
         surfaceObservers.removeAll()
+        chatSurfaceSummaries.removeAll()
+        meshSurfaceSummaries.removeAll()
+        dirtyChatSurfaceIDs.removeAll()
+        dirtyMeshSurfaceIDs.removeAll()
         splitIntentTokens.removeAll()
         await disconnect()
     }
@@ -6250,9 +6307,7 @@ final class AppModel: ObservableObject {
         mesh.loadVisualFixture(
             agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
         )
-        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.scheduleSurfaceSummaryCheck()
-        }
+        observeMeshSurface(mesh)
         meshes = [mesh]
         selectedSessionID = nil
         unifiedSessionCards.install(
@@ -6283,6 +6338,9 @@ final class AppModel: ObservableObject {
               ) else { return }
         chat.conversation.loadVisualFixture(includePermission: includePermission)
         unifiedSessionCards.add(chat.id, to: project.id)
+        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"]?.hasPrefix("chat-studio") == true {
+            unifiedSessionCards.install(SessionPaneLayout(sessionID: chat.id), for: project.id)
+        }
         selectChat(chat.id)
     }
 
